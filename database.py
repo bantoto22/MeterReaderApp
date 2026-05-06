@@ -1,0 +1,294 @@
+"""
+database.py – SQLite helper for the Water Meter Reader application.
+Uses Python's built-in sqlite3 module (no extra install needed).
+"""
+
+import sqlite3
+import os
+
+DB_NAME = "meter.db"
+
+
+def _db_path():
+    """Return the absolute path to the database file, co-located with this script."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME)
+
+
+def get_connection():
+    """Return a new connection to the database with foreign keys enabled."""
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row          # allows dict-like access on rows
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+# ─── Schema creation ─────────────────────────────────────────────────────────
+def init_db():
+    """Create the tables if they don't exist and seed initial data."""
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS zones (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT    UNIQUE NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS consumers (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            meter_no         TEXT    UNIQUE NOT NULL,
+            acct_no          TEXT    NOT NULL,
+            name             TEXT    NOT NULL,
+            previous_reading INTEGER NOT NULL DEFAULT 0,
+            zone_id          INTEGER NOT NULL,
+            FOREIGN KEY (zone_id) REFERENCES zones(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS readings (
+            id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+            consumer_id     INTEGER  NOT NULL,
+            present_reading INTEGER  NOT NULL,
+            consumption     INTEGER  NOT NULL,
+            exception       TEXT     DEFAULT 'None',
+            reading_date    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_flagged      BOOLEAN  DEFAULT 0,
+            FOREIGN KEY (consumer_id) REFERENCES consumers(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            name     TEXT NOT NULL,
+            reader_id TEXT UNIQUE NOT NULL
+        );
+    """)
+
+    # ── Seed data (only if tables are empty) ─────────────────────────────
+    if cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
+        zones = ["Zone 1", "Zone 2", "Zone 3"]
+        cur.executemany("INSERT INTO zones (name) VALUES (?)",
+                        [(z,) for z in zones])
+
+        # Map zone names to their IDs
+        zone_ids = {row["name"]: row["id"]
+                    for row in cur.execute("SELECT id, name FROM zones")}
+
+        # Sample consumers spread across zones
+        consumers = [
+            # Zone 1 – 45 consumers
+            ("MTR-001", "07-11-46-1", "Maria Santos",      980,  zone_ids["Zone 1"]),
+            ("MTR-002", "07-11-46-2", "Juan Dela Cruz",     1234, zone_ids["Zone 1"]),
+            ("MTR-003", "07-11-46-3", "Pedro Reyes",        450,  zone_ids["Zone 1"]),
+            ("MTR-004", "07-11-46-4", "Ana Garcia",         2100, zone_ids["Zone 1"]),
+            ("MTR-005", "07-11-46-5", "Rosa Mendoza",       780,  zone_ids["Zone 1"]),
+            ("MTR-006", "07-11-46-6", "Carlos Ramos",       1560, zone_ids["Zone 1"]),
+            ("MTR-007", "07-11-46-7", "Elena Torres",       320,  zone_ids["Zone 1"]),
+            ("MTR-008", "07-11-46-8", "Roberto Cruz",       890,  zone_ids["Zone 1"]),
+            ("MTR-009", "07-11-46-9", "Linda Flores",       1100, zone_ids["Zone 1"]),
+            ("MTR-010", "07-11-46-10", "Miguel Bautista",   670,  zone_ids["Zone 1"]),
+            # Zone 2 – 30 consumers
+            ("MTR-011", "07-12-46-1", "Sofia Villanueva",   540,  zone_ids["Zone 2"]),
+            ("MTR-012", "07-12-46-2", "Ramon Aquino",       1890, zone_ids["Zone 2"]),
+            ("MTR-013", "07-12-46-3", "Teresa Lim",         410,  zone_ids["Zone 2"]),
+            ("MTR-014", "07-12-46-4", "Antonio Pascual",    1350, zone_ids["Zone 2"]),
+            ("MTR-015", "07-12-46-5", "Gloria Tan",         920,  zone_ids["Zone 2"]),
+            # Zone 3 – 20 consumers
+            ("MTR-016", "07-13-46-1", "Fernando Castillo",  760,  zone_ids["Zone 3"]),
+            ("MTR-017", "07-13-46-2", "Lucia Rivera",       1440, zone_ids["Zone 3"]),
+            ("MTR-018", "07-13-46-3", "Ricardo Morales",    280,  zone_ids["Zone 3"]),
+            ("MTR-019", "07-13-46-4", "Carmen Lopez",       1670, zone_ids["Zone 3"]),
+            ("MTR-020", "07-13-46-5", "Jose Hernandez",     530,  zone_ids["Zone 3"]),
+        ]
+
+        cur.executemany(
+            "INSERT INTO consumers (meter_no, acct_no, name, previous_reading, zone_id) VALUES (?, ?, ?, ?, ?)",
+            consumers
+        )
+
+    # Seed default users if table is empty (separate from zones check)
+    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        users = [
+            ("reader1", "pass123", "Juan Santos", "MR-001"),
+            ("reader2", "pass456", "Maria Cruz", "MR-002"),
+        ]
+        cur.executemany(
+            "INSERT INTO users (username, password, name, reader_id) VALUES (?, ?, ?, ?)",
+            users
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def seed_default_users():
+    """Seed default users if users table is empty. Call this to fix empty user table."""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        users = [
+            ("reader1", "pass123", "Juan Santos", "MR-001"),
+            ("reader2", "pass456", "Maria Cruz", "MR-002"),
+        ]
+        cur.executemany(
+            "INSERT INTO users (username, password, name, reader_id) VALUES (?, ?, ?, ?)",
+            users
+        )
+        conn.commit()
+    conn.close()
+
+
+def authenticate_user(username: str, password: str) -> dict | None:
+    """Validate user credentials. Returns user dict or None if invalid."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT username, password, name, reader_id FROM users WHERE username = ?",
+        (username,)
+    ).fetchone()
+    conn.close()
+    
+    if row and row['password'] == password:
+        return {
+            'username': row['username'],
+            'name': row['name'],
+            'id': row['reader_id']
+        }
+    return None
+
+
+def get_all_users() -> list[dict]:
+    """Return all users for login hint display."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT username, name, reader_id FROM users ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ─── Query helpers ────────────────────────────────────────────────────────────
+
+def search_consumer(meter_no: str) -> dict | None:
+    """Look up a consumer by meter number. Returns dict or None."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                  z.name AS zone_name
+           FROM consumers c
+           JOIN zones z ON c.zone_id = z.id
+           WHERE c.meter_no = ?""",
+        (meter_no,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+
+
+def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8) -> list[dict]:
+    """Search consumers by partial meter_no or name, filtered to a specific zone."""
+    conn = get_connection()
+    like_pattern = f"%{query}%"
+    rows = conn.execute(
+        """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                  z.name AS zone_name
+           FROM consumers c
+           JOIN zones z ON c.zone_id = z.id
+           WHERE z.name = ?
+             AND (c.meter_no LIKE ? OR c.name LIKE ?)
+           ORDER BY c.meter_no
+           LIMIT ?""",
+        (zone_name, like_pattern, like_pattern, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_reading(consumer_id: int, present_reading: int, consumption: int,
+                 exception: str = "None", is_flagged: bool = False):
+    """Insert a new reading record and update the consumer's previous reading."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0))
+    conn.execute(
+        "UPDATE consumers SET previous_reading = ? WHERE id = ?",
+        (present_reading, consumer_id))
+    conn.commit()
+    conn.close()
+
+
+def get_zone_stats() -> dict:
+    """Return per-zone progress stats: {zone_name: {households, read, flagged}}."""
+    conn = get_connection()
+
+    stats = {}
+    zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
+
+    for z in zones:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM consumers WHERE zone_id = ?", (z["id"],)
+        ).fetchone()[0]
+
+        read = conn.execute(
+            """SELECT COUNT(DISTINCT r.consumer_id)
+               FROM readings r
+               JOIN consumers c ON r.consumer_id = c.id
+               WHERE c.zone_id = ?""", (z["id"],)
+        ).fetchone()[0]
+
+        flagged = conn.execute(
+            """SELECT COUNT(*)
+               FROM readings r
+               JOIN consumers c ON r.consumer_id = c.id
+               WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
+        ).fetchone()[0]
+
+        stats[z["name"]] = {"households": total, "read": read, "flagged": flagged}
+
+    conn.close()
+    return stats
+
+
+def get_all_zone_names() -> list[str]:
+    """Return a sorted list of zone names."""
+    conn = get_connection()
+    rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
+    conn.close()
+    return [r["name"] for r in rows]
+
+
+def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
+    """Return all consumers in a zone with their reading status."""
+    conn = get_connection()
+    
+    rows = conn.execute(
+        """SELECT 
+            c.id,
+            c.meter_no,
+            c.acct_no,
+            c.name,
+            c.previous_reading,
+            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
+            r.present_reading as reading_value,
+            r.reading_date,
+            r.exception,
+            r.is_flagged
+           FROM consumers c
+           JOIN zones z ON c.zone_id = z.id
+           LEFT JOIN (
+               SELECT * FROM readings 
+               WHERE id IN (
+                   SELECT MAX(id) FROM readings GROUP BY consumer_id
+               )
+           ) r ON c.id = r.consumer_id
+           WHERE z.name = ?
+           ORDER BY c.meter_no""",
+        (zone_name,)
+    ).fetchall()
+    
+    conn.close()
+    return [dict(r) for r in rows]
