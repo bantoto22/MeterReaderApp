@@ -19,7 +19,7 @@ from receipt import show_receipt
 def _load_custom_font():
     """Register a TTF font file so tkinter can use it by family name."""
     font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "Montserrat.ttf")
+                              "..", "assets", "fonts", "Montserrat.ttf")
     if os.path.exists(font_path):
         ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0)
 
@@ -771,6 +771,8 @@ class MeterReaderApp(tk.Tk):
             self.progress_tab_btn.config(bg=TAB_DARK, activebackground=TAB_DARK)
             self.progress_frame.tkraise()
             self._animate_progress_bar()
+            # Hide autocomplete when switching to progress tab
+            self._hide_autocomplete()
 
     # ══════════════════════════════════════════════════════════════════════
     #  METER ENTRY PAGE (Non-Scrolling, Compact Grouped Card)
@@ -787,7 +789,7 @@ class MeterReaderApp(tk.Tk):
         header_content = tk.Frame(header_bg, bg=HEADER_BLUE)
         header_content.pack(fill="both", expand=True, padx=14, pady=4)
 
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SLR logo 1.png")
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "images", "SLR logo 1.png")
         if os.path.exists(logo_path):
             try:
                 logo_img = Image.open(logo_path)
@@ -1029,7 +1031,7 @@ class MeterReaderApp(tk.Tk):
         header_content = tk.Frame(header_bg, bg=HEADER_BLUE)
         header_content.pack(fill="both", expand=True, padx=14, pady=4)
 
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SLR logo 1.png")
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "images", "SLR logo 1.png")
         if os.path.exists(logo_path):
             try:
                 logo_img = Image.open(logo_path)
@@ -1538,6 +1540,9 @@ class MeterReaderApp(tk.Tk):
             self._set_consumption_state("valid", str(consumption), "Valid reading", "")
 
     def _set_consumption_state(self, state, title, message, validation_msg):
+        # Store the state for print validation
+        self._consumption_state = state
+        
         if state == "valid":
             title_color = VALID_TEXT
             msg_color = VALID_TEXT
@@ -1602,6 +1607,27 @@ class MeterReaderApp(tk.Tk):
         if paper_status == "low":
             if not messagebox.askyesno("Paper Low", "Paper is running low.\n\nDo you want to continue printing?"):
                 return
+        
+        # Check for high consumption warning - require confirmation
+        if hasattr(self, '_consumption_state') and self._consumption_state == "warning":
+            present = int(reading)
+            previous = self._current_consumer["previous_reading"]
+            consumption = present - previous
+            if not messagebox.askyesno("High Consumption Warning", 
+                                       f"Consumption ({consumption}) exceeds threshold ({HIGH_CONSUMPTION_THRESHOLD}).\n\n"
+                                       f"This is an unusually high reading.\n\n"
+                                       f"Do you want to proceed with printing?"):
+                return
+        
+        # Show print confirmation
+        consumer_name = self._current_consumer.get('name', 'Unknown')
+        meter_no = self._current_consumer.get('meter_no', 'Unknown')
+        if not messagebox.askyesno("Confirm Print", 
+                                   f"Print receipt for:\n\n"
+                                   f"Consumer: {consumer_name}\n"
+                                   f"Meter: {meter_no}\n\n"
+                                   f"Continue with printing?"):
+            return
 
         self._show_saving_overlay()
 

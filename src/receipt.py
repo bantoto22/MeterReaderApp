@@ -166,37 +166,11 @@ def show_receipt(parent, consumer: dict, previous: int, present: int, exception:
     btn_frame = tk.Frame(win, bg="#FFFFFF")
     btn_frame.pack(fill="x", padx=14, pady=(0, 12))
 
-    def do_print():
-        """Save receipt to a temp .txt file and send to system printer."""
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt",
-            prefix="SLR_receipt_",
-            delete=False, encoding="utf-8"
-        )
-        tmp.write(receipt_text)
-        tmp.close()
-
-        if sys.platform == "win32":
-            os.startfile(tmp.name, "print")
-        elif sys.platform == "darwin":
-            subprocess.run(["lpr", tmp.name])
-        else:
-            subprocess.run(["lpr", tmp.name])
-
     tk.Button(
-        btn_frame, text="\U0001f5a8  Print",
+        btn_frame, text="\u2715  Close",
         font=(FONT_FAMILY, 11, "bold"),
         bg="#1A2744", fg="#FFFFFF",
         activebackground="#2D2D4A", activeforeground="#FFFFFF",
         relief="flat", bd=0, cursor="hand2",
-        pady=10, command=do_print
-    ).pack(side="left", fill="x", expand=True, padx=(0, 5))
-
-    tk.Button(
-        btn_frame, text="\u2715  Close",
-        font=(FONT_FAMILY, 11, "bold"),
-        bg="#E0E3EA", fg="#1A1A2E",
-        activebackground="#CED4DA", activeforeground="#1A1A2E",
-        relief="flat", bd=0, cursor="hand2",
         pady=10, command=win.destroy
-    ).pack(side="right", fill="x", expand=True, padx=(5, 0))
+    ).pack(fill="x", expand=True)

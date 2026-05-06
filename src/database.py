@@ -10,8 +10,8 @@ DB_NAME = "meter.db"
 
 
 def _db_path():
-    """Return the absolute path to the database file, co-located with this script."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME)
+    """Return the absolute path to the database file in the data folder."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", DB_NAME)
 
 
 def get_connection():
@@ -170,14 +170,18 @@ def get_all_users() -> list[dict]:
 # ─── Query helpers ────────────────────────────────────────────────────────────
 
 def search_consumer(meter_no: str) -> dict | None:
-    """Look up a consumer by meter number. Returns dict or None."""
+    """Look up a consumer by meter number. Returns dict or None.
+    Excludes consumers who already have readings (unread only)."""
     conn = get_connection()
     row = conn.execute(
         """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                   z.name AS zone_name
            FROM consumers c
            JOIN zones z ON c.zone_id = z.id
-           WHERE c.meter_no = ?""",
+           WHERE c.meter_no = ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+             )""",
         (meter_no,)
     ).fetchone()
     conn.close()
@@ -188,7 +192,8 @@ def search_consumer(meter_no: str) -> dict | None:
 
 
 def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8) -> list[dict]:
-    """Search consumers by partial meter_no or name, filtered to a specific zone."""
+    """Search consumers by partial meter_no or name, filtered to a specific zone.
+    Excludes consumers who already have readings (unread only)."""
     conn = get_connection()
     like_pattern = f"%{query}%"
     rows = conn.execute(
@@ -198,6 +203,9 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8) -> list
            JOIN zones z ON c.zone_id = z.id
            WHERE z.name = ?
              AND (c.meter_no LIKE ? OR c.name LIKE ?)
+             AND NOT EXISTS (
+                 SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+             )
            ORDER BY c.meter_no
            LIMIT ?""",
         (zone_name, like_pattern, like_pattern, limit)
