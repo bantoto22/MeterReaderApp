@@ -10,6 +10,7 @@ import threading
 import time
 import math
 import os
+import platform
 import ctypes
 from PIL import Image, ImageTk
 from database import init_db, search_consumer, search_consumers_by_zone, save_reading, get_zone_stats, get_all_zone_names, get_zone_consumers_with_status, authenticate_user, get_all_users, seed_default_users
@@ -20,8 +21,25 @@ def _load_custom_font():
     """Register a TTF font file so tkinter can use it by family name."""
     font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "..", "assets", "fonts", "Montserrat.ttf")
-    if os.path.exists(font_path):
-        ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0)
+    font_path = os.path.abspath(font_path)
+
+    try:
+        if not os.path.exists(font_path):
+            print(f"Custom font not found at: {font_path}")
+            return
+
+        system_name = platform.system()
+        if system_name == "Windows":
+            try:
+                result = ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0)
+                if result == 0:
+                    print(f"Windows font registration returned 0 for: {font_path}")
+            except Exception as exc:
+                print(f"Failed to register custom font on Windows: {exc}")
+        else:
+            print(f"Skipping Windows-only font loading on {system_name}")
+    except Exception as exc:
+        print(f"Custom font loading skipped due to error: {exc}")
 
 _load_custom_font()
 
