@@ -241,12 +241,13 @@ class LoginScreen(tk.Frame):
         self._build_ui()
 
     def _build_ui(self):
+        self.pack_propagate(False)
         # Header
-        header = tk.Frame(self, bg=HEADER_BLUE, height=80)
+        header = tk.Frame(self, bg=HEADER_BLUE, height=92)
         header.pack(fill="x")
         header.pack_propagate(False)
 
-        tk.Label(header, text="Meter Reader Login", font=(FONT_FAMILY, 16, "bold"),
+        tk.Label(header, text="Meter Reader Login", font=(FONT_FAMILY, 18, "bold"),
                  bg=HEADER_BLUE, fg=WHITE).pack(expand=True)
 
         # Logo/Icon area
@@ -272,7 +273,7 @@ class LoginScreen(tk.Frame):
 
         self._username_var = tk.StringVar()
         self._username_entry = RoundedEntry(form_frame, placeholder="Enter username...",
-                                          height=44, radius=8, font=(FONT_FAMILY, 12),
+                                          height=56, radius=10, font=(FONT_FAMILY, 14),
                                           textvariable=self._username_var)
         self._username_entry.pack(fill="x", pady=(0, 12))
 
@@ -282,7 +283,7 @@ class LoginScreen(tk.Frame):
 
         self._password_var = tk.StringVar()
         self._password_entry = RoundedEntry(form_frame, placeholder="Enter password...",
-                                            height=44, radius=8, font=(FONT_FAMILY, 12),
+                                            height=56, radius=10, font=(FONT_FAMILY, 14),
                                             textvariable=self._password_var)
         self._password_entry.entry.config(show="•")
         self._password_entry.pack(fill="x", pady=(0, 20))
@@ -293,11 +294,11 @@ class LoginScreen(tk.Frame):
         self._error_label.pack(pady=(0, 10))
 
         # Login button
-        login_btn = tk.Button(form_frame, text="LOGIN", font=(FONT_FAMILY, 14, "bold"),
+        login_btn = tk.Button(form_frame, text="LOGIN", font=(FONT_FAMILY, 16, "bold"),
                              bg=TAB_DARK, fg=WHITE, activebackground=DARK_HOVER,
                              activeforeground=WHITE, relief="flat", bd=0,
                              cursor="hand2", pady=12, command=self._attempt_login)
-        login_btn.pack(fill="x")
+        login_btn.pack(fill="x", ipady=8)
 
         login_btn.bind("<Enter>", lambda e: e.widget.config(bg=DARK_HOVER))
         login_btn.bind("<Leave>", lambda e: e.widget.config(bg=TAB_DARK))
@@ -508,8 +509,10 @@ class MeterReaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.update_idletasks()
-        self._screen_width = self.winfo_screenwidth()
-        self._screen_height = self.winfo_screenheight()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        self._screen_width = screen_width
+        self._screen_height = screen_height
 
         # Initialise the database (creates tables + seeds on first run)
         init_db()
@@ -517,12 +520,13 @@ class MeterReaderApp(tk.Tk):
 
         self.title("Water Meter Reader")
         self.attributes("-fullscreen", True)
+        self.geometry(f"{screen_width}x{screen_height}+0+0")
         self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
         self.configure(bg=BG_COLOR)
         self.resizable(False, False)
         self._touch_font_base = 13 if self._screen_height >= 900 else 12
         self._content_max_width = min(max(420, int(self._screen_width * 0.95)), 560)
-        self._content_max_height = max(520, int(self._screen_height - 28))
+        self._content_max_height = max(520, int(self._screen_height - 8))
 
         self._current_page = "meter_entry"
         self._current_zone = tk.StringVar(value="Zone 1")
@@ -590,7 +594,7 @@ class MeterReaderApp(tk.Tk):
     def _build_app_content(self):
         """Build the main application content (shown after login)."""
         # ── Tab Navigation ───────────────────────────────────────────────
-        tab_bar = tk.Frame(self.app_content, bg=TAB_DARK, height=52)
+        tab_bar = tk.Frame(self.app_content, bg=TAB_DARK, height=60)
         tab_bar.pack(fill="x")
         tab_bar.pack_propagate(False)
 
@@ -888,7 +892,7 @@ class MeterReaderApp(tk.Tk):
         self._active_zone_label.bind("<Leave>", lambda e: self._on_zone_btn_hover(False))
 
         self.search_var = tk.StringVar()
-        self.search_input = RoundedEntry(search_section, placeholder="Type 001, 002...", height=50, radius=10, font=(FONT_FAMILY, self._touch_font_base), textvariable=self.search_var)
+        self.search_input = RoundedEntry(search_section, placeholder="Type 001, 002...", height=56, radius=10, font=(FONT_FAMILY, self._touch_font_base + 1), textvariable=self.search_var)
         self.search_input.pack(fill="x", pady=(2, 0))
         self.search_input.entry.bind("<Return>", self._on_search)
         self.search_input.entry.bind("<KeyRelease>", self._on_search_key)
@@ -928,8 +932,8 @@ class MeterReaderApp(tk.Tk):
         self.present_var = tk.StringVar()
         self.reading_input = RoundedEntry(
             ri, placeholder="Enter current reading...",
-            height=46, radius=8, bg=WHITE,
-            font=(FONT_FAMILY, 15, "bold"), justify="left",
+            height=56, radius=10, bg=WHITE,
+            font=(FONT_FAMILY, 16, "bold"), justify="left",
             textvariable=self.present_var)
         self.reading_input.pack(fill="x", pady=0)
         self.reading_input.set_validate(vcmd)
@@ -983,8 +987,8 @@ class MeterReaderApp(tk.Tk):
 
         ttk.Combobox(ei, textvariable=self.exception_var,
                      values=["None", "Stuck Meter", "Leaking", "No Access", "Broken Seal"],
-                     state="readonly", font=(FONT_FAMILY, 11, "bold"), style="Figma.TCombobox"
-                     ).pack(fill="x", ipady=4, pady=(0, 2))
+                     state="readonly", font=(FONT_FAMILY, self._touch_font_base, "bold"), style="Figma.TCombobox"
+                     ).pack(fill="x", ipady=8, pady=(0, 4))
 
         # ── PRINT Button ─────────────────────────────────────────────────
         btn_wrapper = tk.Frame(main, bg=BG_COLOR)
@@ -1015,7 +1019,7 @@ class MeterReaderApp(tk.Tk):
             activebackground="#BBDEFB", activeforeground=PRIMARY_BLUE,
             relief="flat", bd=0, cursor="hand2",
             highlightthickness=0, command=self._show_reprint_dialog)
-        self.reprint_btn.pack(fill="x", ipady=12)
+        self.reprint_btn.pack(fill="x", ipady=18)
 
         self.reprint_btn.bind("<Enter>", lambda e: e.widget.config(bg="#BBDEFB"))
         self.reprint_btn.bind("<Leave>", lambda e: e.widget.config(bg="#E3F2FD"))
