@@ -519,6 +519,10 @@ class MeterReaderApp(tk.Tk):
         self.attributes("-fullscreen", True)
         self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
         self.configure(bg=BG_COLOR)
+        self.resizable(False, False)
+        self._touch_font_base = 13 if self._screen_height >= 900 else 12
+        self._content_max_width = min(max(420, int(self._screen_width * 0.95)), 560)
+        self._content_max_height = max(520, int(self._screen_height - 28))
 
         self._current_page = "meter_entry"
         self._current_zone = tk.StringVar(value="Zone 1")
@@ -557,15 +561,18 @@ class MeterReaderApp(tk.Tk):
         # Centered content viewport for portrait touchscreens.
         self.content_viewport = tk.Frame(self.main_container, bg=BG_COLOR)
         self.content_viewport.place(relx=0.5, rely=0.5, anchor="center")
+        self.content_viewport.grid_rowconfigure(0, weight=1)
+        self.content_viewport.grid_columnconfigure(0, weight=1)
         self._update_content_viewport()
 
         # ── Login Screen (shown initially) ───────────────────────────────
         self.login_screen = LoginScreen(self.content_viewport, self._on_login_success)
-        self.login_screen.place(in_=self.content_viewport, x=0, y=0, relwidth=1, relheight=1)
+        self.login_screen.grid(row=0, column=0, sticky="nsew")
 
         # ── App Content (hidden until login) ─────────────────────────────
         self.app_content = tk.Frame(self.content_viewport, bg=BG_COLOR)
-        # Not packed yet - will be shown after login
+        self.app_content.grid(row=0, column=0, sticky="nsew")
+        self.app_content.grid_remove()
 
         self._build_app_content()
 
@@ -576,26 +583,26 @@ class MeterReaderApp(tk.Tk):
         """Keep app content centered while adapting to the current screen shape."""
         available_w = max(1, self.main_container.winfo_width())
         available_h = max(1, self.main_container.winfo_height())
-        viewport_w = min(DEVICE_WIDTH, available_w)
-        viewport_h = min(DEVICE_HEIGHT, available_h)
+        viewport_w = min(self._content_max_width, available_w)
+        viewport_h = min(self._content_max_height, available_h)
         self.content_viewport.place_configure(width=viewport_w, height=viewport_h)
 
     def _build_app_content(self):
         """Build the main application content (shown after login)."""
         # ── Tab Navigation ───────────────────────────────────────────────
-        tab_bar = tk.Frame(self.app_content, bg=TAB_DARK, height=40)
+        tab_bar = tk.Frame(self.app_content, bg=TAB_DARK, height=52)
         tab_bar.pack(fill="x")
         tab_bar.pack_propagate(False)
 
         self.entry_tab_btn = tk.Button(
-            tab_bar, text="Meter Entry", font=(FONT_FAMILY, 11, "bold"),
+            tab_bar, text="Meter Entry", font=(FONT_FAMILY, self._touch_font_base, "bold"),
             bg=TAB_DARK, fg=WHITE, relief="flat", bd=0, cursor="hand2",
             activebackground=TAB_DARK, activeforeground=WHITE,
             command=lambda: self._switch_page("meter_entry"))
         self.entry_tab_btn.pack(side="left", fill="both", expand=True)
 
         self.progress_tab_btn = tk.Button(
-            tab_bar, text="Progress", font=(FONT_FAMILY, 11, "bold"),
+            tab_bar, text="Progress", font=(FONT_FAMILY, self._touch_font_base, "bold"),
             bg=TAB_BLUE, fg=WHITE, relief="flat", bd=0, cursor="hand2",
             activebackground=TAB_BLUE, activeforeground=WHITE,
             command=lambda: self._switch_page("progress"))
@@ -616,8 +623,9 @@ class MeterReaderApp(tk.Tk):
         # Store user info for profile menu
 
         # Switch to app content
-        self.login_screen.place_forget()
-        self.app_content.pack(fill="both", expand=True)
+        self.login_screen.grid_remove()
+        self.app_content.grid()
+        self.app_content.tkraise()
 
         # Show welcome message
         messagebox.showinfo("Welcome", f"Welcome, {user['name']}!\n\nID: {user['id']}")
@@ -789,8 +797,9 @@ class MeterReaderApp(tk.Tk):
         if messagebox.askyesno("Logout", "Are you sure you want to logout?"):
             self._current_user = None
             self.login_screen.clear()
-            self.app_content.pack_forget()
-            self.login_screen.place(in_=self.main_container, x=0, y=0, relwidth=1, relheight=1)
+            self.app_content.grid_remove()
+            self.login_screen.grid()
+            self.login_screen.tkraise()
 
     def _switch_page(self, page_name):
         self._current_page = page_name
@@ -812,7 +821,9 @@ class MeterReaderApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════
     def _build_meter_entry_page(self):
         self.meter_entry_frame = tk.Frame(self.pages_container, bg=BG_COLOR)
-        self.meter_entry_frame.place(in_=self.pages_container, x=0, y=0, relwidth=1, relheight=1)
+        self.pages_container.grid_rowconfigure(0, weight=1)
+        self.pages_container.grid_columnconfigure(0, weight=1)
+        self.meter_entry_frame.grid(row=0, column=0, sticky="nsew")
 
         # ── Fixed Header ─────────────────────────────────────────────────
         header_bg = tk.Frame(self.meter_entry_frame, bg=HEADER_BLUE, height=48)
@@ -877,7 +888,7 @@ class MeterReaderApp(tk.Tk):
         self._active_zone_label.bind("<Leave>", lambda e: self._on_zone_btn_hover(False))
 
         self.search_var = tk.StringVar()
-        self.search_input = RoundedEntry(search_section, placeholder="Type 001, 002...", height=42, radius=8, font=(FONT_FAMILY, 12), textvariable=self.search_var)
+        self.search_input = RoundedEntry(search_section, placeholder="Type 001, 002...", height=50, radius=10, font=(FONT_FAMILY, self._touch_font_base), textvariable=self.search_var)
         self.search_input.pack(fill="x", pady=(2, 0))
         self.search_input.entry.bind("<Return>", self._on_search)
         self.search_input.entry.bind("<KeyRelease>", self._on_search_key)
@@ -999,12 +1010,12 @@ class MeterReaderApp(tk.Tk):
 
         self.reprint_btn = tk.Button(
             reprint_wrapper, text="🔄  Reprint Last Receipt",
-            font=(FONT_FAMILY, 11, "bold"),
+            font=(FONT_FAMILY, self._touch_font_base, "bold"),
             bg="#E3F2FD", fg=PRIMARY_BLUE,
             activebackground="#BBDEFB", activeforeground=PRIMARY_BLUE,
             relief="flat", bd=0, cursor="hand2",
             highlightthickness=0, command=self._show_reprint_dialog)
-        self.reprint_btn.pack(fill="x", ipady=8)
+        self.reprint_btn.pack(fill="x", ipady=12)
 
         self.reprint_btn.bind("<Enter>", lambda e: e.widget.config(bg="#BBDEFB"))
         self.reprint_btn.bind("<Leave>", lambda e: e.widget.config(bg="#E3F2FD"))
@@ -1013,7 +1024,7 @@ class MeterReaderApp(tk.Tk):
         paper_control = tk.Frame(main, bg=BG_COLOR)
         paper_control.pack(fill="x", padx=px, pady=(4, 0))
 
-        tk.Label(paper_control, text="Paper Status (Test):", font=(FONT_FAMILY, 9),
+        tk.Label(paper_control, text="Paper Status (Test):", font=(FONT_FAMILY, 10),
                  bg=BG_COLOR, fg=MID_TEXT).pack(side="left")
 
         paper_states = [
@@ -1024,8 +1035,8 @@ class MeterReaderApp(tk.Tk):
         ]
 
         for label, state, color in paper_states:
-            btn = tk.Label(paper_control, text=label, font=(FONT_FAMILY, 8, "bold"),
-                          bg=BG_COLOR, fg=color, cursor="hand2", padx=4)
+            btn = tk.Label(paper_control, text=label, font=(FONT_FAMILY, 10, "bold"),
+                          bg=BG_COLOR, fg=color, cursor="hand2", padx=8, pady=6)
             btn.pack(side="right")
             btn.bind("<Button-1>", lambda e, s=state: self.status_bar.set_paper_status(s))
 
@@ -1033,19 +1044,19 @@ class MeterReaderApp(tk.Tk):
         signal_control = tk.Frame(main, bg=BG_COLOR)
         signal_control.pack(fill="x", padx=px, pady=(2, 0))
 
-        tk.Label(signal_control, text="Signal:", font=(FONT_FAMILY, 9),
+        tk.Label(signal_control, text="Signal:", font=(FONT_FAMILY, 10),
                  bg=BG_COLOR, fg=MID_TEXT).pack(side="left")
         for i in range(5):
-            btn = tk.Label(signal_control, text=str(i), font=(FONT_FAMILY, 8),
-                          bg=BG_COLOR, fg=PRIMARY_BLUE, cursor="hand2", padx=2)
+            btn = tk.Label(signal_control, text=str(i), font=(FONT_FAMILY, 10),
+                          bg=BG_COLOR, fg=PRIMARY_BLUE, cursor="hand2", padx=6, pady=6)
             btn.pack(side="left")
             btn.bind("<Button-1>", lambda e, s=i: self.status_bar.set_signal(s))
 
-        tk.Label(signal_control, text="| Battery:", font=(FONT_FAMILY, 9),
+        tk.Label(signal_control, text="| Battery:", font=(FONT_FAMILY, 10),
                  bg=BG_COLOR, fg=MID_TEXT).pack(side="left", padx=(10, 0))
         for level, label in [(100, "100"), (50, "50"), (20, "20"), (10, "10")]:
-            btn = tk.Label(signal_control, text=label, font=(FONT_FAMILY, 8),
-                          bg=BG_COLOR, fg=PRIMARY_BLUE, cursor="hand2", padx=2)
+            btn = tk.Label(signal_control, text=label, font=(FONT_FAMILY, 10),
+                          bg=BG_COLOR, fg=PRIMARY_BLUE, cursor="hand2", padx=6, pady=6)
             btn.pack(side="left")
             btn.bind("<Button-1>", lambda e, l=level: self.status_bar.set_battery(l))
 
@@ -1055,7 +1066,7 @@ class MeterReaderApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════
     def _build_progress_page(self):
         self.progress_frame = tk.Frame(self.pages_container, bg=BG_COLOR)
-        self.progress_frame.place(in_=self.pages_container, x=0, y=0, relwidth=1, relheight=1)
+        self.progress_frame.grid(row=0, column=0, sticky="nsew")
 
         header_bg = tk.Frame(self.progress_frame, bg=HEADER_BLUE, height=48)
         header_bg.pack(fill="x")
