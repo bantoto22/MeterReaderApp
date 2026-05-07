@@ -12,6 +12,8 @@ import math
 import os
 import platform
 import ctypes
+import subprocess
+import shutil
 from PIL import Image, ImageTk
 from database import init_db, search_consumer, search_consumers_by_zone, save_reading, get_zone_stats, get_all_zone_names, get_zone_consumers_with_status, authenticate_user, get_all_users, seed_default_users
 from receipt import show_receipt
@@ -533,6 +535,8 @@ class MeterReaderApp(tk.Tk):
         self._shake_after_ids = []
         self._progress_anim_fraction = 0.0
         self._progress_anim_id = None
+        self._keyboard_proc = None
+        self._keyboard_hide_after_id = None
 
         # Currently loaded consumer from DB (None until a search is done)
         self._current_consumer = None
@@ -551,6 +555,7 @@ class MeterReaderApp(tk.Tk):
 
         # Build the UI
         self._build_ui()
+        self.bind_all("<Button-1>", self._on_global_pointer_down, add="+")
 
     def _build_ui(self):
         # ── Status Bar (Phone-style) ─────────────────────────────────────
@@ -579,6 +584,8 @@ class MeterReaderApp(tk.Tk):
         self.app_content.grid_remove()
 
         self._build_app_content()
+        self.bind_keyboard_to_entries(self.login_screen)
+        self.bind_keyboard_to_entries(self.app_content)
 
     def _on_main_container_resize(self, event=None):
         self._update_content_viewport()
@@ -590,6 +597,85 @@ class MeterReaderApp(tk.Tk):
         viewport_w = min(self._content_max_width, available_w)
         viewport_h = min(self._content_max_height, available_h)
         self.content_viewport.place_configure(width=viewport_w, height=viewport_h)
+
+    def _is_text_input_widget(self, widget):
+        if widget is None:
+            return False
+        return isinstance(widget, (tk.Entry, ttk.Entry))
+
+    def _schedule_keyboard_hide(self):
+        if self._keyboard_hide_after_id:
+            self.after_cancel(self._keyboard_hide_after_id)
+        self._keyboard_hide_after_id = self.after(120, self._hide_keyboard_if_no_text_focus)
+
+    def _hide_keyboard_if_no_text_focus(self):
+        self._keyboard_hide_after_id = None
+        focused = self.focus_get()
+        if not self._is_text_input_widget(focused):
+            self.hide_keyboard()
+
+    def show_keyboard(self):
+        """Launch matchbox-keyboard on Linux only when needed."""
+        if platform.system() != "Linux":
+            return
+
+        if self._keyboard_proc and self._keyboard_proc.poll() is None:
+            return
+
+        if shutil.which("matchbox-keyboard") is None:
+            return
+
+        try:
+            self._keyboard_proc = subprocess.Popen(
+                ["matchbox-keyboard"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"Unable to start matchbox-keyboard: {exc}")
+
+    def hide_keyboard(self):
+        """Close matchbox-keyboard safely when text input is no longer active."""
+        proc = self._keyboard_proc
+        if not proc:
+            return
+
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+        except Exception as exc:
+            print(f"Unable to close matchbox-keyboard: {exc}")
+        finally:
+            self._keyboard_proc = None
+
+    def bind_keyboard_to_entries(self, parent):
+        """Bind keyboard show/hide behavior to all Entry widgets under parent."""
+        if parent is None:
+            return
+
+        def _bind_entry(widget):
+            widget.bind("<FocusIn>", lambda e: self.show_keyboard(), add="+")
+            widget.bind("<Button-1>", lambda e: self.show_keyboard(), add="+")
+            widget.bind("<Return>", lambda e: self._schedule_keyboard_hide(), add="+")
+            widget.bind("<Escape>", lambda e: self.hide_keyboard(), add="+")
+            widget.bind("<FocusOut>", lambda e: self._schedule_keyboard_hide(), add="+")
+
+        for child in parent.winfo_children():
+            if isinstance(child, RoundedEntry):
+                _bind_entry(child.entry)
+            elif self._is_text_input_widget(child):
+                _bind_entry(child)
+            elif isinstance(child, ttk.Combobox):
+                _bind_entry(child)
+            self.bind_keyboard_to_entries(child)
+
+    def _on_global_pointer_down(self, event):
+        if not self._is_text_input_widget(event.widget):
+            self._schedule_keyboard_hide()
 
     def _build_app_content(self):
         """Build the main application content (shown after login)."""
@@ -623,6 +709,7 @@ class MeterReaderApp(tk.Tk):
     def _on_login_success(self, user: dict):
         """Handle successful login."""
         self._current_user = user
+        self.hide_keyboard()
 
         # Store user info for profile menu
 
@@ -800,12 +887,14 @@ class MeterReaderApp(tk.Tk):
         """Handle logout."""
         if messagebox.askyesno("Logout", "Are you sure you want to logout?"):
             self._current_user = None
+            self.hide_keyboard()
             self.login_screen.clear()
             self.app_content.grid_remove()
             self.login_screen.grid()
             self.login_screen.tkraise()
 
     def _switch_page(self, page_name):
+        self.hide_keyboard()
         self._current_page = page_name
 
         if page_name == "meter_entry":
