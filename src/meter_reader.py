@@ -507,20 +507,18 @@ class GroupCard(tk.Canvas):
 class MeterReaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.update_idletasks()
+        self._screen_width = self.winfo_screenwidth()
+        self._screen_height = self.winfo_screenheight()
 
         # Initialise the database (creates tables + seeds on first run)
         init_db()
         seed_default_users()  # Ensure default users exist
 
         self.title("Water Meter Reader")
-        self.geometry(f"{DEVICE_WIDTH}x{DEVICE_HEIGHT}")
-        self.resizable(False, False)
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
         self.configure(bg=BG_COLOR)
-
-        self.update_idletasks()
-        x = (self.winfo_screenwidth()  - DEVICE_WIDTH)  // 2
-        y = (self.winfo_screenheight() - DEVICE_HEIGHT) // 2
-        self.geometry(f"+{x}+{y}")
 
         self._current_page = "meter_entry"
         self._current_zone = tk.StringVar(value="Zone 1")
@@ -554,16 +552,33 @@ class MeterReaderApp(tk.Tk):
         # ── Main Container ───────────────────────────────────────────────
         self.main_container = tk.Frame(self, bg=BG_COLOR)
         self.main_container.pack(fill="both", expand=True)
+        self.main_container.bind("<Configure>", self._on_main_container_resize)
+
+        # Centered content viewport for portrait touchscreens.
+        self.content_viewport = tk.Frame(self.main_container, bg=BG_COLOR)
+        self.content_viewport.place(relx=0.5, rely=0.5, anchor="center")
+        self._update_content_viewport()
 
         # ── Login Screen (shown initially) ───────────────────────────────
-        self.login_screen = LoginScreen(self.main_container, self._on_login_success)
-        self.login_screen.place(in_=self.main_container, x=0, y=0, relwidth=1, relheight=1)
+        self.login_screen = LoginScreen(self.content_viewport, self._on_login_success)
+        self.login_screen.place(in_=self.content_viewport, x=0, y=0, relwidth=1, relheight=1)
 
         # ── App Content (hidden until login) ─────────────────────────────
-        self.app_content = tk.Frame(self.main_container, bg=BG_COLOR)
+        self.app_content = tk.Frame(self.content_viewport, bg=BG_COLOR)
         # Not packed yet - will be shown after login
 
         self._build_app_content()
+
+    def _on_main_container_resize(self, event=None):
+        self._update_content_viewport()
+
+    def _update_content_viewport(self):
+        """Keep app content centered while adapting to the current screen shape."""
+        available_w = max(1, self.main_container.winfo_width())
+        available_h = max(1, self.main_container.winfo_height())
+        viewport_w = min(DEVICE_WIDTH, available_w)
+        viewport_h = min(DEVICE_HEIGHT, available_h)
+        self.content_viewport.place_configure(width=viewport_w, height=viewport_h)
 
     def _build_app_content(self):
         """Build the main application content (shown after login)."""
