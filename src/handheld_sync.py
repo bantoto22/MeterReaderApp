@@ -27,6 +27,22 @@ except Exception:
         return False
 
 
+def _load_env_fallback(env_path: str) -> None:
+    """Simple .env loader fallback when python-dotenv is unavailable."""
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,11 +62,16 @@ class SyncConfig:
     main_pg_db: str
     main_pg_user: str
     main_pg_password: str
+    supabase_db_schema: str = "public"
     sync_enabled: bool = False
 
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "SyncConfig":
-        load_dotenv()
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        env_path = os.path.join(project_root, ".env")
+        loaded = load_dotenv(env_path)
+        if not loaded:
+            _load_env_fallback(env_path)
 
         sync_enabled = os.getenv("HANDHELD_SYNC_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
         required = [
@@ -77,10 +98,12 @@ class SyncConfig:
                 + ". Update .env from .env.example."
             )
 
+        supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "") or supabase_service_role_key
         return cls(
             supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
-            supabase_anon_key=os.getenv("SUPABASE_ANON_KEY", ""),
-            supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
+            supabase_anon_key=supabase_anon_key,
+            supabase_service_role_key=supabase_service_role_key,
             local_pg_host=os.getenv("LOCAL_PG_HOST", ""),
             local_pg_port=int(os.getenv("LOCAL_PG_PORT", "5432")),
             local_pg_db=os.getenv("LOCAL_PG_DB", ""),
@@ -91,6 +114,7 @@ class SyncConfig:
             main_pg_db=os.getenv("MAIN_PG_DB", ""),
             main_pg_user=os.getenv("MAIN_PG_USER", ""),
             main_pg_password=os.getenv("MAIN_PG_PASSWORD", ""),
+            supabase_db_schema=os.getenv("SUPABASE_DB_SCHEMA", "public"),
             sync_enabled=sync_enabled,
         )
 
@@ -121,6 +145,9 @@ class LocalSyncStore:
         raise NotImplementedError
 
     def log_audit(self, queue_id: int | None, status: str, message: str, payload: dict | None = None) -> None:
+        raise NotImplementedError
+
+    def get_recent_audit(self, limit: int = 20) -> list[dict]:
         raise NotImplementedError
 
 
@@ -334,12 +361,27 @@ class PostgresLocalSyncStore(LocalSyncStore):
                 )
             conn.commit()
 
+    def get_recent_audit(self, limit: int = 20) -> list[dict]:
+        sql = """
+        SELECT id, queue_id, status, message, payload, created_at
+        FROM sync_audit_log
+        ORDER BY id DESC
+        LIMIT %s
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (max(1, min(limit, 200)),))
+                rows = cur.fetchall()
+        return list(rows)
+
 
 class SupabaseRestClient:
     def __init__(self, cfg: SyncConfig):
         self._url = cfg.supabase_url
         self._anon_key = cfg.supabase_anon_key
         self._service_key = cfg.supabase_service_role_key
+        self._schema = cfg.supabase_db_schema or "public"
+        self._meterreadings_columns: set[str] | None = None
 
     def _req(self, method: str, table_or_path: str, *, query: dict | None = None, payload: dict | list | None = None,
              use_service_key: bool = False, extra_headers: dict | None = None) -> tuple[int, object]:
@@ -352,6 +394,8 @@ class SupabaseRestClient:
             "apikey": self._service_key if use_service_key else self._anon_key,
             "Authorization": f"Bearer {self._service_key if use_service_key else self._anon_key}",
             "Content-Type": "application/json",
+            "Accept-Profile": self._schema,
+            "Content-Profile": self._schema,
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -384,6 +428,29 @@ class SupabaseRestClient:
             raise RuntimeError(f"Supabase read failed: {data}")
         return data if isinstance(data, list) else []
 
+    def _get_meterreadings_columns(self) -> set[str]:
+        if self._meterreadings_columns is not None:
+            return self._meterreadings_columns
+        status, data = self._req("GET", "/rest/v1/", use_service_key=True)
+        cols: set[str] = set()
+        if status == 200 and isinstance(data, dict):
+            path_obj = data.get("paths", {}).get("/meterreadings", {})
+            # Try to collect insert-able/readable params from OpenAPI shape.
+            for method in ("post", "patch", "get"):
+                m = path_obj.get(method, {})
+                for prm in m.get("parameters", []):
+                    schema = prm.get("schema", {})
+                    props = schema.get("properties", {})
+                    if isinstance(props, dict):
+                        cols.update(props.keys())
+        # Fallback: probe one row and use keys from response.
+        if not cols:
+            st2, d2 = self._req("GET", "meterreadings", query={"select": "*", "limit": "1"}, use_service_key=True)
+            if st2 < 400 and isinstance(d2, list) and d2 and isinstance(d2[0], dict):
+                cols.update(d2[0].keys())
+        self._meterreadings_columns = cols
+        return cols
+
     def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
         query = {
             "select": "reading_id,consumer_id,reading_date,updated_at,present_reading",
@@ -399,23 +466,88 @@ class SupabaseRestClient:
             return data[0]
         return None
 
+    def get_consumer_context(self, consumer_id: int) -> dict:
+        # Prefer a broad select to avoid hard-failing when some expected columns
+        # (for example route_id) do not exist in a given deployment.
+        query = {
+            "select": "*",
+            "id": f"eq.{consumer_id}",
+            "limit": "1",
+        }
+        status, data = self._req("GET", "consumer", query=query, use_service_key=True)
+        if status >= 400 or not isinstance(data, list) or not data:
+            return {}
+        row = data[0]
+        return row if isinstance(row, dict) else {}
+
+    def _build_remote_payload(self, payload: dict) -> dict:
+        rid = payload.get("reading_id")
+        rid_int = None
+        try:
+            if rid is not None and str(rid).isdigit():
+                rid_int = int(str(rid))
+        except Exception:
+            rid_int = None
+
+        candidate_payload = {
+            # Send reading_id only if numeric and compatible with remote integer column.
+            "reading_id": rid_int,
+            "consumer_id": payload.get("consumer_id"),
+            # Remote schema uses current_reading instead of present_reading.
+            "current_reading": payload.get("present_reading"),
+            "consumption": payload.get("consumption"),
+            # Remote schema uses notes instead of exception.
+            "notes": payload.get("exception"),
+            "reading_date": payload.get("reading_date"),
+        }
+
+        consumer_id = payload.get("consumer_id")
+        ctx = self.get_consumer_context(int(consumer_id)) if consumer_id is not None else {}
+        if ctx:
+            candidate_payload.setdefault("route_id", ctx.get("route_id"))
+            candidate_payload.setdefault("meter_id", ctx.get("meter_id"))
+            candidate_payload.setdefault("meter_reader_id", ctx.get("meter_reader_id"))
+
+        candidate_payload = {k: v for k, v in candidate_payload.items() if v is not None}
+        allowed = self._get_meterreadings_columns()
+        remote_payload = {k: v for k, v in candidate_payload.items() if (not allowed or k in allowed)}
+        if not remote_payload:
+            raise RuntimeError("No compatible columns found for meterreadings payload.")
+
+        # Preflight only core fields that should always exist for a reading row.
+        required_if_available = ("consumer_id", "reading_date")
+        missing_required = [k for k in required_if_available if ((not allowed or k in allowed) and k not in remote_payload)]
+        if missing_required:
+            raise ValueError(
+                f"Missing required fields for remote meterreadings row: {', '.join(missing_required)}. "
+                "Consumer mapping may be missing."
+            )
+
+        return remote_payload
+
     def upsert_meter_reading(self, payload: dict) -> dict:
+        remote_payload = self._build_remote_payload(payload)
+
         headers = {
             "Prefer": "resolution=merge-duplicates,return=representation",
         }
+        query = {}
+        if "reading_id" in remote_payload:
+            query["on_conflict"] = "reading_id"
+
         status, data = self._req(
             "POST",
             "meterreadings",
-            payload=payload,
+            payload=remote_payload,
             use_service_key=True,
             extra_headers=headers,
-            query={"on_conflict": "reading_id"},
+            query=query if query else None,
         )
         if status >= 400:
             raise RuntimeError(f"Supabase write failed: {data}")
         if isinstance(data, list) and data:
             return data[0]
-        return payload
+        return remote_payload
 
 
 class HandheldSyncDataAccess:
@@ -495,6 +627,41 @@ class HandheldSyncDataAccess:
     def listPendingSyncReadings(self) -> list[dict]:
         return self.local.list_pending()
 
+    def get_recent_audit_entries(self, limit: int = 20) -> list[dict]:
+        return self.local.get_recent_audit(limit=limit)
+
+    def get_last_successful_sync_time(self) -> str | None:
+        entries = self.local.get_recent_audit(limit=100)
+        for row in entries:
+            status = str(row.get("status", "")).lower()
+            msg = str(row.get("message", "")).lower()
+            if status == "success" and "synced" in msg:
+                created = row.get("created_at")
+                return str(created) if created else None
+        return None
+
+    def get_sync_snapshot(self) -> dict:
+        pending = self.listPendingSyncReadings()
+        status = "Online" if self.is_online() else "Offline"
+        has_failed = any(row.get("status") == "failed" for row in pending)
+        has_pending = len(pending) > 0
+        if has_failed:
+            save_target = "Local Queue (sync retry pending)"
+        elif status == "Online":
+            save_target = "Supabase (online)"
+        else:
+            save_target = "Local Queue (offline)"
+        backup_state = "Backed up to main system" if (status == "Online" and not has_pending) else "Not fully backed up"
+        last_sync = self.get_last_successful_sync_time()
+        return {
+            "status": status,
+            "pending_count": len(pending),
+            "has_failed": has_failed,
+            "save_target": save_target,
+            "backup_state": backup_state,
+            "last_sync_time": last_sync,
+        }
+
     def syncPendingReadings(self) -> dict:
         if not self.is_online():
             self.local.log_audit(None, "failed", "Sync skipped, offline")
@@ -509,6 +676,8 @@ class HandheldSyncDataAccess:
             queue_id = row["id"]
             payload = row["payload"]
             try:
+                # Validate payload early so permanently invalid rows don't keep retrying.
+                self.remote._build_remote_payload(payload)
                 existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
                 if existing and existing.get("updated_at") and payload.get("updated_at"):
                     if str(existing["updated_at"]) > str(payload["updated_at"]):
@@ -522,6 +691,10 @@ class HandheldSyncDataAccess:
                 self.local.mark_synced(queue_id)
                 self.local.log_audit(queue_id, "success", "Queue row synced", payload)
                 synced += 1
+            except ValueError as exc:
+                self.local.mark_conflict(queue_id, str(exc))
+                self.local.log_audit(queue_id, "conflict", f"Queue row invalid for remote sync: {exc}", payload)
+                conflicts += 1
             except Exception as exc:
                 self.local.mark_failed(queue_id, str(exc))
                 self.local.log_audit(queue_id, "failed", f"Queue row sync failed: {exc}", payload)

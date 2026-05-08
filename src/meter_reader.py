@@ -12,6 +12,8 @@ import math
 import os
 import platform
 import ctypes
+import socket
+import subprocess
 from datetime import datetime, timezone
 from PIL import Image, ImageTk
 try:
@@ -166,6 +168,9 @@ class StatusBar(tk.Canvas):
         self._signal_strength = max(0, min(4, strength))
         self._redraw()
 
+    def get_signal(self) -> int:
+        return self._signal_strength
+
     def set_paper_status(self, status: str):
         """Set paper status: 'ok', 'low', 'out', 'jam'."""
         self._paper_status = status
@@ -274,6 +279,8 @@ class LoginScreen(tk.Frame):
         self._build_ui()
 
     def _build_ui(self):
+        self._configure_global_ui_styles()
+        self._configure_global_ui_styles()
         self.pack_propagate(False)
         # Header
         header = tk.Frame(self, bg=HEADER_BLUE, height=92)
@@ -550,10 +557,6 @@ class MeterReaderApp(tk.Tk):
         self._screen_width = screen_width
         self._screen_height = screen_height
 
-        # Initialise the database (creates tables + seeds on first run)
-        init_db()
-        seed_default_users()  # Ensure default users exist
-
         self.title("Water Meter Reader")
         self.attributes("-fullscreen", True)
         self.geometry(f"{screen_width}x{screen_height}+0+0")
@@ -571,6 +574,7 @@ class MeterReaderApp(tk.Tk):
         self._progress_anim_id = None
         self._keyboard_target = None
         self._keyboard_mode = "alpha"
+        self._keyboard_caps = False
         self._keyboard_hide_after_id = None
         self._sync_dal = None
         self._sync_state = "Offline"
@@ -578,8 +582,8 @@ class MeterReaderApp(tk.Tk):
 
         # Currently loaded consumer from DB (None until a search is done)
         self._current_consumer = None
-        # Cache zone stats from DB
-        self._zones_data = get_zone_stats()
+        # Cache zone stats from DB (loaded during startup sequence)
+        self._zones_data = {}
         # Autocomplete state
         self._autocomplete_popup = None
         self._autocomplete_results = []
@@ -590,11 +594,152 @@ class MeterReaderApp(tk.Tk):
 
         # Last receipt data for reprint workflow
         self._last_receipt_data = None
+        self._loading_frame = None
 
-        # Build the UI
-        self._build_ui()
-        self._init_handheld_sync()
-        self.bind_all("<Button-1>", self._on_global_pointer_down, add="+")
+        # Show loading page first, then complete initialization.
+        self._show_loading_page()
+        self.update_idletasks()
+        self.after(120, self._finish_startup)
+
+    def _show_loading_page(self):
+        self._loading_frame = tk.Frame(self, bg=BG_COLOR)
+        self._loading_frame.pack(fill="both", expand=True)
+
+        center = tk.Frame(self._loading_frame, bg=BG_COLOR)
+        center.pack(expand=True)
+
+        tk.Label(
+            center,
+            text="Meter Reader Device",
+            font=(FONT_FAMILY, 20, "bold"),
+            bg=BG_COLOR,
+            fg=PRIMARY_BLUE,
+        ).pack(pady=(0, 12))
+
+        tk.Label(
+            center,
+            text="Loading data and sync services...",
+            font=(FONT_FAMILY, 11),
+            bg=BG_COLOR,
+            fg=MID_TEXT,
+        ).pack()
+
+        self._loading_status_label = tk.Label(
+            center,
+            text="Please wait",
+            font=(FONT_FAMILY, 10),
+            bg=BG_COLOR,
+            fg=LIGHT_TEXT,
+        )
+        self._loading_status_label.pack(pady=(10, 0))
+        self._loading_progress = ttk.Progressbar(center, mode="indeterminate", length=280)
+        self._loading_progress.pack(pady=(14, 0))
+        self._loading_progress.start(12)
+
+    def _finish_startup(self):
+        startup_ok = False
+        try:
+            self._loading_status_label.config(text="Initializing local database...")
+            self.update_idletasks()
+            init_db()
+            seed_default_users()  # Ensure default users exist
+
+            self._zones_data = get_zone_stats()
+
+            self._loading_status_label.config(text="Building interface...")
+            self.update_idletasks()
+            self._build_ui()
+
+            self._loading_status_label.config(text="Checking sync services...")
+            self.update_idletasks()
+            self._init_handheld_sync()
+            self._start_system_status_updates()
+
+            self.bind_all("<Button-1>", self._on_global_pointer_down, add="+")
+            startup_ok = True
+        except Exception as exc:
+            if hasattr(self, "_loading_progress"):
+                self._loading_progress.stop()
+            self._loading_status_label.config(text=f"Startup failed: {exc}")
+            messagebox.showerror("Startup Error", f"Failed to initialize app:\n\n{exc}")
+            return
+        finally:
+            if hasattr(self, "_loading_progress"):
+                self._loading_progress.stop()
+            if startup_ok and self._loading_frame and self._loading_frame.winfo_exists():
+                self._loading_frame.destroy()
+
+    def _start_system_status_updates(self):
+        self._update_system_status()
+        self.after(15000, self._start_system_status_updates)
+
+    def _update_system_status(self):
+        """Update status bar with real connectivity, battery, and signal when available."""
+        online = self._is_internet_reachable()
+        battery = self._read_battery_level()
+        signal = self._read_signal_strength(online)
+        self.status_bar.set_signal(signal)
+        if battery is not None:
+            self.status_bar.set_battery(battery)
+
+    @staticmethod
+    def _is_internet_reachable(timeout_sec: float = 2.0) -> bool:
+        try:
+            with socket.create_connection(("1.1.1.1", 53), timeout=timeout_sec):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _read_battery_level() -> int | None:
+        # Raspberry Pi HATs and Linux battery devices expose capacity via /sys.
+        try:
+            power_supply_dir = "/sys/class/power_supply"
+            if os.path.isdir(power_supply_dir):
+                for name in os.listdir(power_supply_dir):
+                    cap_path = os.path.join(power_supply_dir, name, "capacity")
+                    if os.path.exists(cap_path):
+                        with open(cap_path, "r", encoding="utf-8") as f:
+                            value = int(f.read().strip())
+                        return max(0, min(100, value))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _read_signal_strength(online: bool) -> int:
+        # On Linux, map Wi-Fi link quality to 0-4 bars when available.
+        if not online:
+            return 0
+        if platform.system() != "Linux":
+            return 4
+        try:
+            proc = subprocess.run(
+                ["cat", "/proc/net/wireless"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ":" in ln]
+            if not lines:
+                return 4
+            # Example: wlan0: 0000 54. -56. -256 ...
+            parts = lines[0].replace(":", " ").split()
+            if len(parts) >= 3:
+                quality = float(parts[2].strip("."))
+                # Linux wireless quality is usually out of 70
+                pct = max(0.0, min(1.0, quality / 70.0))
+                if pct >= 0.8:
+                    return 4
+                if pct >= 0.6:
+                    return 3
+                if pct >= 0.35:
+                    return 2
+                return 1
+        except Exception:
+            pass
+        return 4
 
     def _build_ui(self):
         # ── Status Bar (Phone-style) ─────────────────────────────────────
@@ -632,6 +777,38 @@ class MeterReaderApp(tk.Tk):
         self.bind_keyboard_to_entries(self.app_content)
         self._refresh_sync_status_ui()
 
+    def _configure_global_ui_styles(self):
+        """Normalize ttk dropdown/list styles so text matches app typography."""
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        combo_font = (FONT_FAMILY, self._touch_font_base, "bold")
+        style.configure(
+            "Figma.TCombobox",
+            fieldbackground=INPUT_BG,
+            background=WHITE,
+            foreground=DARK_TEXT,
+            bordercolor=INPUT_BORDER,
+            arrowcolor=MID_TEXT,
+            relief="flat",
+            padding=8,
+            font=combo_font,
+        )
+        style.map(
+            "Figma.TCombobox",
+            fieldbackground=[("readonly", INPUT_BG)],
+            foreground=[("readonly", DARK_TEXT)],
+            bordercolor=[("focus", INPUT_FOCUS)],
+        )
+        self.option_add("*TCombobox*Listbox.font", f"{FONT_FAMILY} {self._touch_font_base}")
+        self.option_add("*TCombobox*Listbox.background", WHITE)
+        self.option_add("*TCombobox*Listbox.foreground", DARK_TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", PRIMARY_BLUE)
+        self.option_add("*TCombobox*Listbox.selectForeground", WHITE)
+
     def _init_handheld_sync(self):
         """Initialize optional handheld sync layer from environment configuration."""
         if HandheldSyncDataAccess is None or SyncConfig is None:
@@ -656,17 +833,23 @@ class MeterReaderApp(tk.Tk):
 
     def _refresh_sync_status_ui(self, detail: str = ""):
         pending = 0
+        save_target = "Local SQLite only"
+        backup_state = "Not configured"
+        last_sync = "Never"
         if self._sync_dal:
             try:
-                pending = len(self._sync_dal.listPendingSyncReadings())
+                snap = self._sync_dal.get_sync_snapshot()
+                pending = int(snap.get("pending_count", 0))
+                self._sync_state = str(snap.get("status", self._sync_state))
+                save_target = str(snap.get("save_target", save_target))
+                backup_state = str(snap.get("backup_state", backup_state))
+                if snap.get("last_sync_time"):
+                    last_sync = str(snap.get("last_sync_time"))
             except Exception:
                 self._sync_state = "Sync Failed"
+                save_target = "Unavailable (sync error)"
+                backup_state = "Unknown"
         self._sync_pending_count = pending
-        if self._sync_dal and self._sync_state != "Sync Failed":
-            try:
-                self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
-            except Exception:
-                self._sync_state = "Sync Failed"
 
         if self._sync_state == "Online" and pending > 0:
             status_text = "Pending Sync"
@@ -683,8 +866,18 @@ class MeterReaderApp(tk.Tk):
 
         if hasattr(self, "_sync_status_label"):
             self._sync_status_label.config(text=f"Sync: {status_text}", fg=status_color)
+        if hasattr(self, "_settings_sync_status"):
+            self._settings_sync_status.config(text=f"Sync: {status_text}", fg=status_color)
         if hasattr(self, "_sync_pending_label"):
             self._sync_pending_label.config(text=f"Pending: {pending}")
+        if hasattr(self, "_settings_pending_label"):
+            self._settings_pending_label.config(text=f"Pending: {pending}")
+        if hasattr(self, "_sync_target_label"):
+            self._sync_target_label.config(text=f"Save Target: {save_target}")
+        if hasattr(self, "_sync_backup_label"):
+            self._sync_backup_label.config(text=f"Backup: {backup_state}")
+        if hasattr(self, "_sync_last_label"):
+            self._sync_last_label.config(text=f"Last Sync: {last_sync}")
         if detail and hasattr(self, "_sync_pending_label"):
             self._sync_pending_label.config(text=f"Pending: {pending} ({detail})")
 
@@ -726,50 +919,79 @@ class MeterReaderApp(tk.Tk):
             self.hide_keyboard()
 
     def _build_in_app_keyboard(self):
-        self._keyboard_content = tk.Frame(self.keyboard_panel, bg=TAB_DARK)
-        self._keyboard_content.pack(fill="both", expand=True, padx=6, pady=6)
+        self.keyboard_panel.configure(bg="#1C2434")
+        self._keyboard_content = tk.Frame(self.keyboard_panel, bg="#1C2434")
+        self._keyboard_content.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def _keyboard_btn(self, parent, text, command, expand=False):
+    def _keyboard_btn(self, parent, text, command, expand=False, bg_color=TAB_DARK, fg_color=WHITE):
         btn = tk.Button(
             parent,
             text=text,
             font=(FONT_FAMILY, self._touch_font_base, "bold"),
-            bg=PRIMARY_BLUE,
-            fg=WHITE,
-            activebackground=ACCENT_BLUE,
-            activeforeground=WHITE,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground="#354766",
+            activeforeground=fg_color,
             relief="flat",
             bd=0,
             cursor="hand2",
             command=command,
             padx=6,
-            pady=6,
+            pady=4,
+            highlightthickness=0,
         )
-        btn.pack(side="left", fill="both", expand=expand, padx=3, pady=3, ipady=8)
+        btn.pack(side="left", fill="both", expand=expand, padx=4, pady=4, ipady=10)
         return btn
+
+    def _toggle_keyboard_mode(self):
+        self._keyboard_mode = "numeric" if self._keyboard_mode != "numeric" else "alpha"
+        self._render_keyboard()
+
+    def _toggle_keyboard_caps(self):
+        self._keyboard_caps = not self._keyboard_caps
+        self._render_keyboard()
 
     def _render_keyboard(self):
         for child in self._keyboard_content.winfo_children():
             child.destroy()
 
         if self._keyboard_mode == "numeric":
-            rows = ["123", "456", "789", "0"]
+            rows = ["123", "456", "789"]
         else:
-            rows = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
+            rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
 
         for row_keys in rows:
-            row = tk.Frame(self._keyboard_content, bg=TAB_DARK)
+            row = tk.Frame(self._keyboard_content, bg="#1C2434")
             row.pack(fill="x")
             for key_char in row_keys:
-                self._keyboard_btn(row, key_char.upper(), lambda c=key_char: self._insert_key(c), expand=True)
+                if key_char == "⌫":
+                    self._keyboard_btn(row, "⌫", self._backspace_key, expand=True, bg_color="#2B3550", fg_color="#66C6FF")
+                else:
+                    label = key_char.upper() if self._keyboard_caps else key_char
+                    value = key_char.upper() if self._keyboard_caps else key_char
+                    self._keyboard_btn(row, label, lambda c=value: self._insert_key(c), expand=True, bg_color="#253048", fg_color="#66C6FF")
 
-        action_row = tk.Frame(self._keyboard_content, bg=TAB_DARK)
-        action_row.pack(fill="x")
-        self._keyboard_btn(action_row, "Backspace", self._backspace_key, expand=True)
-        self._keyboard_btn(action_row, "Clear", self._clear_key, expand=True)
+        if self._keyboard_mode == "numeric":
+            bottom_row = tk.Frame(self._keyboard_content, bg="#1C2434")
+            bottom_row.pack(fill="x")
+            self._keyboard_btn(bottom_row, "↵", self._toggle_keyboard_mode, expand=True, bg_color="#253048", fg_color="#66C6FF")
+            self._keyboard_btn(bottom_row, "0", lambda: self._insert_key("0"), expand=True, bg_color="#253048", fg_color="#66C6FF")
+            self._keyboard_btn(bottom_row, "⌫", self._backspace_key, expand=True, bg_color="#2B3550", fg_color="#66C6FF")
+
         if self._keyboard_mode != "numeric":
-            self._keyboard_btn(action_row, "Space", lambda: self._insert_key(" "), expand=True)
-        self._keyboard_btn(action_row, "Done", self.hide_keyboard, expand=True)
+            action_row = tk.Frame(self._keyboard_content, bg="#1C2434")
+            action_row.pack(fill="x")
+            self._keyboard_btn(action_row, "123", self._toggle_keyboard_mode, expand=False, bg_color="#253048", fg_color="#66C6FF")
+            self._keyboard_btn(
+                action_row,
+                "⇧" if not self._keyboard_caps else "⇧ ON",
+                self._toggle_keyboard_caps,
+                expand=True,
+                bg_color="#334360" if self._keyboard_caps else "#253048",
+                fg_color="#66C6FF",
+            )
+            self._keyboard_btn(action_row, "space", lambda: self._insert_key(" "), expand=True, bg_color="#2C374F", fg_color="#66C6FF")
+            self._keyboard_btn(action_row, "⌫", self._backspace_key, expand=False, bg_color="#2B3550", fg_color="#66C6FF")
 
     def _get_keyboard_target(self):
         focused = self.focus_get()
@@ -852,7 +1074,7 @@ class MeterReaderApp(tk.Tk):
         if self._is_widget_in_keyboard_panel(event.widget):
             return
         if not self._is_text_input_widget(event.widget):
-            self._schedule_keyboard_hide()
+            self.hide_keyboard()
 
     def _build_app_content(self):
         """Build the main application content (shown after login)."""
@@ -875,12 +1097,20 @@ class MeterReaderApp(tk.Tk):
             command=lambda: self._switch_page("progress"))
         self.progress_tab_btn.pack(side="left", fill="both", expand=True)
 
+        self.settings_tab_btn = tk.Button(
+            tab_bar, text="Settings", font=(FONT_FAMILY, self._touch_font_base, "bold"),
+            bg=TAB_BLUE, fg=WHITE, relief="flat", bd=0, cursor="hand2",
+            activebackground=TAB_BLUE, activeforeground=WHITE,
+            command=lambda: self._switch_page("settings"))
+        self.settings_tab_btn.pack(side="left", fill="both", expand=True)
+
         # ── Pages Container ─────────────────────────────────────────────
         self.pages_container = tk.Frame(self.app_content, bg=BG_COLOR)
         self.pages_container.pack(fill="both", expand=True)
 
         self._build_meter_entry_page()
         self._build_progress_page()
+        self._build_settings_page()
         self._switch_page("meter_entry")
 
     def _on_login_success(self, user: dict):
@@ -894,6 +1124,7 @@ class MeterReaderApp(tk.Tk):
         self.login_screen.grid_remove()
         self.app_content.grid()
         self.app_content.tkraise()
+        self._refresh_zone_stats()
 
         # Show welcome message
         messagebox.showinfo("Welcome", f"Welcome, {user['name']}!\n\nID: {user['id']}")
@@ -1077,14 +1308,21 @@ class MeterReaderApp(tk.Tk):
         if page_name == "meter_entry":
             self.entry_tab_btn.config(bg=TAB_DARK, activebackground=TAB_DARK)
             self.progress_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
+            self.settings_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
             self.meter_entry_frame.tkraise()
-        else:
+        elif page_name == "progress":
             self.entry_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
             self.progress_tab_btn.config(bg=TAB_DARK, activebackground=TAB_DARK)
+            self.settings_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
             self.progress_frame.tkraise()
             self._animate_progress_bar()
             # Hide autocomplete when switching to progress tab
             self._hide_autocomplete()
+        else:
+            self.entry_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
+            self.progress_tab_btn.config(bg=TAB_BLUE, activebackground=TAB_BLUE)
+            self.settings_tab_btn.config(bg=TAB_DARK, activebackground=TAB_DARK)
+            self.settings_frame.tkraise()
 
     # ══════════════════════════════════════════════════════════════════════
     #  METER ENTRY PAGE (Non-Scrolling, Compact Grouped Card)
@@ -1174,6 +1412,9 @@ class MeterReaderApp(tk.Tk):
             sync_row, text="Pending: 0", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=BG_COLOR
         )
         self._sync_pending_label.pack(side="left", padx=(10, 0))
+        self._sync_target_label = None
+        self._sync_backup_label = None
+        self._sync_last_label = None
         self._sync_now_btn = tk.Button(
             sync_row,
             text="Sync Now",
@@ -1190,6 +1431,7 @@ class MeterReaderApp(tk.Tk):
             pady=6,
         )
         self._sync_now_btn.pack(side="right")
+        self._sync_log_btn = None
 
         # ── Grouped Detail Card ──────────────────────────────────────────
         self.group_card = GroupCard(main, radius=10, bg_color=WHITE)
@@ -1266,18 +1508,23 @@ class MeterReaderApp(tk.Tk):
         self.exception_var = tk.StringVar(value="None")
 
         style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Figma.TCombobox",
-                         fieldbackground=INPUT_BG,
-                         background=WHITE,
-                         foreground=DARK_TEXT,
-                         bordercolor=INPUT_BORDER,
-                         arrowcolor=MID_TEXT,
-                         relief="flat",
-                         padding=6)
-        style.map("Figma.TCombobox",
-                   fieldbackground=[("readonly", INPUT_BG)],
-                   bordercolor=[("focus", INPUT_FOCUS)])
+        style.configure(
+            "Figma.TCombobox",
+            fieldbackground=INPUT_BG,
+            background=WHITE,
+            foreground=DARK_TEXT,
+            bordercolor=INPUT_BORDER,
+            arrowcolor=MID_TEXT,
+            relief="flat",
+            padding=8,
+            font=(FONT_FAMILY, self._touch_font_base, "bold"),
+        )
+        style.map(
+            "Figma.TCombobox",
+            fieldbackground=[("readonly", INPUT_BG)],
+            foreground=[("readonly", DARK_TEXT)],
+            bordercolor=[("focus", INPUT_FOCUS)],
+        )
 
         ttk.Combobox(ei, textvariable=self.exception_var,
                      values=["None", "Stuck Meter", "Leaking", "No Access", "Broken Seal"],
@@ -1423,6 +1670,76 @@ class MeterReaderApp(tk.Tk):
 
         self._zone_info_canvas.bind("<Configure>", self._redraw_zone_card)
         self._progress_canvas.bind("<Configure>", self._redraw_progress_card)
+
+    def _build_settings_page(self):
+        self.settings_frame = tk.Frame(self.pages_container, bg=BG_COLOR)
+        self.settings_frame.grid(row=0, column=0, sticky="nsew")
+
+        header_bg = tk.Frame(self.settings_frame, bg=HEADER_BLUE, height=48)
+        header_bg.pack(fill="x")
+        header_bg.pack_propagate(False)
+        tk.Label(
+            header_bg,
+            text="Settings",
+            font=(FONT_FAMILY, 14, "bold"),
+            bg=HEADER_BLUE,
+            fg=WHITE,
+        ).pack(expand=True)
+
+        main = tk.Frame(self.settings_frame, bg=BG_COLOR)
+        main.pack(fill="both", expand=True, padx=18, pady=12)
+
+        card = GroupCard(main, radius=10, bg_color=WHITE)
+        card.pack(fill="x", pady=(0, 8))
+        inner = card.inner_frame
+
+        tk.Label(inner, text="Sync Diagnostics", font=(FONT_FAMILY, 12, "bold"), fg=DARK_TEXT, bg=WHITE).pack(anchor="w")
+        self._settings_sync_status = tk.Label(inner, text="Sync: Offline", font=(FONT_FAMILY, 11, "bold"), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._settings_sync_status.pack(fill="x", pady=(6, 0))
+        self._settings_pending_label = tk.Label(inner, text="Pending: 0", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._settings_pending_label.pack(fill="x", pady=(2, 0))
+        self._sync_target_label = tk.Label(inner, text="Save Target: Local SQLite only", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._sync_target_label.pack(fill="x", pady=(2, 0))
+        self._sync_backup_label = tk.Label(inner, text="Backup: Not configured", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._sync_backup_label.pack(fill="x", pady=(2, 0))
+        self._sync_last_label = tk.Label(inner, text="Last Sync: Never", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._sync_last_label.pack(fill="x", pady=(2, 0))
+
+        btn_row = tk.Frame(main, bg=BG_COLOR)
+        btn_row.pack(fill="x")
+        self._settings_sync_now_btn = tk.Button(
+            btn_row,
+            text="Sync Now",
+            font=(FONT_FAMILY, 10, "bold"),
+            bg=PRIMARY_BLUE,
+            fg=WHITE,
+            activebackground=ACCENT_BLUE,
+            activeforeground=WHITE,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._on_manual_sync_now,
+            padx=10,
+            pady=8,
+        )
+        self._settings_sync_now_btn.pack(side="left")
+
+        self._sync_log_btn = tk.Button(
+            btn_row,
+            text="View Logs",
+            font=(FONT_FAMILY, 10, "bold"),
+            bg=TAB_DARK,
+            fg=WHITE,
+            activebackground=DARK_HOVER,
+            activeforeground=WHITE,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._show_sync_logs,
+            padx=10,
+            pady=8,
+        )
+        self._sync_log_btn.pack(side="left", padx=(8, 0))
 
     def _redraw_zone_card(self, event=None):
         c = self._zone_info_canvas
@@ -1740,7 +2057,40 @@ class MeterReaderApp(tk.Tk):
             messagebox.showinfo("Sync Complete", "Zone data refreshed from the database.")
 
     def _on_manual_sync_now(self):
+        self._refresh_sync_status_ui("checking connection")
         self._on_sync()
+
+    def _show_sync_logs(self):
+        if not self._sync_dal:
+            messagebox.showinfo("Sync Logs", "Sync layer is not enabled/configured.")
+            return
+        try:
+            entries = self._sync_dal.get_recent_audit_entries(limit=25)
+        except Exception as exc:
+            messagebox.showerror("Sync Logs", f"Unable to load logs: {exc}")
+            return
+
+        popup = tk.Toplevel(self)
+        popup.title("Sync Logs")
+        popup.geometry("460x420")
+        popup.configure(bg=BG_COLOR)
+
+        title = tk.Label(popup, text="Recent Sync Activity", font=(FONT_FAMILY, 12, "bold"), bg=BG_COLOR, fg=DARK_TEXT)
+        title.pack(anchor="w", padx=12, pady=(10, 6))
+
+        text = tk.Text(popup, wrap="word", font=(FONT_FAMILY, 9), bg=WHITE, fg=DARK_TEXT, relief="flat", bd=1)
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        if not entries:
+            text.insert("end", "No sync log entries yet.")
+        else:
+            for row in entries:
+                created = row.get("created_at", "")
+                status = str(row.get("status", "")).upper()
+                msg = row.get("message", "")
+                qid = row.get("queue_id")
+                text.insert("end", f"[{created}] {status}  queue_id={qid}\n{msg}\n\n")
+        text.configure(state="disabled")
 
     def _refresh_zone_stats(self):
         """Reload zone statistics from the database and redraw the progress tab."""
@@ -2046,6 +2396,7 @@ class MeterReaderApp(tk.Tk):
 
             messagebox.showinfo("Saved for Reprint",
                 "Reading saved successfully.\n\nYou can reprint this receipt once the paper issue is resolved.")
+            self._refresh_zone_stats()
             self._clear_consumer_details()
             self.search_var.set("")
 
@@ -2076,6 +2427,7 @@ class MeterReaderApp(tk.Tk):
             "exception": exception,
             "timestamp": time.time()
         }
+        self.after(0, self._refresh_zone_stats)
         self.after(0, self._proceed_to_printing)
 
     def _save_to_sync_layer(self, consumer_id: int, present: int, consumption: int, exception: str, is_flagged: bool):
