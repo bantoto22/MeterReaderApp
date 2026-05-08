@@ -12,11 +12,42 @@ import math
 import os
 import platform
 import ctypes
-import subprocess
-import shutil
+from datetime import datetime, timezone
 from PIL import Image, ImageTk
-from database import init_db, search_consumer, search_consumers_by_zone, save_reading, get_zone_stats, get_all_zone_names, get_zone_consumers_with_status, authenticate_user, get_all_users, seed_default_users
-from receipt import show_receipt
+try:
+    from .database import (
+        init_db,
+        search_consumer,
+        search_consumers_by_zone,
+        save_reading,
+        get_zone_stats,
+        get_all_zone_names,
+        get_zone_consumers_with_status,
+        authenticate_user,
+        get_all_users,
+        seed_default_users,
+    )
+    from .receipt import show_receipt
+    from .handheld_sync import HandheldSyncDataAccess, SyncConfig
+except Exception:
+    from database import (
+        init_db,
+        search_consumer,
+        search_consumers_by_zone,
+        save_reading,
+        get_zone_stats,
+        get_all_zone_names,
+        get_zone_consumers_with_status,
+        authenticate_user,
+        get_all_users,
+        seed_default_users,
+    )
+    from receipt import show_receipt
+    try:
+        from handheld_sync import HandheldSyncDataAccess, SyncConfig
+    except Exception:
+        HandheldSyncDataAccess = None
+        SyncConfig = None
 
 # ─── Load custom font (Montserrat) on Windows ────────────────────────────────
 def _load_custom_font():
@@ -309,9 +340,12 @@ class LoginScreen(tk.Frame):
         self._password_entry.entry.bind("<Return>", lambda e: self._attempt_login())
         self._username_entry.entry.bind("<Return>", lambda e: self._password_entry.entry.focus())
 
+        # Fill remaining vertical space so the login screen uses full height cleanly.
+        tk.Frame(self, bg=BG_COLOR).pack(fill="both", expand=True)
+
         # Available users hint
         hint_frame = tk.Frame(self, bg=BG_COLOR)
-        hint_frame.pack(pady=20)
+        hint_frame.pack(side="bottom", pady=(8, 16))
 
         tk.Label(hint_frame, text="Available Users:", font=(FONT_FAMILY, 10, "bold"),
                  bg=BG_COLOR, fg=MID_TEXT).pack()
@@ -535,8 +569,12 @@ class MeterReaderApp(tk.Tk):
         self._shake_after_ids = []
         self._progress_anim_fraction = 0.0
         self._progress_anim_id = None
-        self._keyboard_proc = None
+        self._keyboard_target = None
+        self._keyboard_mode = "alpha"
         self._keyboard_hide_after_id = None
+        self._sync_dal = None
+        self._sync_state = "Offline"
+        self._sync_pending_count = 0
 
         # Currently loaded consumer from DB (None until a search is done)
         self._current_consumer = None
@@ -555,6 +593,7 @@ class MeterReaderApp(tk.Tk):
 
         # Build the UI
         self._build_ui()
+        self._init_handheld_sync()
         self.bind_all("<Button-1>", self._on_global_pointer_down, add="+")
 
     def _build_ui(self):
@@ -583,9 +622,71 @@ class MeterReaderApp(tk.Tk):
         self.app_content.grid(row=0, column=0, sticky="nsew")
         self.app_content.grid_remove()
 
+        self.keyboard_panel = tk.Frame(self.content_viewport, bg=TAB_DARK, bd=1, relief="flat")
+        self.keyboard_panel.grid(row=1, column=0, sticky="ew")
+        self.keyboard_panel.grid_remove()
+
         self._build_app_content()
+        self._build_in_app_keyboard()
         self.bind_keyboard_to_entries(self.login_screen)
         self.bind_keyboard_to_entries(self.app_content)
+        self._refresh_sync_status_ui()
+
+    def _init_handheld_sync(self):
+        """Initialize optional handheld sync layer from environment configuration."""
+        if HandheldSyncDataAccess is None or SyncConfig is None:
+            self._sync_state = "Sync Failed"
+            self._refresh_sync_status_ui("sync module unavailable")
+            return
+        try:
+            cfg = SyncConfig.from_env(fail_fast=False)
+            if not cfg.sync_enabled:
+                self._sync_state = "Offline"
+                self._refresh_sync_status_ui("sync disabled")
+                return
+            self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
+            self._sync_dal.start_sync_worker(interval_seconds=20)
+            self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
+            self._sync_pending_count = len(self._sync_dal.listPendingSyncReadings())
+            self._refresh_sync_status_ui()
+        except Exception as exc:
+            self._sync_dal = None
+            self._sync_state = "Sync Failed"
+            self._refresh_sync_status_ui(str(exc))
+
+    def _refresh_sync_status_ui(self, detail: str = ""):
+        pending = 0
+        if self._sync_dal:
+            try:
+                pending = len(self._sync_dal.listPendingSyncReadings())
+            except Exception:
+                self._sync_state = "Sync Failed"
+        self._sync_pending_count = pending
+        if self._sync_dal and self._sync_state != "Sync Failed":
+            try:
+                self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
+            except Exception:
+                self._sync_state = "Sync Failed"
+
+        if self._sync_state == "Online" and pending > 0:
+            status_text = "Pending Sync"
+            status_color = WARNING_TEXT
+        elif self._sync_state == "Online":
+            status_text = "Online"
+            status_color = VALID_TEXT
+        elif self._sync_state == "Sync Failed":
+            status_text = "Sync Failed"
+            status_color = INVALID_TEXT
+        else:
+            status_text = "Offline"
+            status_color = MID_TEXT
+
+        if hasattr(self, "_sync_status_label"):
+            self._sync_status_label.config(text=f"Sync: {status_text}", fg=status_color)
+        if hasattr(self, "_sync_pending_label"):
+            self._sync_pending_label.config(text=f"Pending: {pending}")
+        if detail and hasattr(self, "_sync_pending_label"):
+            self._sync_pending_label.config(text=f"Pending: {pending} ({detail})")
 
     def _on_main_container_resize(self, event=None):
         self._update_content_viewport()
@@ -603,6 +704,14 @@ class MeterReaderApp(tk.Tk):
             return False
         return isinstance(widget, (tk.Entry, ttk.Entry))
 
+    def _is_widget_in_keyboard_panel(self, widget):
+        cur = widget
+        while cur is not None:
+            if cur == self.keyboard_panel:
+                return True
+            cur = getattr(cur, "master", None)
+        return False
+
     def _schedule_keyboard_hide(self):
         if self._keyboard_hide_after_id:
             self.after_cancel(self._keyboard_hide_after_id)
@@ -611,55 +720,123 @@ class MeterReaderApp(tk.Tk):
     def _hide_keyboard_if_no_text_focus(self):
         self._keyboard_hide_after_id = None
         focused = self.focus_get()
+        if self._is_widget_in_keyboard_panel(focused):
+            return
         if not self._is_text_input_widget(focused):
             self.hide_keyboard()
 
-    def show_keyboard(self):
-        """Launch matchbox-keyboard on Linux only when needed."""
-        if platform.system() != "Linux":
-            return
+    def _build_in_app_keyboard(self):
+        self._keyboard_content = tk.Frame(self.keyboard_panel, bg=TAB_DARK)
+        self._keyboard_content.pack(fill="both", expand=True, padx=6, pady=6)
 
-        if self._keyboard_proc and self._keyboard_proc.poll() is None:
-            return
+    def _keyboard_btn(self, parent, text, command, expand=False):
+        btn = tk.Button(
+            parent,
+            text=text,
+            font=(FONT_FAMILY, self._touch_font_base, "bold"),
+            bg=PRIMARY_BLUE,
+            fg=WHITE,
+            activebackground=ACCENT_BLUE,
+            activeforeground=WHITE,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=command,
+            padx=6,
+            pady=6,
+        )
+        btn.pack(side="left", fill="both", expand=expand, padx=3, pady=3, ipady=8)
+        return btn
 
-        if shutil.which("matchbox-keyboard") is None:
-            return
+    def _render_keyboard(self):
+        for child in self._keyboard_content.winfo_children():
+            child.destroy()
 
+        if self._keyboard_mode == "numeric":
+            rows = ["123", "456", "789", "0"]
+        else:
+            rows = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
+
+        for row_keys in rows:
+            row = tk.Frame(self._keyboard_content, bg=TAB_DARK)
+            row.pack(fill="x")
+            for key_char in row_keys:
+                self._keyboard_btn(row, key_char.upper(), lambda c=key_char: self._insert_key(c), expand=True)
+
+        action_row = tk.Frame(self._keyboard_content, bg=TAB_DARK)
+        action_row.pack(fill="x")
+        self._keyboard_btn(action_row, "Backspace", self._backspace_key, expand=True)
+        self._keyboard_btn(action_row, "Clear", self._clear_key, expand=True)
+        if self._keyboard_mode != "numeric":
+            self._keyboard_btn(action_row, "Space", lambda: self._insert_key(" "), expand=True)
+        self._keyboard_btn(action_row, "Done", self.hide_keyboard, expand=True)
+
+    def _get_keyboard_target(self):
+        focused = self.focus_get()
+        if self._is_text_input_widget(focused):
+            self._keyboard_target = focused
+        return self._keyboard_target
+
+    def _insert_key(self, value):
+        target = self._get_keyboard_target()
+        if target is None:
+            return
         try:
-            self._keyboard_proc = subprocess.Popen(
-                ["matchbox-keyboard"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            print(f"Unable to start matchbox-keyboard: {exc}")
+            target.insert("insert", value)
+        except Exception:
+            pass
+        target.focus_set()
+
+    def _backspace_key(self):
+        target = self._get_keyboard_target()
+        if target is None:
+            return
+        try:
+            idx = target.index("insert")
+            if idx > 0:
+                target.delete(idx - 1)
+        except Exception:
+            pass
+        target.focus_set()
+
+    def _clear_key(self):
+        target = self._get_keyboard_target()
+        if target is None:
+            return
+        try:
+            target.delete(0, "end")
+        except Exception:
+            pass
+        target.focus_set()
+
+    def show_keyboard(self, widget=None):
+        target = widget if self._is_text_input_widget(widget) else self.focus_get()
+        if not self._is_text_input_widget(target):
+            return
+        self._keyboard_target = target
+        mode = getattr(target, "_keyboard_mode", "alpha")
+        if mode not in ("alpha", "numeric"):
+            mode = "alpha"
+        if mode != self._keyboard_mode or not self.keyboard_panel.winfo_ismapped():
+            self._keyboard_mode = mode
+            self._render_keyboard()
+        self.keyboard_panel.grid()
 
     def hide_keyboard(self):
-        """Close matchbox-keyboard safely when text input is no longer active."""
-        proc = self._keyboard_proc
-        if not proc:
-            return
+        """Hide in-app keyboard panel."""
+        self.keyboard_panel.grid_remove()
+        self._keyboard_target = None
 
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    proc.kill()
-        except Exception as exc:
-            print(f"Unable to close matchbox-keyboard: {exc}")
-        finally:
-            self._keyboard_proc = None
-
-    def bind_keyboard_to_entries(self, parent):
+    def bind_keyboard_to_entries(self, parent, default_mode="alpha"):
         """Bind keyboard show/hide behavior to all Entry widgets under parent."""
         if parent is None:
             return
 
         def _bind_entry(widget):
-            widget.bind("<FocusIn>", lambda e: self.show_keyboard(), add="+")
-            widget.bind("<Button-1>", lambda e: self.show_keyboard(), add="+")
+            if not hasattr(widget, "_keyboard_mode"):
+                widget._keyboard_mode = default_mode
+            widget.bind("<FocusIn>", lambda e, w=widget: self.show_keyboard(w), add="+")
+            widget.bind("<Button-1>", lambda e, w=widget: self.show_keyboard(w), add="+")
             widget.bind("<Return>", lambda e: self._schedule_keyboard_hide(), add="+")
             widget.bind("<Escape>", lambda e: self.hide_keyboard(), add="+")
             widget.bind("<FocusOut>", lambda e: self._schedule_keyboard_hide(), add="+")
@@ -669,11 +846,11 @@ class MeterReaderApp(tk.Tk):
                 _bind_entry(child.entry)
             elif self._is_text_input_widget(child):
                 _bind_entry(child)
-            elif isinstance(child, ttk.Combobox):
-                _bind_entry(child)
-            self.bind_keyboard_to_entries(child)
+            self.bind_keyboard_to_entries(child, default_mode=default_mode)
 
     def _on_global_pointer_down(self, event):
+        if self._is_widget_in_keyboard_panel(event.widget):
+            return
         if not self._is_text_input_widget(event.widget):
             self._schedule_keyboard_hide()
 
@@ -987,6 +1164,33 @@ class MeterReaderApp(tk.Tk):
         self.search_input.entry.bind("<KeyRelease>", self._on_search_key)
         self.search_input.entry.bind("<FocusOut>", self._schedule_hide_autocomplete)
 
+        sync_row = tk.Frame(main, bg=BG_COLOR)
+        sync_row.pack(fill="x", padx=px, pady=(2, 4))
+        self._sync_status_label = tk.Label(
+            sync_row, text="Sync: Offline", font=(FONT_FAMILY, 10, "bold"), fg=MID_TEXT, bg=BG_COLOR
+        )
+        self._sync_status_label.pack(side="left")
+        self._sync_pending_label = tk.Label(
+            sync_row, text="Pending: 0", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=BG_COLOR
+        )
+        self._sync_pending_label.pack(side="left", padx=(10, 0))
+        self._sync_now_btn = tk.Button(
+            sync_row,
+            text="Sync Now",
+            font=(FONT_FAMILY, 10, "bold"),
+            bg=PRIMARY_BLUE,
+            fg=WHITE,
+            activebackground=ACCENT_BLUE,
+            activeforeground=WHITE,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._on_manual_sync_now,
+            padx=10,
+            pady=6,
+        )
+        self._sync_now_btn.pack(side="right")
+
         # ── Grouped Detail Card ──────────────────────────────────────────
         self.group_card = GroupCard(main, radius=10, bg_color=WHITE)
         self.group_card.pack(fill="x", padx=px, pady=(2, 2))
@@ -1026,6 +1230,7 @@ class MeterReaderApp(tk.Tk):
             textvariable=self.present_var)
         self.reading_input.pack(fill="x", pady=0)
         self.reading_input.set_validate(vcmd)
+        self.reading_input.entry._keyboard_mode = "numeric"
 
         self._validation_frame = tk.Frame(ri, bg=WHITE)
         self._validation_frame.pack(fill="x")
@@ -1505,13 +1710,37 @@ class MeterReaderApp(tk.Tk):
         self._spawn_overlay("Syncing...", "Refreshing from database", self._do_sync)
 
     def _do_sync(self):
+        if self._sync_dal:
+            try:
+                result = self._sync_dal.syncPendingReadings()
+                self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
+                self._sync_sync_result = result
+            except Exception as exc:
+                self._sync_state = "Sync Failed"
+                self._sync_sync_result = {"status": "failed", "error": str(exc)}
         time.sleep(0.8)
         self.after(0, self._finish_sync)
 
     def _finish_sync(self):
         self._dismiss_overlay()
         self._refresh_zone_stats()
-        messagebox.showinfo("Sync Complete", "Zone data refreshed from the database.")
+        self._refresh_sync_status_ui()
+        if hasattr(self, "_sync_sync_result") and self._sync_sync_result:
+            r = self._sync_sync_result
+            if r.get("status") == "done":
+                messagebox.showinfo(
+                    "Sync Complete",
+                    f"Synced: {r.get('synced', 0)}\nFailed: {r.get('failed', 0)}\nConflicts: {r.get('conflicts', 0)}",
+                )
+            elif r.get("status") == "offline":
+                messagebox.showwarning("Sync Offline", "Device is offline. Pending readings remain queued.")
+            else:
+                messagebox.showerror("Sync Failed", str(r.get("error", "Unknown sync error")))
+        else:
+            messagebox.showinfo("Sync Complete", "Zone data refreshed from the database.")
+
+    def _on_manual_sync_now(self):
+        self._on_sync()
 
     def _refresh_zone_stats(self):
         """Reload zone statistics from the database and redraw the progress tab."""
@@ -1803,6 +2032,7 @@ class MeterReaderApp(tk.Tk):
 
             # Save to database first
             save_reading(self._current_consumer["id"], present, consumption, exception, is_flagged)
+            self._save_to_sync_layer(self._current_consumer["id"], present, consumption, exception, is_flagged)
 
             # Store for reprint
             self._last_receipt_data = {
@@ -1834,6 +2064,7 @@ class MeterReaderApp(tk.Tk):
         exception = self.exception_var.get()
         is_flagged = (consumption > HIGH_CONSUMPTION_THRESHOLD) or (exception != "None")
         save_reading(consumer["id"], present, consumption, exception, is_flagged)
+        self._save_to_sync_layer(consumer["id"], present, consumption, exception, is_flagged)
         # Update the cached consumer so subsequent validations use the new previous
         self._current_consumer["_original_previous"] = self._current_consumer["previous_reading"]
         self._current_consumer["previous_reading"] = present
@@ -1846,6 +2077,27 @@ class MeterReaderApp(tk.Tk):
             "timestamp": time.time()
         }
         self.after(0, self._proceed_to_printing)
+
+    def _save_to_sync_layer(self, consumer_id: int, present: int, consumption: int, exception: str, is_flagged: bool):
+        """Mirror local save to sync layer (online write or offline queue)."""
+        if not self._sync_dal:
+            return
+        payload = {
+            "consumer_id": consumer_id,
+            "present_reading": present,
+            "consumption": consumption,
+            "exception": exception,
+            "is_flagged": bool(is_flagged),
+            "reading_date": datetime.now().date().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._sync_dal.saveMeterReading(payload)
+        except Exception as exc:
+            self._sync_state = "Sync Failed"
+            print(f"Sync layer save failed: {exc}")
+        finally:
+            self.after(0, self._refresh_sync_status_ui)
 
     def _proceed_to_printing(self):
         self._dismiss_overlay()
