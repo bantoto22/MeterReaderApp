@@ -420,13 +420,65 @@ class SupabaseRestClient:
         return 200 <= status < 500 and status != 0
 
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        query = {"select": "id,meter_no,acct_no,name,previous_reading,zone_name"}
+        # Use service key so handheld can fetch assignments even when anon/RLS policy is restrictive.
+        # Primary target schema provided by user:
+        # - consumer.consumer_id
+        # - consumer.account_number
+        # - consumer.meter_number
+        # - consumer.first_name/middle_name/last_name
+        # - consumer.zone_id -> zone.zone_name
+        query = {
+            "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,previous_reading,last_reading,status,zone:zone_id(zone_name)"
+        }
         if zone_name:
-            query["zone_name"] = f"eq.{zone_name}"
-        status, data = self._req("GET", "consumer", query=query, use_service_key=False)
+            query["zone.zone_name"] = f"eq.{zone_name}"
+        status, data = self._req("GET", "consumer", query=query, use_service_key=True)
+        if status >= 400:
+            # Fallback for deployments where previous_reading/last_reading columns do not exist.
+            fb_query = {
+                "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,status,zone:zone_id(zone_name)"
+            }
+            if zone_name:
+                fb_query["zone.zone_name"] = f"eq.{zone_name}"
+            status, data = self._req("GET", "consumer", query=fb_query, use_service_key=True)
         if status >= 400:
             raise RuntimeError(f"Supabase read failed: {data}")
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        normalized: list[dict] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            # Normalize across possible consumer schemas.
+            cid = row.get("consumer_id") or row.get("id")
+            meter_no = row.get("meter_number") or row.get("meter_no") or row.get("meterid")
+            acct_no = row.get("account_number") or row.get("acct_no") or row.get("account_no")
+            first = (row.get("first_name") or "").strip()
+            middle = (row.get("middle_name") or "").strip()
+            last = (row.get("last_name") or "").strip()
+            full_from_parts = " ".join([p for p in [first, middle, last] if p]).strip()
+            name = row.get("name") or row.get("consumer_name") or row.get("fullname") or full_from_parts
+            zone_obj = row.get("zone")
+            if isinstance(zone_obj, dict):
+                zone_val = zone_obj.get("zone_name")
+            else:
+                zone_val = row.get("zone_name") or row.get("zone") or row.get("zone_code")
+            prev = (
+                row.get("previous_reading")
+                if row.get("previous_reading") is not None
+                else row.get("last_reading")
+            )
+            normalized.append(
+                {
+                    "id": cid,
+                    "meter_no": meter_no,
+                    "acct_no": acct_no,
+                    "name": name,
+                    "zone_name": zone_val,
+                    "previous_reading": prev if prev is not None else 0,
+                }
+            )
+        return normalized
 
     def _get_meterreadings_columns(self) -> set[str]:
         if self._meterreadings_columns is not None:

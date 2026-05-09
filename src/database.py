@@ -169,21 +169,25 @@ def get_all_users() -> list[dict]:
 
 # ─── Query helpers ────────────────────────────────────────────────────────────
 
-def search_consumer(meter_no: str) -> dict | None:
-    """Look up a consumer by meter number. Returns dict or None.
-    Excludes consumers who already have readings (unread only)."""
+def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
+    """Look up a consumer by meter number. Returns dict or None."""
     conn = get_connection()
-    row = conn.execute(
-        """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
-                  z.name AS zone_name
-           FROM consumers c
-           JOIN zones z ON c.zone_id = z.id
-           WHERE c.meter_no = ?
-             AND NOT EXISTS (
-                 SELECT 1 FROM readings r WHERE r.consumer_id = c.id
-             )""",
-        (meter_no,)
-    ).fetchone()
+    if unread_only:
+        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        z.name AS zone_name
+                 FROM consumers c
+                 JOIN zones z ON c.zone_id = z.id
+                 WHERE c.meter_no = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+                   )"""
+    else:
+        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        z.name AS zone_name
+                 FROM consumers c
+                 JOIN zones z ON c.zone_id = z.id
+                 WHERE c.meter_no = ?"""
+    row = conn.execute(sql, (meter_no,)).fetchone()
     conn.close()
     if row:
         return dict(row)
@@ -191,25 +195,32 @@ def search_consumer(meter_no: str) -> dict | None:
 
 
 
-def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8) -> list[dict]:
-    """Search consumers by partial meter_no or name, filtered to a specific zone.
-    Excludes consumers who already have readings (unread only)."""
+def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_only: bool = True) -> list[dict]:
+    """Search consumers by partial meter_no or name, filtered to a specific zone."""
     conn = get_connection()
     like_pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
-                  z.name AS zone_name
-           FROM consumers c
-           JOIN zones z ON c.zone_id = z.id
-           WHERE z.name = ?
-             AND (c.meter_no LIKE ? OR c.name LIKE ?)
-             AND NOT EXISTS (
-                 SELECT 1 FROM readings r WHERE r.consumer_id = c.id
-             )
-           ORDER BY c.meter_no
-           LIMIT ?""",
-        (zone_name, like_pattern, like_pattern, limit)
-    ).fetchall()
+    if unread_only:
+        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        z.name AS zone_name
+                 FROM consumers c
+                 JOIN zones z ON c.zone_id = z.id
+                 WHERE z.name = ?
+                   AND (c.meter_no LIKE ? OR c.name LIKE ?)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+                   )
+                 ORDER BY c.meter_no
+                 LIMIT ?"""
+    else:
+        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        z.name AS zone_name
+                 FROM consumers c
+                 JOIN zones z ON c.zone_id = z.id
+                 WHERE z.name = ?
+                   AND (c.meter_no LIKE ? OR c.name LIKE ?)
+                 ORDER BY c.meter_no
+                 LIMIT ?"""
+    rows = conn.execute(sql, (zone_name, like_pattern, like_pattern, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -300,3 +311,70 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
     
     conn.close()
     return [dict(r) for r in rows]
+
+
+def replace_consumers_from_sync(consumers: list[dict]) -> int:
+    """
+    Mirror consumer records from sync source (Supabase/cache) into local SQLite.
+    Returns number of consumer rows upserted.
+    """
+    if not consumers:
+        return 0
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    zone_names = sorted({(c.get("zone_name") or "Unassigned").strip() for c in consumers if c.get("meter_no")})
+    for zone_name in zone_names:
+        cur.execute("INSERT OR IGNORE INTO zones (name) VALUES (?)", (zone_name,))
+
+    zone_rows = cur.execute("SELECT id, name FROM zones").fetchall()
+    zone_id_by_name = {row["name"]: row["id"] for row in zone_rows}
+
+    upserted = 0
+    for c in consumers:
+        meter_no = (c.get("meter_no") or "").strip()
+        if not meter_no:
+            continue
+        zone_name = (c.get("zone_name") or "Unassigned").strip()
+        zone_id = zone_id_by_name.get(zone_name)
+        if zone_id is None:
+            continue
+
+        acct_no = (c.get("acct_no") or "").strip()
+        name = (c.get("name") or "Unknown").strip()
+        previous_reading = int(c.get("previous_reading") or 0)
+        cid = c.get("id")
+
+        if cid is not None:
+            cur.execute(
+                """
+                INSERT INTO consumers (id, meter_no, acct_no, name, previous_reading, zone_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    meter_no = excluded.meter_no,
+                    acct_no = excluded.acct_no,
+                    name = excluded.name,
+                    previous_reading = excluded.previous_reading,
+                    zone_id = excluded.zone_id
+                """,
+                (int(cid), meter_no, acct_no, name, previous_reading, zone_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO consumers (meter_no, acct_no, name, previous_reading, zone_id)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(meter_no) DO UPDATE SET
+                    acct_no = excluded.acct_no,
+                    name = excluded.name,
+                    previous_reading = excluded.previous_reading,
+                    zone_id = excluded.zone_id
+                """,
+                (meter_no, acct_no, name, previous_reading, zone_id),
+            )
+        upserted += 1
+
+    conn.commit()
+    conn.close()
+    return upserted
