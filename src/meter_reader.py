@@ -288,9 +288,16 @@ class LoginScreen(tk.Frame):
         tk.Label(header, text="Meter Reader Login", font=(FONT_FAMILY, 18, "bold"),
                  bg=HEADER_BLUE, fg=WHITE).pack(expand=True)
 
+        # Body area fills remaining screen and centers login form.
+        body = tk.Frame(self, bg=BG_COLOR)
+        body.pack(fill="both", expand=True)
+
+        center_wrap = tk.Frame(body, bg=BG_COLOR)
+        center_wrap.place(relx=0.5, rely=0.46, anchor="center")
+
         # Logo/Icon area
-        icon_frame = tk.Frame(self, bg=BG_COLOR)
-        icon_frame.pack(pady=(30, 20))
+        icon_frame = tk.Frame(center_wrap, bg=BG_COLOR)
+        icon_frame.pack(pady=(10, 18))
 
         # Draw a simple user icon using canvas
         icon_canvas = tk.Canvas(icon_frame, width=80, height=80, bg=BG_COLOR, highlightthickness=0)
@@ -302,8 +309,8 @@ class LoginScreen(tk.Frame):
         icon_canvas.create_arc(20, 35, 60, 70, fill=WHITE, outline="", start=0, extent=180)  # body
 
         # Login form
-        form_frame = tk.Frame(self, bg=BG_COLOR)
-        form_frame.pack(padx=40, pady=10)
+        form_frame = tk.Frame(center_wrap, bg=BG_COLOR)
+        form_frame.pack(padx=40, pady=8)
 
         # Username
         tk.Label(form_frame, text="Username", font=(FONT_FAMILY, 11, "bold"),
@@ -345,11 +352,8 @@ class LoginScreen(tk.Frame):
         self._password_entry.entry.bind("<Return>", lambda e: self._attempt_login())
         self._username_entry.entry.bind("<Return>", lambda e: self._password_entry.entry.focus())
 
-        # Fill remaining vertical space so the login screen uses full height cleanly.
-        tk.Frame(self, bg=BG_COLOR).pack(fill="both", expand=True)
-
         # Bottom loading/info panel (replaces Available Users list).
-        hint_frame = tk.Frame(self, bg=BG_COLOR)
+        hint_frame = tk.Frame(body, bg=BG_COLOR)
         hint_frame.pack(side="bottom", pady=(8, 16))
         self._loading_title_label = tk.Label(
             hint_frame,
