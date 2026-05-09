@@ -623,7 +623,12 @@ class MainPostgresClient:
         )
 
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        where = "WHERE c.status = 'Active'"
+        where = """
+        WHERE c.status = 'Active'
+          AND rs.schedule_date = CURRENT_DATE
+          AND rs.status IN ('Scheduled', 'In Progress')
+          AND today_read.reading_id IS NULL
+        """
         params: list[object] = []
         if zone_name:
             where += " AND z.zone_name = %s"
@@ -635,10 +640,20 @@ class MainPostgresClient:
             c.account_number AS acct_no,
             CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
             z.zone_name AS zone_name,
-            0::int AS previous_reading
+            COALESCE(prev.last_reading, 0)::int AS previous_reading
         FROM {self._schema}.consumer c
-        LEFT JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+        JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+        JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
+        LEFT JOIN (
+            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+            FROM {self._schema}.meterreadings mr
+            GROUP BY mr.consumer_id
+        ) prev ON prev.consumer_id = c.consumer_id
+        LEFT JOIN {self._schema}.meterreadings today_read
+          ON today_read.consumer_id = c.consumer_id
+         AND DATE(today_read.reading_date) = rs.schedule_date
+         AND today_read.status = 'Active'
         {where}
         ORDER BY c.consumer_id
         """
@@ -646,6 +661,35 @@ class MainPostgresClient:
             with conn.cursor(cursor_factory=self._dict_cursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+                if not rows:
+                    # Fallback: no active schedule today, so return active consumers
+                    # for operational continuity.
+                    fb_where = "WHERE c.status = 'Active'"
+                    fb_params: list[object] = []
+                    if zone_name:
+                        fb_where += " AND z.zone_name = %s"
+                        fb_params.append(zone_name)
+                    fb_sql = f"""
+                    SELECT
+                        c.consumer_id AS id,
+                        COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+                        c.account_number AS acct_no,
+                        CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
+                        z.zone_name AS zone_name,
+                        COALESCE(prev.last_reading, 0)::int AS previous_reading
+                    FROM {self._schema}.consumer c
+                    JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+                    LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
+                    LEFT JOIN (
+                        SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+                        FROM {self._schema}.meterreadings mr
+                        GROUP BY mr.consumer_id
+                    ) prev ON prev.consumer_id = c.consumer_id
+                    {fb_where}
+                    ORDER BY c.consumer_id
+                    """
+                    cur.execute(fb_sql, fb_params)
+                    rows = cur.fetchall()
         return [dict(r) for r in rows]
 
 
