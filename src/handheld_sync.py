@@ -602,6 +602,53 @@ class SupabaseRestClient:
         return remote_payload
 
 
+class MainPostgresClient:
+    """Direct pull from main PostgreSQL as fallback when Supabase is unreachable."""
+
+    def __init__(self, cfg: SyncConfig):
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        self._psycopg2 = psycopg2
+        self._dict_cursor = RealDictCursor
+        self._cfg = cfg
+        self._schema = cfg.supabase_db_schema or "public"
+
+    def _connect(self):
+        return self._psycopg2.connect(
+            host=self._cfg.main_pg_host,
+            port=self._cfg.main_pg_port,
+            dbname=self._cfg.main_pg_db,
+            user=self._cfg.main_pg_user,
+            password=self._cfg.main_pg_password,
+        )
+
+    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
+        where = "WHERE c.status = 'Active'"
+        params: list[object] = []
+        if zone_name:
+            where += " AND z.zone_name = %s"
+            params.append(zone_name)
+        sql = f"""
+        SELECT
+            c.consumer_id AS id,
+            COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+            c.account_number AS acct_no,
+            CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
+            z.zone_name AS zone_name,
+            0::int AS previous_reading
+        FROM {self._schema}.consumer c
+        LEFT JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+        LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
+        {where}
+        ORDER BY c.consumer_id
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+
 class HandheldSyncDataAccess:
     """
     Required handheld DAL methods:
@@ -612,9 +659,10 @@ class HandheldSyncDataAccess:
     - syncPendingReadings
     """
 
-    def __init__(self, local_store: LocalSyncStore, remote_store: SupabaseRestClient):
+    def __init__(self, local_store: LocalSyncStore, remote_store: SupabaseRestClient, main_pg_client=None):
         self.local = local_store
         self.remote = remote_store
+        self.main_pg = main_pg_client
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -622,7 +670,12 @@ class HandheldSyncDataAccess:
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "HandheldSyncDataAccess":
         cfg = SyncConfig.from_env(fail_fast=fail_fast)
-        return cls(PostgresLocalSyncStore(cfg), SupabaseRestClient(cfg))
+        main_pg_client = None
+        try:
+            main_pg_client = MainPostgresClient(cfg)
+        except Exception:
+            main_pg_client = None
+        return cls(PostgresLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
 
     def is_online(self) -> bool:
         return self.remote.is_online()
@@ -636,6 +689,14 @@ class HandheldSyncDataAccess:
                 return data
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
+        if self.main_pg:
+            try:
+                data = self.main_pg.load_assigned_consumers(zone_name)
+                self.local.cache_consumers(data)
+                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
+                return data
+            except Exception as exc:
+                self.local.log_audit(None, "failed", f"MAIN_PG load failed, fallback to cache: {exc}")
         cached = self.local.load_cached_consumers(zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached

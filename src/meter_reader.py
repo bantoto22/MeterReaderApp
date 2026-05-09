@@ -308,42 +308,44 @@ class LoginScreen(tk.Frame):
         icon_canvas.create_oval(30, 20, 50, 40, fill=WHITE, outline="")  # head
         icon_canvas.create_arc(20, 35, 60, 70, fill=WHITE, outline="", start=0, extent=180)  # body
 
-        # Login form
-        form_frame = tk.Frame(center_wrap, bg=BG_COLOR)
-        form_frame.pack(padx=40, pady=8)
+        # Login form card
+        form_card = tk.Frame(center_wrap, bg=WHITE, bd=1, relief="flat", highlightthickness=1, highlightbackground=BORDER_COLOR)
+        form_card.pack(padx=24, pady=8, fill="x")
+        form_frame = tk.Frame(form_card, bg=WHITE)
+        form_frame.pack(fill="x", padx=22, pady=18)
 
         # Username
-        tk.Label(form_frame, text="Username", font=(FONT_FAMILY, 11, "bold"),
-                 bg=BG_COLOR, fg=DARK_TEXT).pack(anchor="w", pady=(0, 4))
+        tk.Label(form_frame, text="Username", font=(FONT_FAMILY, 13, "bold"),
+                 bg=WHITE, fg=DARK_TEXT).pack(anchor="w", pady=(0, 6))
 
         self._username_var = tk.StringVar()
         self._username_entry = RoundedEntry(form_frame, placeholder="Enter username...",
-                                          height=56, radius=10, font=(FONT_FAMILY, 14),
+                                          height=74, radius=12, font=(FONT_FAMILY, 18),
                                           textvariable=self._username_var)
-        self._username_entry.pack(fill="x", pady=(0, 12))
+        self._username_entry.pack(fill="x", pady=(0, 14))
 
         # Password
-        tk.Label(form_frame, text="Password", font=(FONT_FAMILY, 11, "bold"),
-                 bg=BG_COLOR, fg=DARK_TEXT).pack(anchor="w", pady=(0, 4))
+        tk.Label(form_frame, text="Password", font=(FONT_FAMILY, 13, "bold"),
+                 bg=WHITE, fg=DARK_TEXT).pack(anchor="w", pady=(0, 6))
 
         self._password_var = tk.StringVar()
         self._password_entry = RoundedEntry(form_frame, placeholder="Enter password...",
-                                            height=56, radius=10, font=(FONT_FAMILY, 14),
+                                            height=74, radius=12, font=(FONT_FAMILY, 18),
                                             textvariable=self._password_var)
         self._password_entry.entry.config(show="•")
-        self._password_entry.pack(fill="x", pady=(0, 20))
+        self._password_entry.pack(fill="x", pady=(0, 24))
 
         # Error message label
         self._error_label = tk.Label(form_frame, text="", font=(FONT_FAMILY, 10),
-                                     bg=BG_COLOR, fg=INVALID_TEXT)
+                                     bg=WHITE, fg=INVALID_TEXT)
         self._error_label.pack(pady=(0, 10))
 
         # Login button
-        login_btn = tk.Button(form_frame, text="LOGIN", font=(FONT_FAMILY, 16, "bold"),
+        login_btn = tk.Button(form_frame, text="LOGIN", font=(FONT_FAMILY, 20, "bold"),
                              bg=TAB_DARK, fg=WHITE, activebackground=DARK_HOVER,
                              activeforeground=WHITE, relief="flat", bd=0,
-                             cursor="hand2", pady=12, command=self._attempt_login)
-        login_btn.pack(fill="x", ipady=8)
+                             cursor="hand2", pady=16, command=self._attempt_login)
+        login_btn.pack(fill="x", ipady=14)
 
         login_btn.bind("<Enter>", lambda e: e.widget.config(bg=DARK_HOVER))
         login_btn.bind("<Leave>", lambda e: e.widget.config(bg=TAB_DARK))
@@ -660,11 +662,17 @@ class MeterReaderApp(tk.Tk):
                 )
             self._last_pull_count = len(consumers)
             self._last_mirrored_count = count
+            if hasattr(self, "_pull_mirror_label"):
+                self._pull_mirror_label.config(
+                    text=f"Last pull mirrored: {count} records (pulled {len(consumers)})"
+                )
             return count
         except Exception as exc:
             print(f"Consumer hydration skipped: {exc}")
             self._last_pull_count = 0
             self._last_mirrored_count = 0
+            if hasattr(self, "_pull_mirror_label"):
+                self._pull_mirror_label.config(text="Last pull mirrored: failed")
             return 0
 
     def _schedule_auto_pull(self):
@@ -959,7 +967,14 @@ class MeterReaderApp(tk.Tk):
 
     def _hide_keyboard_if_no_text_focus(self):
         self._keyboard_hide_after_id = None
-        focused = self.focus_get()
+        try:
+            focused = self.focus_get()
+        except KeyError:
+            # Tk can briefly report internal transient widgets (e.g. ttk combobox popdown)
+            # that are not addressable via nametowidget; treat as non-text focus.
+            focused = None
+        except Exception:
+            focused = None
         if self._is_widget_in_keyboard_panel(focused):
             return
         if not self._is_text_input_widget(focused):
@@ -1747,6 +1762,8 @@ class MeterReaderApp(tk.Tk):
         self._sync_backup_label.pack(fill="x", pady=(2, 0))
         self._sync_last_label = tk.Label(inner, text="Last Sync: Never", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
         self._sync_last_label.pack(fill="x", pady=(2, 0))
+        self._pull_mirror_label = tk.Label(inner, text="Last pull mirrored: 0 records", font=(FONT_FAMILY, 10), fg=MID_TEXT, bg=WHITE, anchor="w")
+        self._pull_mirror_label.pack(fill="x", pady=(2, 0))
 
         sync_cfg = tk.Frame(inner, bg=WHITE)
         sync_cfg.pack(fill="x", pady=(8, 2))
@@ -1832,6 +1849,36 @@ class MeterReaderApp(tk.Tk):
             pady=8,
         )
         self._sync_log_btn.pack(side="left", padx=(8, 0))
+
+        # Wi-Fi configuration
+        wifi_card = GroupCard(main, radius=10, bg_color=WHITE)
+        wifi_card.pack(fill="x", pady=(10, 0))
+        wifi_inner = wifi_card.inner_frame
+        tk.Label(wifi_inner, text="Connectivity", font=(FONT_FAMILY, 12, "bold"), fg=DARK_TEXT, bg=WHITE).pack(anchor="w")
+        tk.Label(
+            wifi_inner,
+            text="Open system Wi-Fi settings to change network connection.",
+            font=(FONT_FAMILY, 10),
+            fg=MID_TEXT,
+            bg=WHITE,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(4, 8))
+        tk.Button(
+            wifi_inner,
+            text="Open Wi-Fi Settings",
+            font=(FONT_FAMILY, 10, "bold"),
+            bg=PRIMARY_BLUE,
+            fg=WHITE,
+            activebackground=ACCENT_BLUE,
+            activeforeground=WHITE,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._open_wifi_settings,
+            padx=10,
+            pady=8,
+        ).pack(anchor="w")
 
     def _redraw_zone_card(self, event=None):
         c = self._zone_info_canvas
@@ -2163,6 +2210,28 @@ class MeterReaderApp(tk.Tk):
         self._schedule_auto_pull()
         mode_text = f"pull={'on' if self._auto_pull_enabled.get() else 'off'}, push={'on' if self._auto_push_enabled.get() else 'off'}, {interval}s"
         self._refresh_sync_status_ui(mode_text)
+
+    def _open_wifi_settings(self):
+        """Open platform Wi-Fi settings for field reconfiguration."""
+        try:
+            system_name = platform.system()
+            if system_name == "Windows":
+                subprocess.Popen(["cmd", "/c", "start", "ms-settings:network-wifi"], shell=False)
+                return
+            if system_name == "Linux":
+                # Raspberry Pi OS desktop commonly has this tool.
+                if subprocess.call(["which", "nm-connection-editor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                    subprocess.Popen(["nm-connection-editor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                if subprocess.call(["which", "nmtui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                    subprocess.Popen(["x-terminal-emulator", "-e", "nmtui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                if subprocess.call(["which", "raspi-config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                    subprocess.Popen(["x-terminal-emulator", "-e", "sudo raspi-config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+            messagebox.showinfo("Wi-Fi Settings", "No supported Wi-Fi settings tool was found on this device.")
+        except Exception as exc:
+            messagebox.showerror("Wi-Fi Settings", f"Unable to open Wi-Fi settings:\n{exc}")
 
     def _show_sync_logs(self):
         if not self._sync_dal:
