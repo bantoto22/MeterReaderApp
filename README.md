@@ -25,6 +25,18 @@ Meter_Reader/
 python main.py
 ```
 
+### Qt Hybrid Mode (Widgets + QML overview)
+
+```bash
+python main.py --qt
+```
+
+Install dependency first:
+
+```bash
+pip install PySide6
+```
+
 ## Default Login Credentials
 
 | Username | Password | Name        | ID     |
