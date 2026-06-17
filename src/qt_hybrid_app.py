@@ -1,14 +1,22 @@
-"""Qt Widgets + QML hybrid UI for the Water Meter Reader app."""
+﻿"""Qt Widgets + QML hybrid UI for the Water Meter Reader app."""
 
 from __future__ import annotations
 
 import sys
 import os
+import importlib.util
+from datetime import datetime
 from pathlib import Path
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
+if os.name == "nt":
+    pyside_spec = importlib.util.find_spec("PySide6")
+    if pyside_spec and pyside_spec.origin:
+        os.add_dll_directory(str(Path(pyside_spec.origin).resolve().parent))
+
 from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
@@ -25,6 +33,7 @@ try:
     from .database import (
         authenticate_user,
         get_all_zone_names,
+        get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
         save_reading,
@@ -35,6 +44,7 @@ except ImportError:
     from database import (
         authenticate_user,
         get_all_zone_names,
+        get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
         save_reading,
@@ -82,6 +92,17 @@ class AppBridge(QObject):
     # Tab property
     currentTabChanged = Signal()
     readerNameChanged = Signal()
+    readerIdChanged = Signal()
+    statusTimeChanged = Signal()
+    batteryLevelChanged = Signal()
+    paperStatusChanged = Signal()
+    searchSuggestionsChanged = Signal()
+    zoneConsumersChanged = Signal()
+    progressDetailsVisibleChanged = Signal()
+    logoutRequested = Signal()
+    welcomeToastRequested = Signal(str)
+    operationBusyChanged = Signal()
+    operationBusyMessageChanged = Signal()
     
     # Meter Entry properties
     zonesChanged = Signal()
@@ -126,6 +147,16 @@ class AppBridge(QObject):
         super().__init__()
         self._current_tab = 0
         self._reader_name = "User"
+        self._reader_id = ""
+
+        self._status_time = datetime.now().strftime("%I:%M %p")
+        self._battery_level = 85
+        self._paper_status = "OK"
+        self._search_suggestions = []
+        self._zone_consumers = []
+        self._progress_details_visible = False
+        self._operation_busy = False
+        self._operation_busy_message = ""
         
         self._zones = get_all_zone_names()
         self._selected_zone = self._zones[0] if self._zones else ""
@@ -162,6 +193,13 @@ class AppBridge(QObject):
         self._zone_remaining_count = 0
 
         self._consumer = None
+        self._clock_timer = QTimer(self)
+        self._clock_timer.setInterval(60_000)
+        self._clock_timer.timeout.connect(self._tick_status_clock)
+        self._clock_timer.start()
+
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
         self.update_stats()
 
     # Properties
@@ -182,9 +220,99 @@ class AppBridge(QObject):
     def readerName(self) -> str:
         return self._reader_name
 
+    @Property(str, notify=readerIdChanged)
+    def readerId(self) -> str:
+        return self._reader_id
+
+    @Property(str, notify=statusTimeChanged)
+    def statusTime(self) -> str:
+        return self._status_time
+
+    @Property(int, notify=batteryLevelChanged)
+    def batteryLevel(self) -> int:
+        return self._battery_level
+
+    @Property(str, notify=paperStatusChanged)
+    def paperStatus(self) -> str:
+        return self._paper_status
+
+    @Property(list, notify=searchSuggestionsChanged)
+    def searchSuggestions(self) -> list:
+        return self._search_suggestions
+
+    @Property(list, notify=zoneConsumersChanged)
+    def zoneConsumers(self) -> list:
+        return self._zone_consumers
+
+    @Property(bool, notify=progressDetailsVisibleChanged)
+    def progressDetailsVisible(self) -> bool:
+        return self._progress_details_visible
+
+    @Property(bool, notify=operationBusyChanged)
+    def operationBusy(self) -> bool:
+        return self._operation_busy
+
+    @Property(str, notify=operationBusyMessageChanged)
+    def operationBusyMessage(self) -> str:
+        return self._operation_busy_message
+
     def set_user(self, user: dict) -> None:
-        self._reader_name = user['name']
+        self._reader_name = user.get('name', 'User')
+        self._reader_id = user.get('id', '')
         self.readerNameChanged.emit()
+        self.readerIdChanged.emit()
+
+    @Slot()
+    def showWelcomeToast(self) -> None:
+        self.welcomeToastRequested.emit(f"Welcome, {self._reader_name}!")
+
+    def _set_operation_busy(self, busy: bool, message: str = "") -> None:
+        if self._operation_busy != busy:
+            self._operation_busy = busy
+            self.operationBusyChanged.emit()
+        if self._operation_busy_message != message:
+            self._operation_busy_message = message
+            self.operationBusyMessageChanged.emit()
+
+    def clear_user(self) -> None:
+        self._reader_name = "User"
+        self._reader_id = ""
+        self.readerNameChanged.emit()
+        self.readerIdChanged.emit()
+
+    def _tick_status_clock(self) -> None:
+        self._status_time = datetime.now().strftime("%I:%M %p")
+        self.statusTimeChanged.emit()
+
+    def _refresh_search_suggestions(self) -> None:
+        query = self._search_query.strip()
+        if not query:
+            self._search_suggestions = []
+            self.searchSuggestionsChanged.emit()
+            return
+
+        try:
+            self._search_suggestions = search_consumers_by_zone(
+                query,
+                self._selected_zone,
+                limit=6,
+                unread_only=self._search_unread_only,
+            )
+        except Exception:
+            self._search_suggestions = []
+        self.searchSuggestionsChanged.emit()
+
+    def _refresh_zone_consumers(self) -> None:
+        if not self._selected_zone:
+            self._zone_consumers = []
+            self.zoneConsumersChanged.emit()
+            return
+
+        try:
+            self._zone_consumers = get_zone_consumers_with_status(self._selected_zone)
+        except Exception:
+            self._zone_consumers = []
+        self.zoneConsumersChanged.emit()
 
     @Property(list, notify=zonesChanged)
     def zones(self) -> list:
@@ -200,6 +328,9 @@ class AppBridge(QObject):
             self._selected_zone = val
             self.selectedZoneChanged.emit()
             self.update_stats()
+            self._refresh_search_suggestions()
+            if self._progress_details_visible:
+                self._refresh_zone_consumers()
 
     @Property(str, notify=searchQueryChanged)
     def searchQuery(self) -> str:
@@ -210,6 +341,7 @@ class AppBridge(QObject):
         if self._search_query != val:
             self._search_query = val
             self.searchQueryChanged.emit()
+            self._refresh_search_suggestions()
 
     @Property(bool, notify=searchUnreadOnlyChanged)
     def searchUnreadOnly(self) -> bool:
@@ -390,6 +522,38 @@ class AppBridge(QObject):
         self.presentReadingChanged.emit()
         self.consumptionChanged.emit()
 
+    @Slot(str)
+    def selectSearchSuggestion(self, meter_no: str) -> None:
+        self._search_query = meter_no
+        self.searchQueryChanged.emit()
+        self._refresh_search_suggestions()
+        self.searchConsumer()
+
+    @Slot()
+    def openProgressDetails(self) -> None:
+        self._progress_details_visible = True
+        self.progressDetailsVisibleChanged.emit()
+        self._refresh_zone_consumers()
+
+    @Slot()
+    def closeProgressDetails(self) -> None:
+        self._progress_details_visible = False
+        self.progressDetailsVisibleChanged.emit()
+
+    @Slot(int)
+    def reprintZoneConsumer(self, consumer_id: int) -> None:
+        self._set_operation_busy(True, "Printing...")
+
+        def finish_reprint() -> None:
+            print(f"Reprint requested for consumer {consumer_id}")
+            self._set_operation_busy(False, "")
+
+        QTimer.singleShot(600, finish_reprint)
+
+    @Slot()
+    def logout(self) -> None:
+        self.logoutRequested.emit()
+
     def calculate_consumption(self) -> None:
         if not self._consumer or not self._present_reading:
             self._consumption = "-"
@@ -441,25 +605,49 @@ class AppBridge(QObject):
             if present < previous:
                 return
 
-            consumption = present - previous
-            save_reading(self._consumer["id"], present, consumption)
-            
-            self._consumer["previous_reading"] = present
-            self._previous_reading = str(present)
-            self._present_reading = ""
-            self._consumption = "-"
-            self._validation_color = "#10B981"
-            self._validation_message = "Saved successfully!"
+            self._set_operation_busy(True, "Printing...")
 
-            self.previousReadingChanged.emit()
-            self.presentReadingChanged.emit()
-            self.consumptionChanged.emit()
-            self.validationColorChanged.emit()
-            self.validationMessageChanged.emit()
-            
-            self.update_stats()
+            def finish_print() -> None:
+                try:
+                    consumption = present - previous
+                    save_reading(self._consumer["id"], present, consumption)
+
+                    self._consumer["previous_reading"] = present
+                    self._previous_reading = str(present)
+                    self._present_reading = ""
+                    self._consumption = "-"
+                    self._validation_color = "#10B981"
+                    self._validation_message = "Saved successfully!"
+
+                    self.previousReadingChanged.emit()
+                    self.presentReadingChanged.emit()
+                    self.consumptionChanged.emit()
+                    self.validationColorChanged.emit()
+                    self.validationMessageChanged.emit()
+
+                    self.update_stats()
+                    if self._progress_details_visible:
+                        self._refresh_zone_consumers()
+                except Exception as e:
+                    print(f"Error saving: {e}")
+                finally:
+                    self._set_operation_busy(False, "")
+
+            QTimer.singleShot(600, finish_print)
         except Exception as e:
             print(f"Error saving: {e}")
+            self._set_operation_busy(False, "")
+
+    @Slot(int)
+    def setBatteryLevel(self, level: int) -> None:
+        self._battery_level = max(0, min(100, level))
+        self.batteryLevelChanged.emit()
+
+    @Slot(str)
+    def setPaperStatus(self, status: str) -> None:
+        normalized = (status or "OK").strip() or "OK"
+        self._paper_status = normalized
+        self.paperStatusChanged.emit()
 
     @Slot()
     def reprintLastReceipt(self) -> None:
@@ -467,14 +655,16 @@ class AppBridge(QObject):
 
     @Slot()
     def syncNow(self) -> None:
-        self._sync_status = "Online"
-        self._sync_status_color = "#10B981"
-        self.syncStatusChanged.emit()
-        self.syncStatusColorChanged.emit()
+        self._set_operation_busy(True, "Syncing...")
 
-    @Slot(str)
-    def setPaperStatus(self, status: str) -> None:
-        pass
+        def finish_sync() -> None:
+            self._sync_status = "Online"
+            self._sync_status_color = "#10B981"
+            self.syncStatusChanged.emit()
+            self.syncStatusColorChanged.emit()
+            self._set_operation_busy(False, "")
+
+        QTimer.singleShot(900, finish_sync)
 
     @Slot()
     def update_stats(self) -> None:
@@ -520,6 +710,8 @@ class AppBridge(QObject):
         self.zoneCompletionPercentageChanged.emit()
         self.zoneFlaggedCountChanged.emit()
         self.zoneRemainingCountChanged.emit()
+        if self._progress_details_visible:
+            self._refresh_zone_consumers()
 
 
 class LoginPage(QWidget):
@@ -554,6 +746,8 @@ class MainContainerPage(QWidget):
         layout.addWidget(self.quick)
 
 
+
+
 class HybridMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -570,10 +764,16 @@ class HybridMainWindow(QMainWindow):
         self.stack.addWidget(self.main_page)
 
         self.login_page.bridge.loginSuccess.connect(self._on_login_success)
+        self.main_page.bridge.logoutRequested.connect(self._on_logout_requested)
 
     def _on_login_success(self, user: dict) -> None:
         self.main_page.bridge.set_user(user)
         self.stack.setCurrentWidget(self.main_page)
+        self.main_page.bridge.showWelcomeToast()
+
+    def _on_logout_requested(self) -> None:
+        self.main_page.bridge.clear_user()
+        self.stack.setCurrentWidget(self.login_page)
 
 
 def run_qt_hybrid() -> int:
