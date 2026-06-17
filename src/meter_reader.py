@@ -1,4 +1,4 @@
-﻿"""
+"""
 Water Meter Reader - Flat UI Compact (Single Card Grouping)
 A modern tkinter GUI for field meter reading on handheld devices.
 Redesigned to fit tightly on a 480x660 screen with a single card group.
@@ -82,37 +82,37 @@ _load_custom_font()
 
 
 # --- Color palette ------------------------------------------------------------
-BG_COLOR         = "#F0F2F5"
+BG_COLOR         = "#F1F5F9"
 WHITE            = "#FFFFFF"
-PRIMARY_BLUE     = "#1565C0"
-HEADER_BLUE      = "#1565C0"
-TAB_DARK         = "#1A2744"
-TAB_BLUE         = "#1565C0"
-ACCENT_BLUE      = "#2196F3"
-DARK_TEXT         = "#1A1A2E"
-MID_TEXT          = "#5A5A7A"
-LIGHT_TEXT        = "#9E9EAF"
-PLACEHOLDER_CLR  = "#B0B0C0"
-BORDER_COLOR     = "#E0E3EA"
-INPUT_BORDER     = "#CED4DA"
+PRIMARY_BLUE     = "#1D4ED8"
+HEADER_BLUE      = "#1D4ED8"
+TAB_DARK         = "#0F172A"
+TAB_BLUE         = "#1E293B"
+ACCENT_BLUE      = "#3B82F6"
+DARK_TEXT         = "#0F172A"
+MID_TEXT          = "#475569"
+LIGHT_TEXT        = "#94A3B8"
+PLACEHOLDER_CLR  = "#94A3B8"
+BORDER_COLOR     = "#CBD5E1"
+INPUT_BORDER     = "#CBD5E1"
 INPUT_FOCUS      = ACCENT_BLUE
-INPUT_BG         = "#FAFBFC"
-DARK_BTN         = "#1A2744"
-DARK_HOVER       = "#2D2D4A"
-OVERLAY_DIM      = "#1A1A2E"
-SUCCESS_GREEN    = "#43A047"
-SUCCESS_TEXT     = "#36EF45" 
+INPUT_BG         = "#F8FAFC"
+DARK_BTN         = "#0F172A"
+DARK_HOVER       = "#1E293B"
+OVERLAY_DIM      = "#0F172A"
+SUCCESS_GREEN    = "#10B981"
+SUCCESS_TEXT     = "#10B981" 
 
 # Consumption states
-VALID_BG         = "#E8F5E9"
-VALID_BORDER     = "#43A047"
-VALID_TEXT        = "#2E7D32"
-WARNING_BG       = "#FFF8E1"
-WARNING_BORDER   = "#F9A825"
-WARNING_TEXT      = "#E65100"
-INVALID_BG       = "#FFEBEE"
-INVALID_BORDER   = "#E53935"
-INVALID_TEXT      = "#C62828"
+VALID_BG         = "#ECFDF5"
+VALID_BORDER     = "#10B981"
+VALID_TEXT        = "#047857"
+WARNING_BG       = "#FFFBEB"
+WARNING_BORDER   = "#F59E0B"
+WARNING_TEXT      = "#B45309"
+INVALID_BG       = "#FEF2F2"
+INVALID_BORDER   = "#EF4444"
+INVALID_TEXT      = "#B91C1C"
 
 DEVICE_WIDTH     = 480
 DEVICE_HEIGHT    = 750  # Perfectly fitted to screen size
@@ -280,100 +280,92 @@ class LoginScreen(tk.Frame):
 
     def _build_ui(self):
         self.pack_propagate(False)
-        # Header
-        header = tk.Frame(self, bg=HEADER_BLUE, height=92)
-        header.pack(fill="x")
-        header.pack_propagate(False)
 
-        tk.Label(header, text="Meter Reader Login", font=(FONT_FAMILY, 18, "bold"),
-                 bg=HEADER_BLUE, fg=WHITE).pack(expand=True)
-
-        # Body area fills remaining screen and centers login form.
-        body = tk.Frame(self, bg=BG_COLOR)
+        # Body area
+        body = tk.Frame(self, bg="#E2E8F0")
         body.pack(fill="both", expand=True)
 
-        center_wrap = tk.Frame(body, bg=BG_COLOR)
-        center_wrap.place(relx=0.5, rely=0.46, anchor="center")
+        # Main Login Card (simulating the mockup card)
+        card = tk.Frame(body, bg="#F1F5F9", highlightthickness=0)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=420, height=660)
 
-        # Logo/Icon area
-        icon_frame = tk.Frame(center_wrap, bg=BG_COLOR)
-        icon_frame.pack(pady=(10, 18))
+        # Ensure the card has rounded corner appearance or clean border
+        card_inner = tk.Frame(card, bg="#F1F5F9")
+        card_inner.pack(fill="both", expand=True, padx=24, pady=24)
 
-        # Draw a simple user icon using canvas
-        icon_canvas = tk.Canvas(icon_frame, width=80, height=80, bg=BG_COLOR, highlightthickness=0)
-        icon_canvas.pack()
-        # Circle background
-        icon_canvas.create_oval(5, 5, 75, 75, fill=PRIMARY_BLUE, outline="")
-        # User silhouette
-        icon_canvas.create_oval(30, 20, 50, 40, fill=WHITE, outline="")  # head
-        icon_canvas.create_arc(20, 35, 60, 70, fill=WHITE, outline="", start=0, extent=180)  # body
+        # Logo
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "images", "SLR logo 1.png")
+        self.logo_photo = None
+        if os.path.exists(logo_path):
+            try:
+                logo_img = Image.open(logo_path)
+                logo_img = logo_img.resize((80, 80), Image.Resampling.LANCZOS)
+                self.logo_photo = ImageTk.PhotoImage(logo_img)
+                logo_label = tk.Label(card_inner, image=self.logo_photo, bg="#F1F5F9")
+                logo_label.pack(pady=(10, 10))
+            except Exception as e:
+                print(f"Error loading login logo: {e}")
 
-        # Login form card
-        form_card = tk.Frame(center_wrap, bg=WHITE, bd=1, relief="flat", highlightthickness=1, highlightbackground=BORDER_COLOR)
-        form_card.pack(padx=24, pady=8, fill="x")
-        form_frame = tk.Frame(form_card, bg=WHITE)
-        form_frame.pack(fill="x", padx=22, pady=18)
+        if not self.logo_photo:
+            # Fallback Canvas Logo
+            icon_canvas = tk.Canvas(card_inner, width=80, height=80, bg="#F1F5F9", highlightthickness=0)
+            icon_canvas.pack(pady=(10, 10))
+            icon_canvas.create_oval(5, 5, 75, 75, fill="#1D4ED8", outline="")
+            icon_canvas.create_text(40, 40, text="💧", font=(FONT_FAMILY, 28), fill="white")
+
+        # Titles
+        tk.Label(card_inner, text="San Lorenzo Ruiz Waterworks System", font=(FONT_FAMILY, 15, "bold"),
+                 bg="#F1F5F9", fg="#0F172A", wraplength=360, justify="center").pack(pady=(0, 4))
+        
+        tk.Label(card_inner, text="Water Billing and Payment Record Management System", font=(FONT_FAMILY, 10),
+                 bg="#F1F5F9", fg="#475569", wraplength=360, justify="center").pack(pady=(0, 16))
+
+        # Form card
+        form_frame = tk.Frame(card_inner, bg="#F1F5F9")
+        form_frame.pack(fill="x", pady=0)
 
         # Username
-        tk.Label(form_frame, text="Username", font=(FONT_FAMILY, 13, "bold"),
-                 bg=WHITE, fg=DARK_TEXT).pack(anchor="w", pady=(0, 6))
+        tk.Label(form_frame, text="👤 Username", font=(FONT_FAMILY, 11, "bold"),
+                 bg="#F1F5F9", fg="#334155").pack(anchor="w", pady=(0, 4))
 
         self._username_var = tk.StringVar()
-        self._username_entry = RoundedEntry(form_frame, placeholder="Enter username...",
-                                          height=74, radius=12, font=(FONT_FAMILY, 18),
-                                          textvariable=self._username_var)
-        self._username_entry.pack(fill="x", pady=(0, 14))
+        self._username_entry = RoundedEntry(form_frame, placeholder="Enter your username",
+                                          height=46, radius=8, font=(FONT_FAMILY, 11),
+                                          bg="#F8FAFC", fg="#0F172A", textvariable=self._username_var)
+        self._username_entry.pack(fill="x", pady=(0, 12))
 
         # Password
-        tk.Label(form_frame, text="Password", font=(FONT_FAMILY, 13, "bold"),
-                 bg=WHITE, fg=DARK_TEXT).pack(anchor="w", pady=(0, 6))
+        tk.Label(form_frame, text="🔒 Password", font=(FONT_FAMILY, 11, "bold"),
+                 bg="#F1F5F9", fg="#334155").pack(anchor="w", pady=(0, 4))
 
         self._password_var = tk.StringVar()
-        self._password_entry = RoundedEntry(form_frame, placeholder="Enter password...",
-                                            height=74, radius=12, font=(FONT_FAMILY, 18),
-                                            textvariable=self._password_var)
+        self._password_entry = RoundedEntry(form_frame, placeholder="Enter your password",
+                                            height=46, radius=8, font=(FONT_FAMILY, 11),
+                                            bg="#F8FAFC", fg="#0F172A", textvariable=self._password_var)
         self._password_entry.entry.config(show="•")
-        self._password_entry.pack(fill="x", pady=(0, 24))
+        self._password_entry.pack(fill="x", pady=(0, 16))
 
         # Error message label
-        self._error_label = tk.Label(form_frame, text="", font=(FONT_FAMILY, 10),
-                                     bg=WHITE, fg=INVALID_TEXT)
-        self._error_label.pack(pady=(0, 10))
+        self._error_label = tk.Label(form_frame, text="", font=(FONT_FAMILY, 9),
+                                     bg="#F1F5F9", fg="#EF4444")
+        self._error_label.pack(pady=(0, 8))
 
         # Login button
-        login_btn = tk.Button(form_frame, text="LOGIN", font=(FONT_FAMILY, 20, "bold"),
-                             bg=TAB_DARK, fg=WHITE, activebackground=DARK_HOVER,
+        login_btn = tk.Button(form_frame, text="Log In", font=(FONT_FAMILY, 12, "bold"),
+                             bg="#1D4ED8", fg=WHITE, activebackground="#1E40AF",
                              activeforeground=WHITE, relief="flat", bd=0,
-                             cursor="hand2", pady=16, command=self._attempt_login)
-        login_btn.pack(fill="x", ipady=14)
+                             cursor="hand2", pady=8, command=self._attempt_login)
+        login_btn.pack(fill="x", ipady=4)
 
-        login_btn.bind("<Enter>", lambda e: e.widget.config(bg=DARK_HOVER))
-        login_btn.bind("<Leave>", lambda e: e.widget.config(bg=TAB_DARK))
+        login_btn.bind("<Enter>", lambda e: e.widget.config(bg="#1E40AF"))
+        login_btn.bind("<Leave>", lambda e: e.widget.config(bg="#1D4ED8"))
 
         # Bind Enter key
         self._password_entry.entry.bind("<Return>", lambda e: self._attempt_login())
         self._username_entry.entry.bind("<Return>", lambda e: self._password_entry.entry.focus())
-
-        # Bottom loading/info panel (replaces Available Users list).
-        hint_frame = tk.Frame(body, bg=BG_COLOR)
-        hint_frame.pack(side="bottom", pady=(8, 16))
-        self._loading_title_label = tk.Label(
-            hint_frame,
-            text="Loading data and sync services...",
-            font=(FONT_FAMILY, 10, "bold"),
-            bg=BG_COLOR,
-            fg=MID_TEXT,
-        )
-        self._loading_title_label.pack()
-        self._loading_detail_label = tk.Label(
-            hint_frame,
-            text="Please wait",
-            font=(FONT_FAMILY, 9),
-            bg=BG_COLOR,
-            fg=LIGHT_TEXT,
-        )
-        self._loading_detail_label.pack(pady=(2, 0))
-        self._loading_hint_frame = hint_frame
+        # Footer
+        tk.Label(card_inner, text="© 2026 Municipality of San Lorenzo Ruiz", font=(FONT_FAMILY, 8),
+                 bg="#F1F5F9", fg="#64748B").pack(side="bottom", pady=(10, 0))
 
     def set_loading_status(self, title: str, detail: str = ""):
         """Update bottom loading/status text on login screen."""

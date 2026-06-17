@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Property, Qt, Signal, Slot
+os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
+
+from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QFont
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
-    QFormLayout,
     QHBoxLayout,
-    QLabel,
-    QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -45,230 +43,537 @@ except ImportError:
     )
 
 
-class ZoneOverviewBridge(QObject):
-    zoneSummaryChanged = Signal()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._zone_summary = ""
-
-    @Property(str, notify=zoneSummaryChanged)
-    def zoneSummary(self) -> str:
-        return self._zone_summary
-
-    @Slot()
-    def refresh(self) -> None:
-        stats = get_zone_stats()
-        if not stats:
-            self._zone_summary = "No zone data"
-        else:
-            lines = []
-            for zone_name in sorted(stats.keys()):
-                zone = stats[zone_name]
-                lines.append(
-                    f"{zone_name}: {zone['read']}/{zone['households']} read | flagged: {zone['flagged']}"
-                )
-            self._zone_summary = "\n".join(lines)
-        self.zoneSummaryChanged.emit()
-
-
-class LoginPage(QWidget):
+class LoginBridge(QObject):
     loginSuccess = Signal(dict)
+    loginFailed = Signal()
+    errorMessageChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 28)
-        layout.setSpacing(12)
+        self._error_message = ""
 
-        title = QLabel("Water Meter Reader")
-        title.setStyleSheet("font-size: 22px; font-weight: 700;")
-        subtitle = QLabel("Sign in to start field readings")
-        subtitle.setStyleSheet("color: #4d5b6a;")
+    @Property(str, notify=errorMessageChanged)
+    def errorMessage(self) -> str:
+        return self._error_message
 
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Username")
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.Password)
-        self.password_input.setPlaceholderText("Password")
-
-        login_btn = QPushButton("Login")
-        login_btn.clicked.connect(self._attempt_login)
-
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addSpacing(8)
-        layout.addWidget(self.username_input)
-        layout.addWidget(self.password_input)
-        layout.addWidget(login_btn)
-        layout.addStretch(1)
-
-    def _attempt_login(self) -> None:
-        user = authenticate_user(self.username_input.text().strip(), self.password_input.text().strip())
-        if not user:
-            QMessageBox.warning(self, "Login failed", "Invalid username or password.")
+    @Slot(str, str)
+    def attemptLogin(self, username, password):
+        username = username.strip()
+        password = password.strip()
+        if not username or not password:
+            self._error_message = "Please enter username and password"
+            self.errorMessageChanged.emit()
+            self.loginFailed.emit()
             return
+
+        user = authenticate_user(username, password)
+        if not user:
+            self._error_message = "Invalid username or password."
+            self.errorMessageChanged.emit()
+            self.loginFailed.emit()
+            return
+
+        self._error_message = ""
+        self.errorMessageChanged.emit()
         self.loginSuccess.emit(user)
 
 
-class MeterEntryPage(QWidget):
-    requestOverview = Signal()
+class AppBridge(QObject):
+    # Tab property
+    currentTabChanged = Signal()
+    readerNameChanged = Signal()
+    
+    # Meter Entry properties
+    zonesChanged = Signal()
+    selectedZoneChanged = Signal()
+    searchQueryChanged = Signal()
+    searchUnreadOnlyChanged = Signal()
+    
+    # Consumer info properties
+    accountNoChanged = Signal()
+    consumerNameChanged = Signal()
+    previousReadingChanged = Signal()
+    presentReadingChanged = Signal()
+    consumptionChanged = Signal()
+    validationColorChanged = Signal()
+    validationMessageChanged = Signal()
+    
+    # Exception properties
+    exceptionsChanged = Signal()
+    selectedExceptionChanged = Signal()
+
+    # Sync properties
+    syncStatusChanged = Signal()
+    syncStatusColorChanged = Signal()
+    syncPendingCountChanged = Signal()
+    saveTargetChanged = Signal()
+    backupStateChanged = Signal()
+    lastSyncChanged = Signal()
+    lastPullMirrorChanged = Signal()
+    autoPullEnabledChanged = Signal()
+    autoPushEnabledChanged = Signal()
+    pullIntervalChanged = Signal()
+
+    # Circular progress / dashboard stats
+    overallPercentageChanged = Signal()
+    overallFractionChanged = Signal()
+    zoneReadFractionChanged = Signal()
+    zoneCompletionPercentageChanged = Signal()
+    zoneFlaggedCountChanged = Signal()
+    zoneRemainingCountChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self._current_tab = 0
+        self._reader_name = "User"
+        
+        self._zones = get_all_zone_names()
+        self._selected_zone = self._zones[0] if self._zones else ""
+        self._search_query = ""
+        self._search_unread_only = True
+        
+        self._account_no = "-"
+        self._consumer_name = "-"
+        self._previous_reading = "-"
+        self._present_reading = ""
+        self._consumption = "-"
+        self._validation_color = "#94a3b8"
+        self._validation_message = "-"
+        
+        self._exceptions = ["None", "Stuck Meter", "Leaking", "No Access", "Broken Seal"]
+        self._selected_exception = "None"
+
+        self._sync_status = "Offline"
+        self._sync_status_color = "#475569"
+        self._sync_pending_count = 0
+        self._save_target = "Local SQLite only"
+        self._backup_state = "Not configured"
+        self._last_sync = "Never"
+        self._last_pull_mirror = 0
+        self._auto_pull_enabled = True
+        self._auto_push_enabled = True
+        self._pull_interval = 60
+
+        self._overall_percentage = 0
+        self._overall_fraction = "0/0"
+        self._zone_read_fraction = "0/0"
+        self._zone_completion_percentage = 0
+        self._zone_flagged_count = 0
+        self._zone_remaining_count = 0
+
         self._consumer = None
+        self.update_stats()
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
+    # Properties
+    @Property(int, notify=zoneRemainingCountChanged)
+    def zoneRemainingCount(self) -> int:
+        return self._zone_remaining_count
+    @Property(int, notify=currentTabChanged)
+    def currentTab(self) -> int:
+        return self._current_tab
 
-        top_row = QHBoxLayout()
-        self.user_label = QLabel("Reader: -")
-        overview_btn = QPushButton("Zone Overview")
-        overview_btn.clicked.connect(self.requestOverview.emit)
-        top_row.addWidget(self.user_label)
-        top_row.addStretch(1)
-        top_row.addWidget(overview_btn)
+    @currentTab.setter
+    def currentTab(self, val: int) -> None:
+        if self._current_tab != val:
+            self._current_tab = val
+            self.currentTabChanged.emit()
 
-        form = QFormLayout()
-        self.zone_select = QComboBox()
-        self.zone_select.addItems(get_all_zone_names())
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Meter No (e.g., MTR-001)")
-        self.present_input = QLineEdit()
-        self.present_input.setPlaceholderText("Present reading")
-
-        self.result_label = QLabel("Search a consumer to begin.")
-        self.result_label.setWordWrap(True)
-
-        search_btn = QPushButton("Search")
-        search_btn.clicked.connect(self._search_consumer)
-        save_btn = QPushButton("Save Reading")
-        save_btn.clicked.connect(self._save_reading)
-
-        form.addRow("Zone", self.zone_select)
-        form.addRow("Meter", self.search_input)
-        form.addRow("Present", self.present_input)
-
-        root.addLayout(top_row)
-        root.addSpacing(8)
-        root.addLayout(form)
-        root.addWidget(search_btn)
-        root.addWidget(save_btn)
-        root.addWidget(self.result_label)
-        root.addStretch(1)
+    @Property(str, notify=readerNameChanged)
+    def readerName(self) -> str:
+        return self._reader_name
 
     def set_user(self, user: dict) -> None:
-        self.user_label.setText(f"Reader: {user['name']} ({user['id']})")
+        self._reader_name = user['name']
+        self.readerNameChanged.emit()
 
-    def _search_consumer(self) -> None:
-        query = self.search_input.text().strip()
+    @Property(list, notify=zonesChanged)
+    def zones(self) -> list:
+        return self._zones
+
+    @Property(str, notify=selectedZoneChanged)
+    def selectedZone(self) -> str:
+        return self._selected_zone
+
+    @selectedZone.setter
+    def selectedZone(self, val: str) -> None:
+        if self._selected_zone != val:
+            self._selected_zone = val
+            self.selectedZoneChanged.emit()
+            self.update_stats()
+
+    @Property(str, notify=searchQueryChanged)
+    def searchQuery(self) -> str:
+        return self._search_query
+
+    @searchQuery.setter
+    def searchQuery(self, val: str) -> None:
+        if self._search_query != val:
+            self._search_query = val
+            self.searchQueryChanged.emit()
+
+    @Property(bool, notify=searchUnreadOnlyChanged)
+    def searchUnreadOnly(self) -> bool:
+        return self._search_unread_only
+
+    @searchUnreadOnly.setter
+    def searchUnreadOnly(self, val: bool) -> None:
+        if self._search_unread_only != val:
+            self._search_unread_only = val
+            self.searchUnreadOnlyChanged.emit()
+
+    # Consumer Details properties
+    @Property(str, notify=accountNoChanged)
+    def accountNo(self) -> str:
+        return self._account_no
+
+    @Property(str, notify=consumerNameChanged)
+    def consumerName(self) -> str:
+        return self._consumer_name
+
+    @Property(str, notify=previousReadingChanged)
+    def previousReading(self) -> str:
+        return self._previous_reading
+
+    @Property(str, notify=presentReadingChanged)
+    def presentReading(self) -> str:
+        return self._present_reading
+
+    @presentReading.setter
+    def presentReading(self, val: str) -> None:
+        if self._present_reading != val:
+            self._present_reading = val
+            self.presentReadingChanged.emit()
+            self.calculate_consumption()
+
+    @Property(str, notify=consumptionChanged)
+    def consumption(self) -> str:
+        return self._consumption
+
+    @Property(str, notify=validationColorChanged)
+    def validationColor(self) -> str:
+        return self._validation_color
+
+    @Property(str, notify=validationMessageChanged)
+    def validationMessage(self) -> str:
+        return self._validation_message
+
+    # Exception properties
+    @Property(list, notify=exceptionsChanged)
+    def exceptions(self) -> list:
+        return self._exceptions
+
+    @Property(str, notify=selectedExceptionChanged)
+    def selectedException(self) -> str:
+        return self._selected_exception
+
+    @selectedException.setter
+    def selectedException(self, val: str) -> None:
+        if self._selected_exception != val:
+            self._selected_exception = val
+            self.selectedExceptionChanged.emit()
+
+    # Sync Settings properties
+    @Property(str, notify=syncStatusChanged)
+    def syncStatus(self) -> str:
+        return self._sync_status
+
+    @Property(str, notify=syncStatusColorChanged)
+    def syncStatusColor(self) -> str:
+        return self._sync_status_color
+
+    @Property(int, notify=syncPendingCountChanged)
+    def syncPendingCount(self) -> int:
+        return self._sync_pending_count
+
+    @Property(str, notify=saveTargetChanged)
+    def saveTarget(self) -> str:
+        return self._save_target
+
+    @Property(str, notify=backupStateChanged)
+    def backupState(self) -> str:
+        return self._backup_state
+
+    @Property(str, notify=lastSyncChanged)
+    def lastSync(self) -> str:
+        return self._last_sync
+
+    @Property(int, notify=lastPullMirrorChanged)
+    def lastPullMirror(self) -> int:
+        return self._last_pull_mirror
+
+    @Property(bool, notify=autoPullEnabledChanged)
+    def autoPullEnabled(self) -> bool:
+        return self._auto_pull_enabled
+
+    @autoPullEnabled.setter
+    def autoPullEnabled(self, val: bool) -> None:
+        if self._auto_pull_enabled != val:
+            self._auto_pull_enabled = val
+            self.autoPullEnabledChanged.emit()
+
+    @Property(bool, notify=autoPushEnabledChanged)
+    def autoPushEnabled(self) -> bool:
+        return self._auto_push_enabled
+
+    @autoPushEnabled.setter
+    def autoPushEnabled(self, val: bool) -> None:
+        if self._auto_push_enabled != val:
+            self._auto_push_enabled = val
+            self.autoPushEnabledChanged.emit()
+
+    @Property(int, notify=pullIntervalChanged)
+    def pullInterval(self) -> int:
+        return self._pull_interval
+
+    @pullInterval.setter
+    def pullInterval(self, val: int) -> None:
+        if self._pull_interval != val:
+            self._pull_interval = val
+            self.pullIntervalChanged.emit()
+
+    # Circular progress stats properties
+    @Property(int, notify=overallPercentageChanged)
+    def overallPercentage(self) -> int:
+        return self._overall_percentage
+
+    @Property(str, notify=overallFractionChanged)
+    def overallFraction(self) -> str:
+        return self._overall_fraction
+
+    @Property(str, notify=zoneReadFractionChanged)
+    def zoneReadFraction(self) -> str:
+        return self._zone_read_fraction
+
+    @Property(int, notify=zoneCompletionPercentageChanged)
+    def zoneCompletionPercentage(self) -> int:
+        return self._zone_completion_percentage
+
+    @Property(int, notify=zoneFlaggedCountChanged)
+    def zoneFlaggedCount(self) -> int:
+        return self._zone_flagged_count
+
+    # Actions / slots
+    @Slot()
+    def searchConsumer(self) -> None:
+        query = self._search_query.strip()
+        if not query:
+            return
+
         if query.isdigit():
             query = f"MTR-{query.zfill(3)}"
+            self._search_query = query
+            self.searchQueryChanged.emit()
 
-        consumer = search_consumer(query, unread_only=False)
+        consumer = search_consumer(query, unread_only=self._search_unread_only)
         if consumer is None:
-            matches = search_consumers_by_zone(query, self.zone_select.currentText(), limit=1, unread_only=False)
+            matches = search_consumers_by_zone(query, self._selected_zone, limit=1, unread_only=self._search_unread_only)
             consumer = matches[0] if matches else None
 
         if consumer is None:
             self._consumer = None
-            self.result_label.setText("Consumer not found in selected zone.")
-            return
+            self._account_no = "-"
+            self._consumer_name = "Consumer not found"
+            self._previous_reading = "-"
+            self._present_reading = ""
+            self._consumption = "-"
+        else:
+            self._consumer = consumer
+            self._account_no = str(consumer["id"])
+            self._consumer_name = consumer["name"]
+            self._previous_reading = str(consumer["previous_reading"])
+            self._present_reading = ""
+            self._consumption = "-"
 
-        self._consumer = consumer
-        self.result_label.setText(
-            f"{consumer['name']} | {consumer['meter_no']} | prev: {consumer['previous_reading']}"
-        )
+        self.accountNoChanged.emit()
+        self.consumerNameChanged.emit()
+        self.previousReadingChanged.emit()
+        self.presentReadingChanged.emit()
+        self.consumptionChanged.emit()
 
-    def _save_reading(self) -> None:
-        if not self._consumer:
-            QMessageBox.warning(self, "No consumer", "Search a consumer before saving.")
+    def calculate_consumption(self) -> None:
+        if not self._consumer or not self._present_reading:
+            self._consumption = "-"
+            self._validation_color = "#94a3b8"
+            self._validation_message = "-"
+            self.consumptionChanged.emit()
+            self.validationColorChanged.emit()
+            self.validationMessageChanged.emit()
             return
 
         try:
-            present = int(self.present_input.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Invalid reading", "Present reading must be numeric.")
+            present = int(self._present_reading)
+            previous = int(self._consumer["previous_reading"])
+            diff = present - previous
+            
+            if diff < 0:
+                self._consumption = str(diff)
+                self._validation_color = "#EF4444"
+                self._validation_message = "Invalid: Lower than previous"
+            elif diff > 500:
+                self._consumption = str(diff)
+                self._validation_color = "#F59E0B"
+                self._validation_message = "Warning: High Consumption"
+            else:
+                self._consumption = str(diff)
+                self._validation_color = "#10B981"
+                self._validation_message = "Valid"
+        except Exception:
+            self._consumption = "-"
+            self._validation_color = "#EF4444"
+            self._validation_message = "Numeric error"
+
+        self.consumptionChanged.emit()
+        self.validationColorChanged.emit()
+        self.validationMessageChanged.emit()
+
+    @Slot()
+    def saveReading(self) -> None:
+        self.printReceipt()
+
+    @Slot()
+    def printReceipt(self) -> None:
+        if not self._consumer or not self._present_reading:
             return
 
-        previous = int(self._consumer["previous_reading"])
-        if present < previous:
-            QMessageBox.warning(self, "Invalid reading", "Present reading cannot be lower than previous.")
+        try:
+            present = int(self._present_reading)
+            previous = int(self._consumer["previous_reading"])
+            if present < previous:
+                return
+
+            consumption = present - previous
+            save_reading(self._consumer["id"], present, consumption)
+            
+            self._consumer["previous_reading"] = present
+            self._previous_reading = str(present)
+            self._present_reading = ""
+            self._consumption = "-"
+            self._validation_color = "#10B981"
+            self._validation_message = "Saved successfully!"
+
+            self.previousReadingChanged.emit()
+            self.presentReadingChanged.emit()
+            self.consumptionChanged.emit()
+            self.validationColorChanged.emit()
+            self.validationMessageChanged.emit()
+            
+            self.update_stats()
+        except Exception as e:
+            print(f"Error saving: {e}")
+
+    @Slot()
+    def reprintLastReceipt(self) -> None:
+        pass
+
+    @Slot()
+    def syncNow(self) -> None:
+        self._sync_status = "Online"
+        self._sync_status_color = "#10B981"
+        self.syncStatusChanged.emit()
+        self.syncStatusColorChanged.emit()
+
+    @Slot(str)
+    def setPaperStatus(self, status: str) -> None:
+        pass
+
+    @Slot()
+    def update_stats(self) -> None:
+        stats = get_zone_stats()
+        if not stats:
             return
 
-        consumption = present - previous
-        save_reading(self._consumer["id"], present, consumption)
-        self._consumer["previous_reading"] = present
-        self.result_label.setText(
-            f"Saved. {self._consumer['name']} | consumption: {consumption}"
-        )
-        self.present_input.clear()
+        # Overall completion calculations
+        total_read = 0
+        total_households = 0
+        flagged = 0
+        for z_name, z_data in stats.items():
+            total_read += z_data["read"]
+            total_households += z_data["households"]
+            flagged += z_data["flagged"]
+
+        if total_households > 0:
+            self._overall_percentage = int((total_read / total_households) * 100)
+        else:
+            self._overall_percentage = 0
+
+        self._overall_fraction = f"{total_read}/{total_households} read"
+        self.overallPercentageChanged.emit()
+        self.overallFractionChanged.emit()
+
+        # Active Zone calculations
+        active_zone = stats.get(self._selected_zone)
+        if active_zone:
+            self._zone_read_fraction = f"{active_zone['read']}/{active_zone['households']}"
+            if active_zone['households'] > 0:
+                self._zone_completion_percentage = int((active_zone['read'] / active_zone['households']) * 100)
+            else:
+                self._zone_completion_percentage = 0
+            self._zone_flagged_count = active_zone["flagged"]
+            self._zone_remaining_count = max(0, active_zone['households'] - active_zone['read'])
+        else:
+            self._zone_read_fraction = "0/0"
+            self._zone_completion_percentage = 0
+            self._zone_flagged_count = 0
+            self._zone_remaining_count = 0
+
+        self.zoneReadFractionChanged.emit()
+        self.zoneCompletionPercentageChanged.emit()
+        self.zoneFlaggedCountChanged.emit()
+        self.zoneRemainingCountChanged.emit()
 
 
-class ZoneOverviewPage(QWidget):
-    backRequested = Signal()
-
+class LoginPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.bridge = ZoneOverviewBridge()
-
+        self.bridge = LoginBridge()
+        self.bridge.setParent(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        quick = QQuickWidget()
-        quick.rootContext().setContextProperty("zoneBridge", self.bridge)
-        qml_path = Path(__file__).resolve().parent.parent / "assets" / "qml" / "ZoneOverview.qml"
-        quick.setSource(str(qml_path))
-        quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        self.quick = QQuickWidget()
+        self.quick.rootContext().setContextProperty("loginBridge", self.bridge)
+        qml_path = Path(__file__).resolve().parent.parent / "assets" / "qml" / "Login.qml"
+        self.quick.setSource(QUrl.fromLocalFile(str(qml_path)))
+        self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        layout.addWidget(self.quick)
 
-        footer = QWidget()
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(16, 8, 16, 12)
-        back_btn = QPushButton("Back to Meter Entry")
-        back_btn.clicked.connect(self.backRequested.emit)
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.bridge.refresh)
-        footer_layout.addWidget(back_btn)
-        footer_layout.addStretch(1)
-        footer_layout.addWidget(refresh_btn)
 
-        layout.addWidget(quick, 1)
-        layout.addWidget(footer)
+class MainContainerPage(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bridge = AppBridge()
+        self.bridge.setParent(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        self.bridge.refresh()
+        self.quick = QQuickWidget()
+        self.quick.rootContext().setContextProperty("appBridge", self.bridge)
+        qml_path = Path(__file__).resolve().parent.parent / "assets" / "qml" / "MainContainer.qml"
+        self.quick.setSource(QUrl.fromLocalFile(str(qml_path)))
+        self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        layout.addWidget(self.quick)
 
 
 class HybridMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Water Meter Reader - Qt Hybrid")
-        self.resize(920, 620)
+        self.resize(480, 750)  # Perfectly aligned with mobile handheld layout dimensions
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.login_page = LoginPage()
-        self.meter_page = MeterEntryPage()
-        self.overview_page = ZoneOverviewPage()
+        self.main_page = MainContainerPage()
 
         self.stack.addWidget(self.login_page)
-        self.stack.addWidget(self.meter_page)
-        self.stack.addWidget(self.overview_page)
+        self.stack.addWidget(self.main_page)
 
-        self.login_page.loginSuccess.connect(self._on_login_success)
-        self.meter_page.requestOverview.connect(self._open_overview)
-        self.overview_page.backRequested.connect(self._open_meter_entry)
+        self.login_page.bridge.loginSuccess.connect(self._on_login_success)
 
     def _on_login_success(self, user: dict) -> None:
-        self.meter_page.set_user(user)
-        self.stack.setCurrentWidget(self.meter_page)
-
-    def _open_overview(self) -> None:
-        self.overview_page.bridge.refresh()
-        self.stack.setCurrentWidget(self.overview_page)
-
-    def _open_meter_entry(self) -> None:
-        self.stack.setCurrentWidget(self.meter_page)
+        self.main_page.bridge.set_user(user)
+        self.stack.setCurrentWidget(self.main_page)
 
 
 def run_qt_hybrid() -> int:
@@ -279,3 +584,5 @@ def run_qt_hybrid() -> int:
     win = HybridMainWindow()
     win.show()
     return app.exec()
+
+
