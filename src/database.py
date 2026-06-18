@@ -293,6 +293,7 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             c.previous_reading,
             CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
             r.present_reading as reading_value,
+            r.consumption,
             r.reading_date,
             r.exception,
             r.is_flagged

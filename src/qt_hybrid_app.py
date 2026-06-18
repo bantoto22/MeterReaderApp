@@ -5,7 +5,10 @@ from __future__ import annotations
 import sys
 import os
 import importlib.util
-from datetime import datetime
+import re
+import subprocess
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
@@ -36,6 +39,7 @@ try:
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        replace_consumers_from_sync,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
@@ -47,10 +51,20 @@ except ImportError:
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        replace_consumers_from_sync,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
     )
+
+try:
+    from .handheld_sync import HandheldSyncDataAccess, SyncConfig
+except ImportError:
+    try:
+        from handheld_sync import HandheldSyncDataAccess, SyncConfig
+    except ImportError:
+        HandheldSyncDataAccess = None
+        SyncConfig = None
 
 
 class LoginBridge(QObject):
@@ -103,6 +117,9 @@ class AppBridge(QObject):
     welcomeToastRequested = Signal(str)
     operationBusyChanged = Signal()
     operationBusyMessageChanged = Signal()
+    alertRequested = Signal(str, str)
+    receiptPreviewRequested = Signal(str, str)
+    canReprintChanged = Signal()
     
     # Meter Entry properties
     zonesChanged = Signal()
@@ -134,6 +151,15 @@ class AppBridge(QObject):
     autoPullEnabledChanged = Signal()
     autoPushEnabledChanged = Signal()
     pullIntervalChanged = Signal()
+    syncLogsChanged = Signal()
+    wifiStatusChanged = Signal()
+    wifiStatusColorChanged = Signal()
+    wifiNetworksChanged = Signal()
+    wifiBusyChanged = Signal()
+    syncTaskFinished = Signal(object)
+    wifiScanFinished = Signal(object, str)
+    wifiConnectFinished = Signal(bool, str, str)
+    wifiStatusResult = Signal(str, str)
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -157,6 +183,7 @@ class AppBridge(QObject):
         self._progress_details_visible = False
         self._operation_busy = False
         self._operation_busy_message = ""
+        self._last_receipt = None
         
         self._zones = get_all_zone_names()
         self._selected_zone = self._zones[0] if self._zones else ""
@@ -184,6 +211,12 @@ class AppBridge(QObject):
         self._auto_pull_enabled = True
         self._auto_push_enabled = True
         self._pull_interval = 60
+        self._sync_logs = "No sync activity yet."
+        self._sync_dal = None
+        self._wifi_status = "Status: Checking..."
+        self._wifi_status_color = "#526176"
+        self._wifi_networks = []
+        self._wifi_busy = False
 
         self._overall_percentage = 0
         self._overall_fraction = "0/0"
@@ -198,9 +231,25 @@ class AppBridge(QObject):
         self._clock_timer.timeout.connect(self._tick_status_clock)
         self._clock_timer.start()
 
+        self.syncTaskFinished.connect(self._finish_sync_task)
+        self.wifiScanFinished.connect(self._finish_wifi_scan)
+        self.wifiConnectFinished.connect(self._finish_wifi_connect)
+        self.wifiStatusResult.connect(self._set_wifi_status)
+
+        self._wifi_timer = QTimer(self)
+        self._wifi_timer.setInterval(5_000)
+        self._wifi_timer.timeout.connect(self.refreshWifiStatus)
+        self._wifi_timer.start()
+
+        self._auto_pull_timer = QTimer(self)
+        self._auto_pull_timer.timeout.connect(self._run_auto_pull)
+        self._reset_auto_pull_timer()
+
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
         self.update_stats()
+        self._init_sync()
+        self.refreshWifiStatus()
 
     # Properties
     @Property(int, notify=zoneRemainingCountChanged)
@@ -255,6 +304,10 @@ class AppBridge(QObject):
     @Property(str, notify=operationBusyMessageChanged)
     def operationBusyMessage(self) -> str:
         return self._operation_busy_message
+
+    @Property(bool, notify=canReprintChanged)
+    def canReprint(self) -> bool:
+        return self._last_receipt is not None
 
     def set_user(self, user: dict) -> None:
         self._reader_name = user.get('name', 'User')
@@ -352,6 +405,7 @@ class AppBridge(QObject):
         if self._search_unread_only != val:
             self._search_unread_only = val
             self.searchUnreadOnlyChanged.emit()
+            self._refresh_search_suggestions()
 
     # Consumer Details properties
     @Property(str, notify=accountNoChanged)
@@ -442,6 +496,7 @@ class AppBridge(QObject):
         if self._auto_pull_enabled != val:
             self._auto_pull_enabled = val
             self.autoPullEnabledChanged.emit()
+            self._reset_auto_pull_timer()
 
     @Property(bool, notify=autoPushEnabledChanged)
     def autoPushEnabled(self) -> bool:
@@ -459,9 +514,31 @@ class AppBridge(QObject):
 
     @pullInterval.setter
     def pullInterval(self, val: int) -> None:
-        if self._pull_interval != val:
-            self._pull_interval = val
+        normalized = max(15, int(val or 60))
+        if self._pull_interval != normalized:
+            self._pull_interval = normalized
             self.pullIntervalChanged.emit()
+            self._reset_auto_pull_timer()
+
+    @Property(str, notify=syncLogsChanged)
+    def syncLogs(self) -> str:
+        return self._sync_logs
+
+    @Property(str, notify=wifiStatusChanged)
+    def wifiStatus(self) -> str:
+        return self._wifi_status
+
+    @Property(str, notify=wifiStatusColorChanged)
+    def wifiStatusColor(self) -> str:
+        return self._wifi_status_color
+
+    @Property(list, notify=wifiNetworksChanged)
+    def wifiNetworks(self) -> list:
+        return self._wifi_networks
+
+    @Property(bool, notify=wifiBusyChanged)
+    def wifiBusy(self) -> bool:
+        return self._wifi_busy
 
     # Circular progress stats properties
     @Property(int, notify=overallPercentageChanged)
@@ -483,6 +560,317 @@ class AppBridge(QObject):
     @Property(int, notify=zoneFlaggedCountChanged)
     def zoneFlaggedCount(self) -> int:
         return self._zone_flagged_count
+
+    def _emit_sync_state(self) -> None:
+        self.syncStatusChanged.emit()
+        self.syncStatusColorChanged.emit()
+        self.syncPendingCountChanged.emit()
+        self.saveTargetChanged.emit()
+        self.backupStateChanged.emit()
+        self.lastSyncChanged.emit()
+        self.lastPullMirrorChanged.emit()
+
+    def _init_sync(self) -> None:
+        if HandheldSyncDataAccess is None or SyncConfig is None:
+            self._sync_status = "Sync Failed"
+            self._sync_status_color = "#EF4444"
+            self._sync_logs = "Sync module is unavailable."
+            self.syncLogsChanged.emit()
+            self._emit_sync_state()
+            return
+        try:
+            cfg = SyncConfig.from_env(fail_fast=False)
+            if not cfg.sync_enabled:
+                self._sync_status = "Offline"
+                self._sync_status_color = "#526176"
+                self._sync_logs = "Handheld sync is disabled in the environment."
+                self.syncLogsChanged.emit()
+                self._emit_sync_state()
+                return
+            self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
+            self._sync_dal.start_sync_worker(interval_seconds=20)
+            self._refresh_sync_snapshot()
+        except Exception as exc:
+            self._sync_dal = None
+            self._sync_status = "Sync Failed"
+            self._sync_status_color = "#EF4444"
+            self._sync_logs = str(exc)
+            self.syncLogsChanged.emit()
+            self._emit_sync_state()
+
+    def _refresh_sync_snapshot(self) -> None:
+        if not self._sync_dal:
+            self._emit_sync_state()
+            return
+        try:
+            snapshot = self._sync_dal.get_sync_snapshot()
+            self._sync_status = str(snapshot.get("status", "Offline"))
+            self._sync_status_color = "#10B981" if self._sync_status == "Online" else "#526176"
+            if snapshot.get("has_failed"):
+                self._sync_status = "Sync Failed"
+                self._sync_status_color = "#EF4444"
+            self._sync_pending_count = int(snapshot.get("pending_count", 0))
+            self._save_target = str(snapshot.get("save_target", "Local SQLite only"))
+            self._backup_state = str(snapshot.get("backup_state", "Not configured"))
+            self._last_sync = str(snapshot.get("last_sync_time") or "Never")
+            entries = self._sync_dal.get_recent_audit_entries(limit=25)
+            self._sync_logs = "\n\n".join(
+                f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
+                for row in entries
+            ) or "No sync activity yet."
+            self.syncLogsChanged.emit()
+        except Exception as exc:
+            self._sync_status = "Sync Failed"
+            self._sync_status_color = "#EF4444"
+            self._sync_logs = str(exc)
+            self.syncLogsChanged.emit()
+        self._emit_sync_state()
+
+    def _reset_auto_pull_timer(self) -> None:
+        if not hasattr(self, "_auto_pull_timer"):
+            return
+        self._auto_pull_timer.stop()
+        if self._auto_pull_enabled:
+            self._auto_pull_timer.start(max(15, self._pull_interval) * 1000)
+
+    def _run_auto_pull(self) -> None:
+        if not self._auto_pull_enabled or not self._sync_dal or self._operation_busy:
+            return
+
+        def _task() -> None:
+            try:
+                consumers = self._sync_dal.loadAssignedConsumers(None)
+                mirrored = replace_consumers_from_sync(consumers)
+                self.syncTaskFinished.emit({"kind": "pull", "pulled": len(consumers), "mirrored": mirrored})
+            except Exception as exc:
+                self.syncTaskFinished.emit({"kind": "error", "error": str(exc), "silent": True})
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_sync_task(self, result: dict) -> None:
+        self._set_operation_busy(False, "")
+        if result.get("kind") == "error":
+            self._sync_status = "Sync Failed"
+            self._sync_status_color = "#EF4444"
+            self._sync_logs = str(result.get("error", "Sync failed"))
+            self.syncLogsChanged.emit()
+            self._emit_sync_state()
+            if not result.get("silent"):
+                self.alertRequested.emit("Sync Failed", self._sync_logs)
+            return
+
+        self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
+        self._zones = get_all_zone_names()
+        self.zonesChanged.emit()
+        self.update_stats()
+        self._refresh_sync_snapshot()
+        if result.get("kind") == "sync":
+            sync_result = result.get("result", {})
+            self.alertRequested.emit(
+                "Sync Complete",
+                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}\nMirrored: {self._last_pull_mirror}",
+            )
+
+    def _save_to_sync_layer(self, consumer_id: int, present: int, consumption: int, exception: str, flagged: bool) -> None:
+        if not self._sync_dal or not self._auto_push_enabled:
+            return
+        payload = {
+            "consumer_id": consumer_id,
+            "present_reading": present,
+            "consumption": consumption,
+            "exception": exception,
+            "is_flagged": bool(flagged),
+            "reading_date": datetime.now().date().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._sync_dal.saveMeterReading(payload)
+        except Exception as exc:
+            self._sync_logs = f"Sync save failed: {exc}"
+            self.syncLogsChanged.emit()
+        self._refresh_sync_snapshot()
+
+    def _set_wifi_busy(self, busy: bool, status: str | None = None) -> None:
+        self._wifi_busy = busy
+        if status is not None:
+            self._wifi_status = status
+            self.wifiStatusChanged.emit()
+        self.wifiBusyChanged.emit()
+
+    def _set_wifi_status(self, status: str, color: str) -> None:
+        self._wifi_status = status
+        self._wifi_status_color = color
+        self.wifiStatusChanged.emit()
+        self.wifiStatusColorChanged.emit()
+
+    @Slot()
+    def scanWifiNetworks(self) -> None:
+        if self._wifi_busy:
+            return
+        self._set_wifi_busy(True, "Status: Scanning...")
+        self._wifi_status_color = "#2563EB"
+        self.wifiStatusColorChanged.emit()
+
+        def _task() -> None:
+            try:
+                command = (
+                    ["netsh", "wlan", "show", "networks", "mode=bssid"]
+                    if os.name == "nt"
+                    else ["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list"]
+                )
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "Wi-Fi scan failed").strip()
+                    if os.name == "nt" and ("location permission" in detail.lower() or "requires elevation" in detail.lower()):
+                        detail = "Windows requires Location services for Wi-Fi scanning. Enable Location in Privacy & security, then scan again."
+                    raise RuntimeError(detail)
+                if os.name == "nt":
+                    networks = sorted({
+                        match.group(1).strip()
+                        for line in result.stdout.splitlines()
+                        if (match := re.match(r"^\s*SSID\s+\d+\s*:\s*(.+)$", line))
+                        and match.group(1).strip()
+                    })
+                else:
+                    networks = sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
+                self.wifiScanFinished.emit(networks, "")
+            except FileNotFoundError:
+                tool = "netsh" if os.name == "nt" else "nmcli"
+                self.wifiScanFinished.emit([], f"Wi-Fi utility '{tool}' is not installed.")
+            except subprocess.TimeoutExpired:
+                self.wifiScanFinished.emit([], "Wi-Fi scan timed out. Please try again.")
+            except Exception as exc:
+                self.wifiScanFinished.emit([], str(exc))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_wifi_scan(self, networks: list, error: str) -> None:
+        self._set_wifi_busy(False)
+        if error:
+            self._wifi_networks = []
+            self.wifiNetworksChanged.emit()
+            self._set_wifi_status(f"Status: Error - {error}", "#EF4444")
+            self.alertRequested.emit("Wi-Fi Scan Failed", error)
+            return
+        self._wifi_networks = list(networks)
+        self.wifiNetworksChanged.emit()
+        if networks:
+            self._set_wifi_status(f"Status: Scan Complete ({len(networks)} found)", "#10B981")
+        else:
+            self._set_wifi_status("Status: No networks found", "#F59E0B")
+
+    @Slot(str, str)
+    def connectWifiNetwork(self, ssid: str, password: str) -> None:
+        ssid = ssid.strip()
+        if not ssid:
+            self.alertRequested.emit("Wi-Fi", "Enter or select a Wi-Fi network first.")
+            return
+        if os.name == "nt":
+            message = "Wi-Fi connection is available on the Raspberry Pi. Windows mode supports network scanning and status checks for UI testing."
+            self._set_wifi_status("Status: Windows development mode", "#F59E0B")
+            self.alertRequested.emit("Raspberry Pi Wi-Fi", message)
+            return
+        if self._wifi_busy:
+            return
+        self._set_wifi_busy(True, f"Status: Connecting to {ssid}...")
+        self._wifi_status_color = "#2563EB"
+        self.wifiStatusColorChanged.emit()
+
+        def _task() -> None:
+            try:
+                cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                if password:
+                    cmd.extend(["password", password])
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=35, check=False)
+                detail = (result.stderr or result.stdout or "Connection failed. Check the password.").strip()
+                self.wifiConnectFinished.emit(result.returncode == 0, ssid, detail)
+            except FileNotFoundError:
+                self.wifiConnectFinished.emit(False, ssid, "NetworkManager utility 'nmcli' is not installed.")
+            except subprocess.TimeoutExpired:
+                self.wifiConnectFinished.emit(False, ssid, "Connection attempt timed out. Please try again.")
+            except Exception as exc:
+                self.wifiConnectFinished.emit(False, ssid, str(exc))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_wifi_connect(self, success: bool, ssid: str, detail: str) -> None:
+        if detail == "status-only":
+            self._set_wifi_status(f"Status: Connected to {ssid}", "#10B981")
+            return
+        self._set_wifi_busy(False)
+        if success:
+            self._set_wifi_status(f"Status: Connected to {ssid}", "#10B981")
+            self.alertRequested.emit("Wi-Fi Connected", f"Connected to {ssid} successfully.")
+        else:
+            self._set_wifi_status(f"Status: Error - {detail}", "#EF4444")
+            self.alertRequested.emit("Wi-Fi Connection Failed", detail)
+
+    @Slot()
+    def refreshWifiStatus(self) -> None:
+        if self._wifi_busy:
+            return
+
+        def _task() -> None:
+            try:
+                if os.name == "nt":
+                    result = subprocess.run(
+                        ["netsh", "wlan", "show", "interfaces"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout or "Unable to check Wi-Fi status").strip()
+                        if "requires elevation" in detail.lower() or "access WLAN information" in detail:
+                            self.wifiStatusResult.emit("Status: Raspberry Pi Wi-Fi (Windows preview)", "#F59E0B")
+                            return
+                        raise RuntimeError(detail)
+                    connected = re.search(r"^\s*State\s*:\s*connected\s*$", result.stdout, re.MULTILINE | re.IGNORECASE)
+                    ssid_match = re.search(r"^\s*SSID\s*:\s*(.+)$", result.stdout, re.MULTILINE | re.IGNORECASE)
+                    if connected and ssid_match:
+                        self.wifiStatusResult.emit(f"Status: Connected to {ssid_match.group(1).strip()}", "#10B981")
+                    elif "There is no wireless interface" in result.stdout:
+                        self.wifiStatusResult.emit("Status: No Wi-Fi adapter detected", "#F59E0B")
+                    else:
+                        self.wifiStatusResult.emit("Status: Disconnected", "#526176")
+                    return
+                result = subprocess.run(
+                    ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev", "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout or "Unable to check Wi-Fi status").strip())
+                wifi_found = False
+                for line in result.stdout.splitlines():
+                    parts = line.split(":", 3)
+                    if len(parts) < 4 or parts[1].strip() != "wifi":
+                        continue
+                    wifi_found = True
+                    if parts[2].strip() == "connected":
+                        self.wifiConnectFinished.emit(True, parts[3].strip(), "status-only")
+                        return
+                status = "Status: Disconnected" if wifi_found else "Status: Error - No Wi-Fi adapter detected"
+                color = "#526176" if wifi_found else "#F59E0B"
+                self.wifiStatusResult.emit(status, color)
+            except FileNotFoundError:
+                tool = "netsh" if os.name == "nt" else "nmcli"
+                self.wifiStatusResult.emit(f"Status: Wi-Fi utility '{tool}' is not installed", "#F59E0B")
+            except subprocess.TimeoutExpired:
+                self.wifiStatusResult.emit("Status: Wi-Fi status check timed out", "#F59E0B")
+            except Exception as exc:
+                self.wifiStatusResult.emit(f"Status: Error - {exc}", "#EF4444")
+
+        threading.Thread(target=_task, daemon=True).start()
 
     # Actions / slots
     @Slot()
@@ -510,7 +898,7 @@ class AppBridge(QObject):
             self._consumption = "-"
         else:
             self._consumer = consumer
-            self._account_no = str(consumer["id"])
+            self._account_no = str(consumer.get("acct_no") or consumer["id"])
             self._consumer_name = consumer["name"]
             self._previous_reading = str(consumer["previous_reading"])
             self._present_reading = ""
@@ -542,13 +930,16 @@ class AppBridge(QObject):
 
     @Slot(int)
     def reprintZoneConsumer(self, consumer_id: int) -> None:
-        self._set_operation_busy(True, "Printing...")
-
-        def finish_reprint() -> None:
-            print(f"Reprint requested for consumer {consumer_id}")
-            self._set_operation_busy(False, "")
-
-        QTimer.singleShot(600, finish_reprint)
+        rows = get_zone_consumers_with_status(self._selected_zone)
+        row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
+        if not row or not row.get("is_read"):
+            self.alertRequested.emit("No Receipt", "No saved reading is available for this consumer.")
+            return
+        present = int(row.get("reading_value") or 0)
+        consumption = int(row.get("consumption") or 0)
+        previous = present - consumption
+        receipt = self._build_receipt_text(row, previous, present, row.get("exception") or "None")
+        self.receiptPreviewRequested.emit("Receipt Preview", receipt)
 
     @Slot()
     def logout(self) -> None:
@@ -597,12 +988,17 @@ class AppBridge(QObject):
     @Slot()
     def printReceipt(self) -> None:
         if not self._consumer or not self._present_reading:
+            self.alertRequested.emit("Missing Details", "Select a consumer and enter a present reading.")
             return
 
         try:
             present = int(self._present_reading)
             previous = int(self._consumer["previous_reading"])
             if present < previous:
+                self.alertRequested.emit("Invalid Reading", "Present reading cannot be lower than the previous reading.")
+                return
+            if self._paper_status.lower() in {"out", "jam"}:
+                self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
                 return
 
             self._set_operation_busy(True, "Printing...")
@@ -610,7 +1006,13 @@ class AppBridge(QObject):
             def finish_print() -> None:
                 try:
                     consumption = present - previous
-                    save_reading(self._consumer["id"], present, consumption)
+                    exception = self._selected_exception
+                    flagged = consumption > 500 or exception != "None"
+                    save_reading(self._consumer["id"], present, consumption, exception, flagged)
+                    self._save_to_sync_layer(self._consumer["id"], present, consumption, exception, flagged)
+                    receipt = self._build_receipt_text(self._consumer, previous, present, exception)
+                    self._last_receipt = receipt
+                    self.canReprintChanged.emit()
 
                     self._consumer["previous_reading"] = present
                     self._previous_reading = str(present)
@@ -628,14 +1030,15 @@ class AppBridge(QObject):
                     self.update_stats()
                     if self._progress_details_visible:
                         self._refresh_zone_consumers()
+                    self.receiptPreviewRequested.emit("Receipt Preview", receipt)
                 except Exception as e:
-                    print(f"Error saving: {e}")
+                    self.alertRequested.emit("Save Failed", str(e))
                 finally:
                     self._set_operation_busy(False, "")
 
             QTimer.singleShot(600, finish_print)
         except Exception as e:
-            print(f"Error saving: {e}")
+            self.alertRequested.emit("Save Failed", str(e))
             self._set_operation_busy(False, "")
 
     @Slot(int)
@@ -651,20 +1054,67 @@ class AppBridge(QObject):
 
     @Slot()
     def reprintLastReceipt(self) -> None:
-        pass
+        if not self._last_receipt:
+            self.alertRequested.emit("No Receipt", "No saved receipt is available for reprint.")
+            return
+        if self._paper_status.lower() in {"out", "jam"}:
+            self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
+            return
+        self.receiptPreviewRequested.emit("Receipt Preview", self._last_receipt)
 
     @Slot()
     def syncNow(self) -> None:
+        if not self._sync_dal:
+            self.alertRequested.emit("Sync Unavailable", self._sync_logs)
+            return
         self._set_operation_busy(True, "Syncing...")
 
-        def finish_sync() -> None:
-            self._sync_status = "Online"
-            self._sync_status_color = "#10B981"
-            self.syncStatusChanged.emit()
-            self.syncStatusColorChanged.emit()
-            self._set_operation_busy(False, "")
+        def _task() -> None:
+            try:
+                result = self._sync_dal.syncPendingReadings()
+                consumers = self._sync_dal.loadAssignedConsumers(None)
+                mirrored = replace_consumers_from_sync(consumers)
+                self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": mirrored})
+            except Exception as exc:
+                self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
 
-        QTimer.singleShot(900, finish_sync)
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _build_receipt_text(self, consumer: dict, previous: int, present: int, exception: str) -> str:
+        consumption = present - previous
+        current_bill = max(50.0, round(max(consumption, 0) * 7.50, 2))
+        penalty = round(current_bill * 0.10, 2)
+        total = round(current_bill + penalty, 2)
+        due_date = (datetime.now() + timedelta(days=11)).strftime("%Y-%m-%d")
+        lines = [
+            "================================",
+            " SAN LORENZO RUIZ WATERWORKS",
+            "     Water Billing System",
+            "================================",
+            f" Account No : {consumer.get('acct_no', 'N/A')}",
+            f" Name       : {consumer.get('name', 'N/A')}",
+            f" Zone       : {consumer.get('zone_name', self._selected_zone)}",
+            "--------------------------------",
+            f" Meter No   : {consumer.get('meter_no', 'N/A')}",
+            f" Prev Read  : {previous}",
+            f" Curr Read  : {present}",
+            f" Consumption: {consumption} m3",
+        ]
+        if exception and exception != "None":
+            lines.append(f" Exception  : {exception}")
+        lines += [
+            "--------------------------------",
+            f" Current Bill: PHP {current_bill:>8.2f}",
+            f" Penalty     : PHP {penalty:>8.2f}",
+            "================================",
+            f" TOTAL AMOUNT: PHP {total:>8.2f}",
+            f" Due Date    : {due_date}",
+            "--------------------------------",
+            f" Reader: {self._reader_name}",
+            "         Thank you!",
+            "================================",
+        ]
+        return "\n".join(lines)
 
     @Slot()
     def update_stats(self) -> None:

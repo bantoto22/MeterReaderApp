@@ -833,8 +833,10 @@ class HandheldSyncDataAccess:
             queue_id = row["id"]
             payload = row["payload"]
             try:
-                # Validate payload early so permanently invalid rows don't keep retrying.
-                self.remote._build_remote_payload(payload)
+                # Validate early when the remote implementation exposes a preflight hook.
+                preflight = getattr(self.remote, "_build_remote_payload", None)
+                if callable(preflight):
+                    preflight(payload)
                 existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
                 if existing and existing.get("updated_at") and payload.get("updated_at"):
                     if str(existing["updated_at"]) > str(payload["updated_at"]):

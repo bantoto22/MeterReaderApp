@@ -7,15 +7,11 @@ Rectangle {
     width: parent ? parent.width : 480
     height: parent ? parent.height : 750
 
-    // Premium Linear Gradient Background
-    gradient: Gradient {
-        GradientStop { position: 0.0; color: "#E8F0F8" }
-        GradientStop { position: 1.0; color: "#F4F8FC" }
-    }
+    color: "#F4F7FB"
 
     ColumnLayout {
         anchors.centerIn: parent
-        width: Math.min(parent.width - 40, 380)
+        width: Math.min(parent.width - 40, 420)
         spacing: 20
 
         // Logo Image with Entry Animation
@@ -23,8 +19,8 @@ Rectangle {
             id: logoImg
             Layout.alignment: Qt.AlignHCenter
             source: "../images/SLR logo 1.png"
-            Layout.preferredWidth: 90
-            Layout.preferredHeight: 90
+            Layout.preferredWidth: 80
+            Layout.preferredHeight: 80
             fillMode: Image.PreserveAspectFit
 
             // Soft entry scale and opacity animation
@@ -84,7 +80,7 @@ Rectangle {
         Rectangle {
             Layout.fillWidth: true
             implicitHeight: 300
-            radius: 20
+            radius: 8
             color: "#FFFFFF"
             border.color: "#E2E8F0"
             border.width: 1
@@ -100,7 +96,7 @@ Rectangle {
                     spacing: 6
 
                     Text {
-                        text: "👤 Username"
+                        text: "Username"
                         font.pixelSize: 11
                         font.family: "Montserrat"
                         font.bold: true
@@ -116,7 +112,7 @@ Rectangle {
                         color: "#0f172a"
                         padding: 12
                         background: Rectangle {
-                            radius: 10
+                            radius: 8
                             border.color: txtUsername.activeFocus ? "#3B82F6" : "#E2E8F0"
                             border.width: txtUsername.activeFocus ? 2 : 1
                             color: txtUsername.activeFocus ? "#FFFFFF" : "#F8FAFC"
@@ -133,7 +129,7 @@ Rectangle {
                     spacing: 6
 
                     Text {
-                        text: "🔒 Password"
+                        text: "Password"
                         font.pixelSize: 11
                         font.family: "Montserrat"
                         font.bold: true
@@ -150,7 +146,7 @@ Rectangle {
                         color: "#0f172a"
                         padding: 12
                         background: Rectangle {
-                            radius: 10
+                            radius: 8
                             border.color: txtPassword.activeFocus ? "#3B82F6" : "#E2E8F0"
                             border.width: txtPassword.activeFocus ? 2 : 1
                             color: txtPassword.activeFocus ? "#FFFFFF" : "#F8FAFC"
@@ -194,13 +190,7 @@ Rectangle {
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                     }
-                    background: Rectangle {
-                        radius: 10
-                        gradient: Gradient {
-                            GradientStop { position: 0.0; color: loginButton.pressed ? "#1E40AF" : (loginButton.hovered ? "#2563EB" : "#1D4ED8") }
-                            GradientStop { position: 1.0; color: loginButton.pressed ? "#1E3A8A" : (loginButton.hovered ? "#1D4ED8" : "#1E40AF") }
-                        }
-                    }
+                    background: Rectangle { radius: 8; color: loginButton.pressed ? "#1E40AF" : (loginButton.hovered ? "#1D4ED8" : "#2563EB") }
                     onClicked: {
                         if (typeof loginBridge !== "undefined" && loginBridge) {
                             loginBridge.attemptLogin(txtUsername.text, txtPassword.text)
@@ -213,7 +203,7 @@ Rectangle {
         // Footer Copyright
         Text {
             Layout.alignment: Qt.AlignHCenter
-            text: "© 2026 Municipality of San Lorenzo Ruiz"
+            text: "Copyright 2026 Municipality of San Lorenzo Ruiz"
             font.pixelSize: 10
             font.family: "Montserrat"
             color: "#64748b"

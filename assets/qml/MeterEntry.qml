@@ -37,11 +37,48 @@ Rectangle {
             showPrintAlert("Invalid Consumption", "Present reading cannot be lower than the previous reading.")
             return
         }
+        var paper = bridgeObj.paperStatus.toLowerCase()
+        if (paper === "out" || paper === "jam") {
+            showPrintAlert("Paper Error", "Cannot print while paper status is " + bridgeObj.paperStatus + ".")
+            return
+        }
+        if (paper === "low") {
+            paperLowDialog.open()
+            return
+        }
+        continuePrintValidation()
+    }
+
+    function continuePrintValidation() {
         if (currentConsumption > 500) {
-            showPrintAlert("Unusual Consumption", "Consumption is unusually high. Please verify the reading before printing.")
+            highConsumptionDialog.open()
             return
         }
         bridgeObj.printReceipt()
+    }
+
+    Dialog {
+        id: paperLowDialog
+        title: "Paper Low"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 48, 340)
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: continuePrintValidation()
+        contentItem: Text { text: "Paper is running low. Continue printing?"; wrapMode: Text.WordWrap; color: "#111827"; font.family: "Montserrat" }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+    }
+
+    Dialog {
+        id: highConsumptionDialog
+        title: "High Consumption Warning"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 48, 360)
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: bridgeObj.printReceipt()
+        contentItem: Text { text: "Consumption is unusually high. Continue printing?"; wrapMode: Text.WordWrap; color: "#111827"; font.family: "Montserrat" }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
 
     Dialog {
@@ -62,7 +99,7 @@ Rectangle {
 
         background: Rectangle {
             color: "white"
-            radius: 14
+            radius: 8
             border.color: "#CBD5E1"
             border.width: 1
         }
@@ -73,7 +110,7 @@ Rectangle {
         contentWidth: parent.width
 
         ColumnLayout {
-            width: parent.width - 32
+            width: Math.min(parent.width - 40, 1120)
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
             anchors.topMargin: 16
@@ -83,12 +120,25 @@ Rectangle {
                 Layout.fillWidth: true
                 spacing: 8
 
-                Text {
-                    text: "Search by Meter No."
-                    font.pixelSize: 12
-                    font.family: "Montserrat"
-                    font.bold: true
-                    color: "#334155"
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "Search by Meter No."
+                        font.pixelSize: 13
+                        font.family: "Montserrat"
+                        font.bold: true
+                        color: "#111827"
+                    }
+                    Item { Layout.fillWidth: true }
+                    ComboBox {
+                        id: cmbEntryZone
+                        Layout.preferredWidth: Math.min(190, meterEntryRoot.width * 0.36)
+                        model: bridgeObj ? bridgeObj.zones : []
+                        currentIndex: bridgeObj ? Math.max(0, bridgeObj.zones.indexOf(bridgeObj.selectedZone)) : 0
+                        background: Rectangle { implicitHeight: 38; radius: 7; color: "#2563EB" }
+                        contentItem: Text { text: cmbEntryZone.currentText; color: "white"; font.family: "Montserrat"; font.pixelSize: 11; font.bold: true; verticalAlignment: Text.AlignVCenter; leftPadding: 12 }
+                        onActivated: { if (bridgeObj && currentText) bridgeObj.selectedZone = currentText }
+                    }
                 }
 
                 RowLayout {
@@ -102,7 +152,7 @@ Rectangle {
                         TextField {
                             id: txtSearch
                             Layout.fillWidth: true
-                            placeholderText: "🔍 Type meter no. or name..."
+                            placeholderText: "Type 001, 002..."
                             text: bridgeObj ? bridgeObj.searchQuery : ""
                             font.pixelSize: 13
                             font.family: "Montserrat"
@@ -110,7 +160,7 @@ Rectangle {
                             placeholderTextColor: "#94A3B8"
                             padding: 12
                             background: Rectangle {
-                                radius: 10
+                                radius: 8
                                 border.color: txtSearch.activeFocus ? "#3B82F6" : "#E2E8F0"
                                 border.width: txtSearch.activeFocus ? 2 : 1
                                 color: "#FFFFFF"
@@ -130,7 +180,7 @@ Rectangle {
                             focus: false
 
                             background: Rectangle {
-                                radius: 10
+                                radius: 8
                                 color: "white"
                                 border.color: "#E2E8F0"
                                 border.width: 1
@@ -172,26 +222,81 @@ Rectangle {
                         Behavior on scale { NumberAnimation { duration: 80 } }
 
                         contentItem: Text {
-                            text: "🔍"
-                            font.pixelSize: 16
+                            text: "Go"
+                            font.pixelSize: 11
+                            font.family: "Montserrat"
+                            font.bold: true
                             color: "white"
                             horizontalAlignment: Text.AlignHCenter
                             verticalAlignment: Text.AlignVCenter
                         }
                         background: Rectangle {
-                            radius: 10
+                            radius: 8
                             color: btnSearch.pressed ? "#1E40AF" : (btnSearch.hovered ? "#2563EB" : "#1D4ED8")
                             Behavior on color { ColorAnimation { duration: 150 } }
                         }
                         onClicked: { if (bridgeObj) bridgeObj.searchConsumer() }
                     }
                 }
+
+                CheckBox {
+                    id: chkUnreadOnly
+                    text: "Unread only"
+                    checked: bridgeObj ? bridgeObj.searchUnreadOnly : true
+                    font.family: "Montserrat"
+                    font.pixelSize: 11
+                    font.bold: checked
+                    spacing: 8
+                    leftPadding: 8
+                    rightPadding: 12
+                    implicitHeight: 34
+
+                    indicator: Rectangle {
+                        x: chkUnreadOnly.leftPadding
+                        y: (chkUnreadOnly.height - height) / 2
+                        implicitWidth: 20
+                        implicitHeight: 20
+                        radius: 5
+                        color: chkUnreadOnly.checked ? "#2563EB" : "#FFFFFF"
+                        border.width: 1
+                        border.color: chkUnreadOnly.checked ? "#2563EB" : "#94A3B8"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "\u2713"
+                            visible: chkUnreadOnly.checked
+                            color: "white"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+                    }
+
+                    contentItem: Text {
+                        leftPadding: chkUnreadOnly.indicator.width + chkUnreadOnly.spacing
+                        text: chkUnreadOnly.text
+                        color: chkUnreadOnly.checked ? "#1D4ED8" : "#475569"
+                        font: chkUnreadOnly.font
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    background: Rectangle {
+                        radius: 17
+                        color: chkUnreadOnly.checked
+                               ? (chkUnreadOnly.hovered ? "#DBEAFE" : "#EFF6FF")
+                               : (chkUnreadOnly.hovered ? "#F1F5F9" : "transparent")
+                        border.width: chkUnreadOnly.checked ? 1 : 0
+                        border.color: "#BFDBFE"
+                        Behavior on color { ColorAnimation { duration: 120 } }
+                    }
+
+                    onToggled: { if (bridgeObj) bridgeObj.searchUnreadOnly = checked }
+                }
             }
 
             Rectangle {
                 Layout.fillWidth: true
                 implicitHeight: 410
-                radius: 16
+                radius: 8
                 color: "#FFFFFF"
                 border.color: "#E2E8F0"
                 border.width: 1
@@ -257,7 +362,7 @@ Rectangle {
                         padding: 12
                         validator: IntValidator { bottom: 0 }
                         background: Rectangle {
-                            radius: 10
+                            radius: 8
                             border.color: txtPresent.activeFocus ? "#3B82F6" : "#E2E8F0"
                             border.width: txtPresent.activeFocus ? 2 : 1
                             color: txtPresent.activeFocus ? "#FFFFFF" : "#F8FAFC"
@@ -404,8 +509,8 @@ Rectangle {
                         anchors.centerIn: parent
                         spacing: 8
                         Text {
-                            text: "🖨️"
-                            font.pixelSize: 16
+                            text: ""
+                            font.pixelSize: 1
                             color: "white"
                             verticalAlignment: Text.AlignVCenter
                         }
@@ -421,11 +526,53 @@ Rectangle {
                     }
                 }
                 background: Rectangle {
-                    radius: 10
+                    radius: 8
                     color: btnPrint.pressed ? "#0B0F19" : (btnPrint.hovered ? "#334155" : "#1E293B")
                     Behavior on color { ColorAnimation { duration: 150 } }
                 }
                 onClicked: requestPrint()
+            }
+
+            Button {
+                id: btnReprint
+                Layout.fillWidth: true
+                implicitHeight: 48
+                enabled: bridgeObj ? bridgeObj.canReprint : false
+                contentItem: Text {
+                    text: "Reprint Last Receipt"
+                    color: btnReprint.enabled ? "#2563EB" : "#94A3B8"
+                    font.family: "Montserrat"
+                    font.pixelSize: 12
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle { radius: 8; color: btnReprint.hovered ? "#DBEAFE" : "#EFF6FF"; border.color: "#BFDBFE" }
+                onClicked: { if (bridgeObj) bridgeObj.reprintLastReceipt() }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Text { text: "Paper Status (Test):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10 }
+                Item { Layout.fillWidth: true }
+                Repeater {
+                    model: ["OK", "Low", "Out", "Jam"]
+                    Button {
+                        implicitWidth: 54
+                        implicitHeight: 34
+                        contentItem: Text {
+                            text: modelData
+                            font.family: "Montserrat"
+                            font.pixelSize: 10
+                            font.bold: true
+                            color: modelData === "OK" ? "#10B981" : (modelData === "Low" ? "#F59E0B" : "#EF4444")
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle { radius: 6; color: parent.hovered ? "#E2E8F0" : "transparent" }
+                        onClicked: { if (bridgeObj) bridgeObj.setPaperStatus(modelData) }
+                    }
+                }
             }
         }
     }

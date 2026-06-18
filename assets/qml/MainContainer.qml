@@ -6,7 +6,7 @@ Rectangle {
     id: mainContainerRoot
     width: parent ? parent.width : 480
     height: parent ? parent.height : 750
-    color: "#F8FAFC"
+    color: "#F4F7FB"
 
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property int currentActiveTab: bridgeObj ? bridgeObj.currentTab : 0
@@ -15,6 +15,18 @@ Rectangle {
         toastText.text = message
         toastPopup.open()
         toastHideTimer.restart()
+    }
+
+    function showAlert(title, message) {
+        alertDialog.title = title
+        alertText.text = message
+        alertDialog.open()
+    }
+
+    function showReceipt(title, receipt) {
+        receiptDialog.title = title
+        receiptText.text = receipt
+        receiptDialog.open()
     }
 
     Rectangle {
@@ -27,9 +39,7 @@ Rectangle {
         z: 30
 
         Text {
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.left: parent.left
-            anchors.leftMargin: 12
+            anchors.centerIn: parent
             text: bridgeObj ? bridgeObj.statusTime : "--:--"
             color: "white"
             font.pixelSize: 11
@@ -38,9 +48,11 @@ Rectangle {
         }
 
         Text {
-            anchors.centerIn: parent
-            text: bridgeObj ? ("Paper: " + bridgeObj.paperStatus) : "Paper: --"
-            color: "#CBD5E1"
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.right: parent.right
+            anchors.rightMargin: 64
+            text: bridgeObj ? ("PAPER " + bridgeObj.paperStatus.toUpperCase()) : "PAPER --"
+            color: bridgeObj && bridgeObj.paperStatus.toLowerCase() === "ok" ? "#43A047" : "#F59E0B"
             font.pixelSize: 10
             font.family: "Montserrat"
         }
@@ -54,6 +66,17 @@ Rectangle {
             font.pixelSize: 10
             font.family: "Montserrat"
             font.bold: true
+        }
+
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: 14
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 3
+            Repeater {
+                model: 4
+                Rectangle { width: 4; height: 6 + index * 3; color: "#43A047" }
+            }
         }
     }
 
@@ -174,6 +197,51 @@ Rectangle {
         function onWelcomeToastRequested(message) {
             showToast(message)
         }
+        function onAlertRequested(title, message) {
+            showAlert(title, message)
+        }
+        function onReceiptPreviewRequested(title, receipt) {
+            showReceipt(title, receipt)
+        }
+    }
+
+    Dialog {
+        id: alertDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 40, 420)
+        modal: true
+        standardButtons: Dialog.Ok
+        contentItem: Text {
+            id: alertText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: "#111827"
+            font.family: "Montserrat"
+            font.pixelSize: 12
+        }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+    }
+
+    Dialog {
+        id: receiptDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        height: Math.min(parent.height - 64, 620)
+        modal: true
+        standardButtons: Dialog.Close
+        contentItem: ScrollView {
+            clip: true
+            TextArea {
+                id: receiptText
+                readOnly: true
+                wrapMode: TextEdit.NoWrap
+                color: "#111827"
+                font.family: "Courier New"
+                font.pixelSize: 12
+                background: Rectangle { color: "#F8FAFD"; radius: 6 }
+            }
+        }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
 
     Rectangle {
@@ -224,8 +292,8 @@ Rectangle {
         Rectangle {
             id: navBar
             Layout.fillWidth: true
-            height: 52
-            color: "#0f172a"
+            height: 64
+            color: "#111827"
 
             RowLayout {
                 anchors.fill: parent
@@ -237,8 +305,8 @@ Rectangle {
                     Layout.fillHeight: true
                     contentItem: Text {
                         text: "Meter Entry"
-                        color: currentActiveTab === 0 ? "#3B82F6" : "#94A3B8"
-                        font.pixelSize: 12
+                        color: currentActiveTab === 0 ? "#FFFFFF" : "#A8B4C5"
+                        font.pixelSize: 13
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -254,8 +322,8 @@ Rectangle {
                     Layout.fillHeight: true
                     contentItem: Text {
                         text: "Progress"
-                        color: currentActiveTab === 1 ? "#3B82F6" : "#94A3B8"
-                        font.pixelSize: 12
+                        color: currentActiveTab === 1 ? "#FFFFFF" : "#A8B4C5"
+                        font.pixelSize: 13
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -271,8 +339,8 @@ Rectangle {
                     Layout.fillHeight: true
                     contentItem: Text {
                         text: "Settings"
-                        color: currentActiveTab === 2 ? "#3B82F6" : "#94A3B8"
-                        font.pixelSize: 12
+                        color: currentActiveTab === 2 ? "#FFFFFF" : "#A8B4C5"
+                        font.pixelSize: 13
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -287,7 +355,7 @@ Rectangle {
                 id: tabIndicator
                 y: parent.height - 3
                 height: 3
-                color: "#3B82F6"
+                color: "#60A5FA"
                 z: 10
 
                 property var activeBtn: {
@@ -307,7 +375,7 @@ Rectangle {
 
         Rectangle {
             Layout.fillWidth: true
-            height: 48
+            height: 56
             gradient: Gradient {
                 GradientStop { position: 0.0; color: "#2563EB" }
                 GradientStop { position: 1.0; color: "#1D4ED8" }
@@ -329,12 +397,20 @@ Rectangle {
                 Text {
                     text: "Water Meter Reading System"
                     color: "white"
-                    font.pixelSize: 12
+                    font.pixelSize: 14
                     font.family: "Montserrat"
                     font.bold: true
                 }
 
                 Item { Layout.fillWidth: true }
+
+                Text {
+                    text: bridgeObj ? bridgeObj.readerName : "User"
+                    color: "white"
+                    font.family: "Montserrat"
+                    font.pixelSize: 11
+                    font.bold: true
+                }
 
                 Rectangle {
                     width: 32
@@ -349,8 +425,11 @@ Rectangle {
 
                     Text {
                         anchors.centerIn: parent
-                        text: "👤"
-                        font.pixelSize: 16
+                        text: "U"
+                        color: "#1E40AF"
+                        font.pixelSize: 12
+                        font.family: "Montserrat"
+                        font.bold: true
                     }
 
                     MouseArea {

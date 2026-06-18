@@ -52,7 +52,7 @@ Rectangle {
                 contentWidth: parent.width
 
                 ColumnLayout {
-                    width: parent.width - 32
+                    width: Math.min(parent.width - 40, 1240)
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.top: parent.top
                     anchors.topMargin: 16
@@ -64,7 +64,7 @@ Rectangle {
 
                         Text {
                             text: "Assigned Zone"
-                            font.pixelSize: 12
+                            font.pixelSize: 13
                             font.family: "Montserrat"
                             font.bold: true
                             color: "#334155"
@@ -77,7 +77,7 @@ Rectangle {
                             currentIndex: bridgeObj ? Math.max(0, bridgeObj.zones.indexOf(bridgeObj.selectedZone)) : 0
 
                             background: Rectangle {
-                                implicitHeight: 40
+                                implicitHeight: 54
                                 radius: 8
                                 border.color: cmbProgressZone.focus ? "#3B82F6" : "#E2E8F0"
                                 border.width: 1
@@ -110,10 +110,10 @@ Rectangle {
                     Rectangle {
                         id: zoneProgressCard
                         Layout.fillWidth: true
-                        implicitHeight: 520
-                        radius: 20
-                        color: "#FFFFFF"
-                        border.color: "#E2E8F0"
+                        implicitHeight: 340
+                        radius: 8
+                        color: "#1F4FC4"
+                        border.color: "#1F4FC4"
                         border.width: 1
                         clip: true
                         scale: progressCardMouse.pressed ? 0.985 : 1.0
@@ -133,8 +133,9 @@ Rectangle {
                             spacing: 0
 
                             Item {
+                                visible: false
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 220
+                                Layout.preferredHeight: 0
 
                                 ColumnLayout {
                                     anchors.fill: parent
@@ -212,8 +213,8 @@ Rectangle {
                             Rectangle {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                Layout.margins: 12
-                                radius: 18
+                                Layout.margins: 0
+                                radius: 8
                                 clip: true
                                 gradient: Gradient {
                                     GradientStop { position: 0.0; color: "#2563EB" }
@@ -279,10 +280,9 @@ Rectangle {
                                         Rectangle {
                                             Layout.fillWidth: true
                                             Layout.preferredHeight: 74
-                                            radius: 12
-                                            color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
-                                            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.15)
-                                            border.width: 1
+                                            radius: 0
+                                            color: "transparent"
+                                            border.width: 0
 
                                             ColumnLayout {
                                                 anchors.centerIn: parent
@@ -308,10 +308,9 @@ Rectangle {
                                         Rectangle {
                                             Layout.fillWidth: true
                                             Layout.preferredHeight: 74
-                                            radius: 12
-                                            color: Qt.rgba(1.0, 1.0, 1.0, 0.08)
-                                            border.color: Qt.rgba(1.0, 1.0, 1.0, 0.15)
-                                            border.width: 1
+                                            radius: 0
+                                            color: "transparent"
+                                            border.width: 0
 
                                             ColumnLayout {
                                                 anchors.centerIn: parent
@@ -334,7 +333,46 @@ Rectangle {
                                             }
                                         }
                                     }
+
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: "Tap for details"
+                                        color: "#93C5FD"
+                                        font.pixelSize: 9
+                                        font.family: "Montserrat"
+                                    }
                                 }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 150
+                        radius: 8
+                        color: "white"
+                        border.color: "#D8E1EC"
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: 26
+                            ColumnLayout {
+                                spacing: 5
+                                Text { text: bridgeObj ? bridgeObj.selectedZone : "-"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: 22; font.bold: true }
+                                Text { text: (bridgeObj ? bridgeObj.zoneReadFraction.split("/")[1] : "0") + " households assigned"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10 }
+                                RowLayout {
+                                    spacing: 10
+                                    Text { text: (bridgeObj ? bridgeObj.zoneCompletionPercentage : 0) + "%"; color: "#10B981"; font.family: "Montserrat"; font.pixelSize: 31; font.bold: true }
+                                    Text { text: "Complete"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10; font.bold: true; Layout.alignment: Qt.AlignBottom }
+                                }
+                            }
+                            Item { Layout.fillWidth: true }
+                            Button {
+                                implicitWidth: 116
+                                implicitHeight: 44
+                                contentItem: Text { text: "Sync Now"; color: "#2563EB"; font.family: "Montserrat"; font.pixelSize: 10; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { radius: 7; color: parent.hovered ? "#DBEAFE" : "white"; border.color: "#BFDBFE" }
+                                onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                             }
                         }
                     }
@@ -394,6 +432,8 @@ Rectangle {
                                 font.bold: true
                                 horizontalAlignment: Text.AlignHCenter
                             }
+
+                            Item { Layout.preferredWidth: 42 }
                         }
                     }
 
@@ -422,29 +462,35 @@ Rectangle {
                     }
 
                     Rectangle {
+                        id: detailsTable
                         Layout.fillWidth: true
                         radius: 14
                         color: "white"
                         border.color: "#CBD5E1"
                         border.width: 1
-                        implicitHeight: 480
+                        readonly property int rowCount: bridgeObj ? bridgeObj.zoneConsumers.length : 0
+                        readonly property real columnsWidth: Math.max(0, width - 16 - 32)
+                        readonly property real meterColumnWidth: columnsWidth * 0.18
+                        readonly property real nameColumnWidth: columnsWidth * 0.34
+                        readonly property real statusColumnWidth: columnsWidth * 0.16
+                        readonly property real readingColumnWidth: columnsWidth * 0.16
+                        readonly property real actionColumnWidth: columnsWidth * 0.16
+                        implicitHeight: Math.min(520, Math.max(142, 52 + rowCount * 44))
 
                         ColumnLayout {
                             anchors.fill: parent
                             anchors.margins: 8
                             spacing: 6
 
-                            GridLayout {
+                            RowLayout {
                                 Layout.fillWidth: true
-                                columns: 5
-                                columnSpacing: 8
-                                rowSpacing: 0
+                                spacing: 8
 
-                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 34; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Meter"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 34; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Name"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 34; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Status"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 34; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Reading"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 34; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Action"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.meterColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Meter"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.nameColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Name"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.statusColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Status"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.readingColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Reading"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.actionColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Action"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
                             }
 
                             ListView {
@@ -456,23 +502,21 @@ Rectangle {
 
                                 delegate: Rectangle {
                                     width: ListView.view.width
-                                    height: 40
+                                    height: 43
                                     color: modelData.is_read ? "#E8F5E9" : "white"
 
-                                    GridLayout {
+                                    RowLayout {
                                         anchors.fill: parent
-                                        anchors.leftMargin: 6
-                                        anchors.rightMargin: 6
-                                        columns: 5
-                                        columnSpacing: 8
+                                        spacing: 8
 
-                                        Text { Layout.fillWidth: true; text: modelData.meter_no; font.pixelSize: 10; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
-                                        Text { Layout.fillWidth: true; text: modelData.name; font.pixelSize: 10; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
-                                        Text { Layout.fillWidth: true; text: modelData.is_read ? "Read" : "Pending"; font.pixelSize: 10; font.bold: true; color: modelData.is_read ? "#10B981" : "#64748B"; verticalAlignment: Text.AlignVCenter }
-                                        Text { Layout.fillWidth: true; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.pixelSize: 10; color: "#0F172A"; verticalAlignment: Text.AlignVCenter }
+                                        Text { Layout.preferredWidth: detailsTable.meterColumnWidth; text: modelData.meter_no; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; leftPadding: 8 }
+                                        Text { Layout.preferredWidth: detailsTable.nameColumnWidth; text: modelData.name; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignLeft; leftPadding: 8 }
+                                        Text { Layout.preferredWidth: detailsTable.statusColumnWidth; text: modelData.is_read ? "Read" : "Pending"; font.family: "Montserrat"; font.pixelSize: 9; font.bold: true; color: modelData.is_read ? "#10B981" : "#64748B"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                        Text { Layout.preferredWidth: detailsTable.readingColumnWidth; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
                                         Button {
                                             id: btnRowPrint
-                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: detailsTable.actionColumnWidth
+                                            Layout.fillHeight: true
                                             visible: modelData.is_read
                                             text: "Print"
                                             scale: pressed ? 0.92 : 1.0
@@ -488,7 +532,16 @@ Rectangle {
                                                 reprintConfirmDialog.open()
                                             }
                                         }
-                                        Item { Layout.fillWidth: true; visible: !modelData.is_read }
+                                        Text {
+                                            Layout.preferredWidth: detailsTable.actionColumnWidth
+                                            visible: !modelData.is_read
+                                            text: "-"
+                                            color: "#64748B"
+                                            font.family: "Montserrat"
+                                            font.pixelSize: 9
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
                                     }
                                 }
                             }

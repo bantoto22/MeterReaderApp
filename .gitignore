@@ -1,0 +1,20 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local runtime database and generated data
+data/*.db
+data/*.db-*
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
