@@ -1202,7 +1202,7 @@ class HybridMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Water Meter Reader - Qt Hybrid")
-        self.resize(480, 750)  # Perfectly aligned with mobile handheld layout dimensions
+        self.resize(480, 800)  # Match the portrait touchscreen viewport more closely.
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
