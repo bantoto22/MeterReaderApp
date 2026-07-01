@@ -238,59 +238,6 @@ Rectangle {
                         onClicked: { if (bridgeObj) bridgeObj.searchConsumer() }
                     }
                 }
-
-                CheckBox {
-                    id: chkUnreadOnly
-                    text: "Unread only"
-                    checked: bridgeObj ? bridgeObj.searchUnreadOnly : true
-                    font.family: "Montserrat"
-                    font.pixelSize: 11
-                    font.bold: checked
-                    spacing: 8
-                    leftPadding: 8
-                    rightPadding: 12
-                    implicitHeight: 34
-
-                    indicator: Rectangle {
-                        x: chkUnreadOnly.leftPadding
-                        y: (chkUnreadOnly.height - height) / 2
-                        implicitWidth: 20
-                        implicitHeight: 20
-                        radius: 5
-                        color: chkUnreadOnly.checked ? "#2563EB" : "#FFFFFF"
-                        border.width: 1
-                        border.color: chkUnreadOnly.checked ? "#2563EB" : "#94A3B8"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: "\u2713"
-                            visible: chkUnreadOnly.checked
-                            color: "white"
-                            font.pixelSize: 13
-                            font.bold: true
-                        }
-                    }
-
-                    contentItem: Text {
-                        leftPadding: chkUnreadOnly.indicator.width + chkUnreadOnly.spacing
-                        text: chkUnreadOnly.text
-                        color: chkUnreadOnly.checked ? "#1D4ED8" : "#475569"
-                        font: chkUnreadOnly.font
-                        verticalAlignment: Text.AlignVCenter
-                    }
-
-                    background: Rectangle {
-                        radius: 17
-                        color: chkUnreadOnly.checked
-                               ? (chkUnreadOnly.hovered ? "#DBEAFE" : "#EFF6FF")
-                               : (chkUnreadOnly.hovered ? "#F1F5F9" : "transparent")
-                        border.width: chkUnreadOnly.checked ? 1 : 0
-                        border.color: "#BFDBFE"
-                        Behavior on color { ColorAnimation { duration: 120 } }
-                    }
-
-                    onToggled: { if (bridgeObj) bridgeObj.searchUnreadOnly = checked }
-                }
             }
 
             Rectangle {

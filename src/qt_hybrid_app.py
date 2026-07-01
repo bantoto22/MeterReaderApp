@@ -1,4 +1,4 @@
-﻿"""Qt Widgets + QML hybrid UI for the Water Meter Reader app."""
+"""Qt Widgets + QML hybrid UI for the Water Meter Reader app."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ class AppBridge(QObject):
     zonesChanged = Signal()
     selectedZoneChanged = Signal()
     searchQueryChanged = Signal()
-    searchUnreadOnlyChanged = Signal()
+
     
     # Consumer info properties
     accountNoChanged = Signal()
@@ -396,16 +396,9 @@ class AppBridge(QObject):
             self.searchQueryChanged.emit()
             self._refresh_search_suggestions()
 
-    @Property(bool, notify=searchUnreadOnlyChanged)
-    def searchUnreadOnly(self) -> bool:
-        return self._search_unread_only
-
-    @searchUnreadOnly.setter
-    def searchUnreadOnly(self, val: bool) -> None:
-        if self._search_unread_only != val:
-            self._search_unread_only = val
-            self.searchUnreadOnlyChanged.emit()
-            self._refresh_search_suggestions()
+    @Property(list, notify=searchSuggestionsChanged)
+    def searchSuggestions(self) -> list:
+        return self._search_suggestions
 
     # Consumer Details properties
     @Property(str, notify=accountNoChanged)

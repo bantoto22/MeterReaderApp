@@ -6,6 +6,7 @@ Redesigned to fit tightly on a 480x660 screen with a single card group.
 
 import tkinter as tk
 from tkinter import ttk, messagebox
+import ttkbootstrap as tb
 import threading
 import time
 import math
@@ -326,23 +327,23 @@ class LoginScreen(tk.Frame):
         form_frame.pack(fill="x", pady=0)
 
         # Username
-        tk.Label(form_frame, text="👤 Username", font=(FONT_FAMILY, 11, "bold"),
-                 bg="#F1F5F9", fg="#334155").pack(anchor="w", pady=(0, 4))
+        tk.Label(form_frame, text="Username", font=(FONT_FAMILY, 11, "bold"),
+                 bg="#F1F5F9", fg="#475569").pack(anchor="w", pady=(0, 4))
 
         self._username_var = tk.StringVar()
         self._username_entry = RoundedEntry(form_frame, placeholder="Enter your username",
                                           height=46, radius=8, font=(FONT_FAMILY, 11),
-                                          bg="#F8FAFC", fg="#0F172A", textvariable=self._username_var)
+                                          bg="#FFFFFF", fg="#0F172A", border_color="#E2E8F0", textvariable=self._username_var)
         self._username_entry.pack(fill="x", pady=(0, 12))
 
         # Password
-        tk.Label(form_frame, text="🔒 Password", font=(FONT_FAMILY, 11, "bold"),
-                 bg="#F1F5F9", fg="#334155").pack(anchor="w", pady=(0, 4))
+        tk.Label(form_frame, text="Password", font=(FONT_FAMILY, 11, "bold"),
+                 bg="#F1F5F9", fg="#475569").pack(anchor="w", pady=(0, 4))
 
         self._password_var = tk.StringVar()
         self._password_entry = RoundedEntry(form_frame, placeholder="Enter your password",
                                             height=46, radius=8, font=(FONT_FAMILY, 11),
-                                            bg="#F8FAFC", fg="#0F172A", textvariable=self._password_var)
+                                            bg="#FFFFFF", fg="#0F172A", border_color="#E2E8F0", textvariable=self._password_var)
         self._password_entry.entry.config(show="•")
         self._password_entry.pack(fill="x", pady=(0, 16))
 
@@ -352,15 +353,9 @@ class LoginScreen(tk.Frame):
         self._error_label.pack(pady=(0, 8))
 
         # Login button
-        login_btn = tk.Button(form_frame, text="Log In", font=(FONT_FAMILY, 12, "bold"),
-                             bg="#1D4ED8", fg=WHITE, activebackground="#1E40AF",
-                             activeforeground=WHITE, relief="flat", bd=0,
-                             cursor="hand2", pady=8, command=self._attempt_login)
-        login_btn.pack(fill="x", ipady=4)
-
-        login_btn.bind("<Enter>", lambda e: e.widget.config(bg="#1E40AF"))
-        login_btn.bind("<Leave>", lambda e: e.widget.config(bg="#1D4ED8"))
-
+        login_btn = RoundedButton(form_frame, text="Log In", command=self._attempt_login,
+                                  radius=8, bg_color="#2563EB", fg_color=WHITE, font=(FONT_FAMILY, 12, "bold"))
+        login_btn.pack(fill="x", pady=(8, 0), ipady=8)
         # Bind Enter key
         self._password_entry.entry.bind("<Return>", lambda e: self._attempt_login())
         self._username_entry.entry.bind("<Return>", lambda e: self._password_entry.entry.focus())
@@ -781,9 +776,9 @@ class ModernTabButton(tk.Frame):
 
 
 # --- Main Application --------------------------------------------------------
-class MeterReaderApp(tk.Tk):
+class MeterReaderApp(tb.Window):
     def __init__(self):
-        super().__init__()
+        super().__init__(themename="cosmo")
         self.update_idletasks()
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
@@ -1734,14 +1729,7 @@ class MeterReaderApp(tk.Tk):
         self.search_input.entry.bind("<KeyRelease>", self._on_search_key)
         self.search_input.entry.bind("<FocusOut>", self._schedule_hide_autocomplete)
 
-        search_mode_row = tk.Frame(search_section, bg=BG_COLOR)
-        search_mode_row.pack(fill="x", pady=(4, 0))
-        CompactCheckbutton(
-            search_mode_row,
-            text="Unread only",
-            variable=self._search_unread_only,
-            command=self._on_search_mode_changed,
-        ).pack(side="left")
+
 
         self._sync_target_label = None
         self._sync_backup_label = None
@@ -2217,8 +2205,8 @@ class MeterReaderApp(tk.Tk):
         self._draw_rr(c, 1, 1, w - 4, h - 5, 8, fill=WHITE, outline=BORDER_COLOR, width=1)
         c.create_text(28, 38, text=zone_name, font=(FONT_FAMILY, 22, "bold"), fill=DARK_TEXT, anchor="w")
         c.create_text(28, 68, text=f"{total} households assigned", font=(FONT_FAMILY, 10), fill=MID_TEXT, anchor="w")
-        c.create_text(28, 119, text=f"{pct}%", font=(FONT_FAMILY, 31, "bold"), fill=SUCCESS_TEXT, anchor="w")
-        c.create_text(126, 122, text="Complete", font=(FONT_FAMILY, 10, "bold"), fill=MID_TEXT, anchor="w")
+        c.create_text(28, 112, text=f"{pct}%", font=(FONT_FAMILY, 31, "bold"), fill=SUCCESS_TEXT, anchor="w")
+        c.create_text(28, 138, text="Complete", font=(FONT_FAMILY, 10, "bold"), fill=MID_TEXT, anchor="w")
         
         # Interactive Sync Button
         sync_bg = self._draw_rr(c, w - 142, 24, w - 26, 68, 7, fill=WHITE, outline="#BFDBFE", width=1, tags="sync_btn")
@@ -2252,7 +2240,7 @@ class MeterReaderApp(tk.Tk):
         c.create_rectangle(6, 190, w - 9, h - 14, fill="#1F4FC0", outline="")
         cx = w // 2
 
-        c.create_text(cx, 34, text="TODAY'S PROGRESS", font=(FONT_FAMILY, 10, "bold"), fill=WHITE)
+        c.create_text(cx, 34, text="Today's Progress", font=(FONT_FAMILY, 10, "bold"), fill=WHITE)
         c.create_text(cx, 94, text=f"{read}/{total}", font=(FONT_FAMILY, 52, "bold"), fill=WHITE)
         c.create_text(cx, 137, text="Meters Read", font=(FONT_FAMILY, 11), fill="#D5E5FF")
 
