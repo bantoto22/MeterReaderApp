@@ -2141,11 +2141,13 @@ class MeterReaderApp(tk.Tk):
         wifi_inner = wifi_card.inner_frame
 
         self._wifi_status_var = tk.StringVar(value="Status: Unknown")
+        self._wifi_hint_var = tk.StringVar(value="Nearby internet connections will appear here after scan.")
         self._wifi_ssid_var = tk.StringVar()
         self._wifi_pwd_var = tk.StringVar()
         self._wifi_networks = []
         self._wifi_scan_busy = False
         self._wifi_connect_busy = False
+        self._wifi_scan_silent = False
 
         wifi_header = tk.Frame(wifi_inner, bg=WHITE)
         wifi_header.pack(fill="x", pady=(0, 18))
@@ -2180,6 +2182,38 @@ class MeterReaderApp(tk.Tk):
         self._wifi_scan_btn.text = "Scan"
         self._wifi_scan_btn.pack(side="right", padx=(16, 0))
 
+        tk.Label(
+            wifi_inner,
+            textvariable=self._wifi_hint_var,
+            font=(FONT_FAMILY, 10),
+            fg=MID_TEXT,
+            bg=WHITE,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(0, 8))
+
+        networks_panel = tk.Frame(wifi_inner, bg=WHITE)
+        networks_panel.pack(fill="x", pady=(0, 12))
+
+        self._wifi_network_list = tk.Listbox(
+            networks_panel,
+            height=5,
+            font=(FONT_FAMILY, 10),
+            bg=INPUT_BG,
+            fg=DARK_TEXT,
+            bd=0,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=INPUT_BORDER,
+            highlightcolor=ACCENT_BLUE,
+            activestyle="none",
+            selectbackground="#DBEAFE",
+            selectforeground=DARK_TEXT,
+            exportselection=False,
+        )
+        self._wifi_network_list.pack(fill="x")
+        self._wifi_network_list.bind("<<ListboxSelect>>", self._on_wifi_network_selected)
+
         conn_row = tk.Frame(wifi_inner, bg=WHITE)
         conn_row.pack(fill="x")
 
@@ -2198,6 +2232,42 @@ class MeterReaderApp(tk.Tk):
         self._wifi_connect_btn.text = "Connect"
         self._wifi_connect_btn.pack(side="right", padx=(16, 0))
 
+        power_card = GroupCard(main, radius=8, bg_color=WHITE, padding=24)
+        power_card.pack(fill="x", pady=(0, 22))
+        power_inner = power_card.inner_frame
+
+        power_header = tk.Frame(power_inner, bg=WHITE)
+        power_header.pack(fill="x", pady=(0, 12))
+        tk.Label(power_header, text="Power", font=(FONT_FAMILY, 16, "bold"), fg=DARK_TEXT, bg=WHITE).pack(anchor="w")
+        tk.Label(
+            power_header,
+            text="Use this before switching off external power to help prevent Raspberry Pi OS corruption.",
+            font=(FONT_FAMILY, 10),
+            fg=MID_TEXT,
+            bg=WHITE,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).pack(anchor="w", pady=(8, 0))
+
+        power_btn_row = tk.Frame(power_inner, bg=WHITE)
+        power_btn_row.pack(fill="x")
+        self._power_off_btn = RoundedButton(
+            power_btn_row,
+            text="Power Off Device",
+            command=self._confirm_power_off,
+            radius=7,
+            bg_color="#B91C1C",
+            fg_color=WHITE,
+            font=(FONT_FAMILY, 10, "bold"),
+            shadow_color="#D8E1EC",
+            width=168,
+            height=48,
+        )
+        self._power_off_btn.text = "Power Off Device"
+        self._power_off_btn.pack(side="left")
+
+        self.after(500, lambda: self._scan_wifi_networks(silent=True))
         self.after(2000, self._poll_wifi_status)
 
     def _redraw_zone_card(self, event=None):
@@ -2537,17 +2607,146 @@ class MeterReaderApp(tk.Tk):
         mode_text = f"pull={'on' if self._auto_pull_enabled.get() else 'off'}, push={'on' if self._auto_push_enabled.get() else 'off'}, {interval}s"
         self._refresh_sync_status_ui(mode_text)
 
+    def _confirm_power_off(self):
+        pending = int(getattr(self, "_sync_pending_count", 0) or 0)
+        warning = (
+            "Power off the device safely?\n\n"
+            "The app will sync pending readings first, then send a proper shutdown command to the Raspberry Pi to help prevent Raspberry Pi OS corruption.\n"
+            "Only remove external power after the screen and Pi have fully shut down."
+        )
+        if pending > 0:
+            warning += f"\n\nWarning: {pending} reading(s) are still pending sync."
+
+        if not messagebox.askyesno("Power Off Device", warning):
+            return
+
+        if os.name == "nt":
+            messagebox.showinfo(
+                "Windows Preview",
+                "Safe power-off is intended for the Raspberry Pi device.\n\n"
+                "On the Pi, this button will request a graceful OS shutdown before external power is removed.",
+            )
+            return
+
+        self._spawn_overlay(
+            "Preparing Shutdown...",
+            "Syncing pending readings before power off",
+            self._sync_then_power_off_task,
+        )
+
+    def _sync_then_power_off_task(self):
+        try:
+            if self._sync_dal:
+                result = self._sync_dal.syncPendingReadings()
+                self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
+                self._sync_sync_result = result
+
+                if result.get("status") != "done":
+                    detail = str(result.get("error") or result.get("status") or "Sync failed before shutdown.")
+                    self.after(0, lambda msg=detail: self._on_power_off_blocked(msg))
+                    return
+
+                pending_after_sync = len(self._sync_dal.listPendingSyncReadings())
+                self._sync_pending_count = pending_after_sync
+                if pending_after_sync > 0:
+                    self.after(
+                        0,
+                        lambda count=pending_after_sync: self._on_power_off_blocked(
+                            f"{count} reading(s) are still pending after sync. Shutdown was cancelled."
+                        ),
+                    )
+                    return
+
+                self._hydrate_local_consumers_from_sync()
+                self.after(0, self._refresh_zone_stats)
+                self.after(0, self._refresh_sync_status_ui)
+            self._power_off_device_task()
+        except Exception as exc:
+            self._sync_state = "Sync Failed"
+            self.after(0, lambda msg=str(exc): self._on_power_off_blocked(msg or "Sync failed before shutdown."))
+
+    def _power_off_device_task(self):
+        commands = [
+            ["systemctl", "poweroff"],
+            ["shutdown", "-h", "now"],
+            ["poweroff"],
+            ["sudo", "-n", "shutdown", "-h", "now"],
+            ["sudo", "-n", "poweroff"],
+        ]
+
+        last_error = "Power-off command failed."
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return
+                detail = (result.stderr or result.stdout or "").strip()
+                if detail:
+                    last_error = detail
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                return
+            except Exception as exc:
+                last_error = str(exc) or last_error
+
+        self.after(0, lambda msg=last_error: self._on_power_off_failed(msg))
+
+    def _on_power_off_failed(self, detail: str):
+        self._dismiss_overlay()
+        messagebox.showerror(
+            "Power Off Failed",
+            f"Unable to request a safe Raspberry Pi shutdown.\n\n{detail}",
+        )
+
+    def _on_power_off_blocked(self, detail: str):
+        self._dismiss_overlay()
+        self._refresh_sync_status_ui()
+        messagebox.showwarning(
+            "Shutdown Cancelled",
+            f"Device shutdown was stopped because the pre-shutdown sync did not complete cleanly.\n\n{detail}",
+        )
+
     # --- Native Wi-Fi Settings Handlers --------------------------------------
     def _set_wifi_status(self, text: str, color: str = MID_TEXT):
         self._wifi_status_var.set(text)
         if hasattr(self, "_wifi_status_label") and self._wifi_status_label.winfo_exists():
             self._wifi_status_label.config(fg=color)
 
-    def _scan_wifi_networks(self):
+    def _refresh_wifi_network_list(self):
+        if not hasattr(self, "_wifi_network_list") or not self._wifi_network_list.winfo_exists():
+            return
+
+        self._wifi_network_list.delete(0, "end")
+        if self._wifi_networks:
+            for network in self._wifi_networks:
+                self._wifi_network_list.insert("end", network)
+            self._wifi_hint_var.set(
+                f"Available internet connections in range: {len(self._wifi_networks)}"
+            )
+        else:
+            self._wifi_hint_var.set("No nearby internet connections found yet. Tap Scan to refresh.")
+
+    def _on_wifi_network_selected(self, event=None):
+        if not hasattr(self, "_wifi_network_list") or not self._wifi_network_list.curselection():
+            return
+        index = self._wifi_network_list.curselection()[0]
+        if 0 <= index < len(self._wifi_networks):
+            self._wifi_ssid_var.set(self._wifi_networks[index])
+
+    def _scan_wifi_networks(self, silent: bool = False):
         if self._wifi_scan_busy:
             return
         self._wifi_scan_busy = True
+        self._wifi_scan_silent = silent
         self._set_wifi_status("Status: Scanning...", PRIMARY_BLUE)
+        self._wifi_hint_var.set("Scanning for nearby internet connections...")
         self._wifi_scan_btn.text = "Scanning..."
         threading.Thread(target=self._scan_wifi_networks_thread, daemon=True).start()
 
@@ -2592,15 +2791,20 @@ class MeterReaderApp(tk.Tk):
     def _on_scan_complete(self, networks, error):
         self._wifi_scan_busy = False
         self._wifi_scan_btn.text = "Scan"
+        silent = self._wifi_scan_silent
+        self._wifi_scan_silent = False
         if error:
             self._wifi_networks = []
             self._wifi_combo["values"] = []
+            self._refresh_wifi_network_list()
             self._set_wifi_status(f"Status: Error - {error}", INVALID_TEXT)
-            messagebox.showerror("Wi-Fi Scan Failed", error)
+            if not silent:
+                messagebox.showerror("Wi-Fi Scan Failed", error)
             return
 
         self._wifi_networks = networks
         self._wifi_combo["values"] = self._wifi_networks
+        self._refresh_wifi_network_list()
         if self._wifi_networks and not self._wifi_ssid_var.get():
             self._wifi_ssid_var.set(self._wifi_networks[0])
         if self._wifi_networks:

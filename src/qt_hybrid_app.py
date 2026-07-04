@@ -160,6 +160,7 @@ class AppBridge(QObject):
     wifiScanFinished = Signal(object, str)
     wifiConnectFinished = Signal(bool, str, str)
     wifiStatusResult = Signal(str, str)
+    powerOffFailed = Signal(str)
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -235,6 +236,7 @@ class AppBridge(QObject):
         self.wifiScanFinished.connect(self._finish_wifi_scan)
         self.wifiConnectFinished.connect(self._finish_wifi_connect)
         self.wifiStatusResult.connect(self._set_wifi_status)
+        self.powerOffFailed.connect(self._finish_power_off_failure)
 
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(5_000)
@@ -648,7 +650,9 @@ class AppBridge(QObject):
         threading.Thread(target=_task, daemon=True).start()
 
     def _finish_sync_task(self, result: dict) -> None:
-        self._set_operation_busy(False, "")
+        keep_busy = bool(result.get("keep_busy"))
+        if not keep_busy:
+            self._set_operation_busy(False, "")
         if result.get("kind") == "error":
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
@@ -664,7 +668,7 @@ class AppBridge(QObject):
         self.zonesChanged.emit()
         self.update_stats()
         self._refresh_sync_snapshot()
-        if result.get("kind") == "sync":
+        if result.get("kind") == "sync" and not result.get("silent"):
             sync_result = result.get("result", {})
             self.alertRequested.emit(
                 "Sync Complete",
@@ -1079,6 +1083,86 @@ class AppBridge(QObject):
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
 
         threading.Thread(target=_task, daemon=True).start()
+
+    @Slot()
+    def powerOffDevice(self) -> None:
+        if os.name == "nt":
+            self.alertRequested.emit(
+                "Windows Preview",
+                "Safe power-off is intended for the Raspberry Pi device.\n\n"
+                "On the Pi, this button will request a graceful OS shutdown before external power is removed.",
+            )
+            return
+
+        self._set_operation_busy(True, "Syncing before power off...")
+
+        def _task() -> None:
+            try:
+                if self._sync_dal:
+                    result = self._sync_dal.syncPendingReadings()
+                    if result.get("status") != "done":
+                        detail = str(result.get("error") or result.get("status") or "Sync failed before shutdown.")
+                        self.powerOffFailed.emit(f"Shutdown cancelled because sync did not complete cleanly.\n\n{detail}")
+                        return
+
+                    pending_after_sync = len(self._sync_dal.listPendingSyncReadings())
+                    if pending_after_sync > 0:
+                        self.powerOffFailed.emit(
+                            f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending after sync."
+                        )
+                        return
+
+                    consumers = self._sync_dal.loadAssignedConsumers(None)
+                    mirrored = replace_consumers_from_sync(consumers)
+                    self.syncTaskFinished.emit(
+                        {"kind": "sync", "result": result, "mirrored": mirrored, "silent": True, "keep_busy": True}
+                    )
+            except Exception as exc:
+                self.powerOffFailed.emit(
+                    f"Shutdown cancelled because the pre-shutdown sync failed.\n\n{str(exc) or 'Unknown sync error.'}"
+                )
+                return
+
+            commands = [
+                ["systemctl", "poweroff"],
+                ["shutdown", "-h", "now"],
+                ["poweroff"],
+                ["sudo", "-n", "shutdown", "-h", "now"],
+                ["sudo", "-n", "poweroff"],
+            ]
+
+            last_error = "Power-off command failed."
+            for command in commands:
+                try:
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=12,
+                        check=False,
+                    )
+                    if result.returncode == 0:
+                        return
+                    detail = (result.stderr or result.stdout or "").strip()
+                    if detail:
+                        last_error = detail
+                except FileNotFoundError:
+                    continue
+                except subprocess.TimeoutExpired:
+                    return
+                except Exception as exc:
+                    last_error = str(exc) or last_error
+
+            self.powerOffFailed.emit(last_error)
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_power_off_failure(self, detail: str) -> None:
+        self._set_operation_busy(False, "")
+        self.alertRequested.emit(
+            "Shutdown Cancelled",
+            detail,
+        )
 
     def _build_receipt_text(self, consumer: dict, previous: int, present: int, exception: str) -> str:
         consumption = present - previous

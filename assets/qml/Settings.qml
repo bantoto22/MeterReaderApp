@@ -9,6 +9,27 @@ Rectangle {
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property bool wideLayout: width >= 760
 
+    Dialog {
+        id: powerDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 40, 420)
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        title: "Power Off Device"
+        onAccepted: {
+            if (bridgeObj) bridgeObj.powerOffDevice()
+        }
+        contentItem: Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: "#111827"
+            font.family: "Montserrat"
+            font.pixelSize: 12
+            text: "Power off the device safely?\n\nThe app will sync pending readings first, then send a proper shutdown command to the Raspberry Pi to help prevent Raspberry Pi OS corruption. Only remove external power after the screen and Pi have fully shut down."
+        }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+    }
+
     component ActionButton: Button {
         id: control
         property color buttonColor: "#2563EB"
@@ -326,6 +347,46 @@ Rectangle {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: powerCardContent.implicitHeight + 48
+                radius: 8
+                color: "white"
+                border.color: "#D8E1EC"
+
+                ColumnLayout {
+                    id: powerCardContent
+                    anchors.fill: parent
+                    anchors.margins: 24
+                    spacing: 14
+
+                    Text {
+                        text: "Power"
+                        color: "#111827"
+                        font.family: "Montserrat"
+                        font.pixelSize: 16
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Use this before switching off external power to help prevent Raspberry Pi OS corruption."
+                        color: "#526176"
+                        font.family: "Montserrat"
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+
+                    ActionButton {
+                        text: "Power Off Device"
+                        buttonColor: "#B91C1C"
+                        hoverColor: "#991B1B"
+                        Layout.preferredWidth: 168
+                        onClicked: powerDialog.open()
                     }
                 }
             }
