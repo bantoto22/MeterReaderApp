@@ -662,6 +662,7 @@ class RoundedButton(tk.Canvas):
         self._fg_color = fg_color
         self._font = font or (FONT_FAMILY, 14, "bold")
         self._shadow_color = shadow_color
+        self.text = text
         
         self.bind("<Configure>", self._redraw)
         self.bind("<Button-1>", self._on_click)
@@ -726,6 +727,69 @@ class RoundedButton(tk.Canvas):
     def text(self, value):
         self._text = value
         self._redraw()
+
+
+# --- Rounded Key (Canvas-based animated keyboard key) -------------------------
+class RoundedKey(tk.Canvas):
+    """A Canvas-based keyboard key with rounded corners and hover/press animations."""
+    def __init__(self, parent, text, command=None,
+                 bg=None, hover=None, press=None, fg="#66C6FF",
+                 font=None, radius=12, height=65, **kwargs):
+        _bg     = bg    or "#253048"
+        _hover  = hover or "#2E3B5C"
+        _press  = press or "#3A4A70"
+        super().__init__(parent, highlightthickness=0, bd=0,
+                         width=1, height=height, bg=parent["bg"], **kwargs)
+        self.command = command
+        self._text = text
+        self._bg_color   = _bg
+        self._hover_color = _hover
+        self._press_color = _press
+        self._fg_color   = fg
+        self._font       = font
+        self._radius     = radius
+        self._current    = _bg
+
+        self.bind("<Configure>",      lambda e: self._draw())
+        self.bind("<Enter>",          lambda e: self._set_state(self._hover_color))
+        self.bind("<Leave>",          lambda e: self._set_state(self._bg_color))
+        self.bind("<ButtonPress-1>",  lambda e: self._set_state(self._press_color))
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kw):
+        r = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+        pts = [
+            x1+r, y1,  x2-r, y1,  x2, y1,  x2, y1+r,
+            x2, y2-r,  x2, y2,    x2-r, y2, x1+r, y2,
+            x1, y2,    x1, y2-r,  x1, y1+r, x1, y1,
+        ]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        self._round_rect(2, 2, w-2, h-2, self._radius,
+                         fill=self._current, outline="")
+        self.create_text(w/2, h/2, text=self._text,
+                         fill=self._fg_color, font=self._font)
+
+    def _set_state(self, color):
+        self._current = color
+        self._draw()
+
+    def _on_release(self, event):
+        self._current = self._hover_color
+        self._draw()
+        w, h = self.winfo_width(), self.winfo_height()
+        if 0 <= event.x <= w and 0 <= event.y <= h and self.command:
+            self.command()
+
+    def set_text(self, text):
+        self._text = text
+        self._draw()
 
 
 # --- Modern Tab Button -------------------------------------------------------
@@ -1197,27 +1261,15 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _build_in_app_keyboard(self):
         self.keyboard_panel.configure(bg="#1C2434")
         self._keyboard_content = tk.Frame(self.keyboard_panel, bg="#1C2434")
-        self._keyboard_content.pack(fill="both", expand=True, padx=10, pady=10)
-
-    def _keyboard_btn(self, parent, text, command, expand=False, bg_color=TAB_DARK, fg_color=WHITE):
-        btn = tk.Button(
-            parent,
-            text=text,
-            font=(FONT_FAMILY, self._touch_font_base, "bold"),
-            bg=bg_color,
-            fg=fg_color,
-            activebackground="#354766",
-            activeforeground=fg_color,
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=command,
-            padx=6,
-            pady=4,
-            highlightthickness=0,
+        self._keyboard_content.pack(fill="both", expand=True, padx=14, pady=12)
+        self._keyboard_mode = getattr(self, "_keyboard_mode", "alpha")
+        self._keyboard_caps = getattr(self, "_keyboard_caps", False)
+        from tkinter import font as tkfont
+        self._key_font = tkfont.Font(
+            family=FONT_FAMILY,
+            size=getattr(self, "_touch_font_base", 13),
+            weight="bold",
         )
-        btn.pack(side="left", fill="both", expand=expand, padx=4, pady=4, ipady=10)
-        return btn
 
     def _toggle_keyboard_mode(self):
         self._keyboard_mode = "numeric" if self._keyboard_mode != "numeric" else "alpha"
@@ -1236,37 +1288,82 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         else:
             rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
 
+        # Use grid() + column weights so keys always divide the row width evenly,
+        # preventing overflow on long rows like "qwertyuiop" (10 keys).
         for row_idx, row_keys in enumerate(rows):
             row = tk.Frame(self._keyboard_content, bg="#1C2434")
-            row.pack(fill="x")
+            row.pack(fill="x", pady=4)
+            col = 0
+
             if self._keyboard_mode != "numeric" and row_idx == 2:
-                self._keyboard_btn(
+                RoundedKey(
                     row,
-                    "↑" if not self._keyboard_caps else "↑ ON",
-                    self._toggle_keyboard_caps,
-                    expand=False,
-                    bg_color="#334360" if self._keyboard_caps else "#253048",
-                    fg_color="#66C6FF",
-                )
+                    "⇧",
+                    command=self._toggle_keyboard_caps,
+                    bg="#334360" if self._keyboard_caps else "#2B3550",
+                    hover="#354766", press="#41547E",
+                    fg="#FFFFFF" if self._keyboard_caps else "#66C6FF", font=self._key_font,
+                ).grid(row=0, column=col, sticky="nsew", padx=4)
+                row.grid_columnconfigure(col, weight=15)
+                col += 1
+
             for key_char in row_keys:
                 label = key_char.upper() if self._keyboard_caps else key_char
-                value = key_char.upper() if self._keyboard_caps else key_char
-                self._keyboard_btn(row, label, lambda c=value: self._insert_key(c), expand=True, bg_color="#253048", fg_color="#66C6FF")
+                RoundedKey(
+                    row, label,
+                    command=lambda c=label: self._insert_key(c),
+                    bg="#253048", hover="#2E3B5C", press="#3A4A70",
+                    fg=WHITE, font=self._key_font,
+                ).grid(row=0, column=col, sticky="nsew", padx=4)
+                row.grid_columnconfigure(col, weight=10)
+                col += 1
+
             if self._keyboard_mode != "numeric" and row_idx == 2:
-                self._keyboard_btn(row, "⌫", self._backspace_key, expand=False, bg_color="#2B3550", fg_color="#66C6FF")
+                RoundedKey(
+                    row, "⌫",
+                    command=self._backspace_key,
+                    bg="#2B3550", hover="#8a3b3b", press="#a54848",
+                    fg="#66C6FF", font=self._key_font,
+                ).grid(row=0, column=col, sticky="nsew", padx=4)
+                row.grid_columnconfigure(col, weight=15)
+
+            row.grid_rowconfigure(0, weight=1)
 
         if self._keyboard_mode == "numeric":
             bottom_row = tk.Frame(self._keyboard_content, bg="#1C2434")
-            bottom_row.pack(fill="x")
-            self._keyboard_btn(bottom_row, "ABC", self._toggle_keyboard_mode, expand=True, bg_color="#253048", fg_color="#66C6FF")
-            self._keyboard_btn(bottom_row, "0", lambda: self._insert_key("0"), expand=True, bg_color="#253048", fg_color="#66C6FF")
-            self._keyboard_btn(bottom_row, "⌫", self._backspace_key, expand=True, bg_color="#2B3550", fg_color="#66C6FF")
+            bottom_row.pack(fill="x", pady=4)
+            for idx, (label, cmd, is_num) in enumerate([
+                ("ABC", self._toggle_keyboard_mode, False),
+                ("0",   lambda: self._insert_key("0"), True),
+                ("⌫",   self._backspace_key, False),
+            ]):
+                RoundedKey(
+                    bottom_row, label, command=cmd,
+                    bg="#253048" if is_num else "#2B3550",
+                    hover="#2E3B5C" if is_num else "#354766",
+                    press="#3A4A70" if is_num else "#41547E",
+                    fg=WHITE if is_num else "#66C6FF",
+                    font=self._key_font,
+                ).grid(row=0, column=idx, sticky="nsew", padx=4)
+                bottom_row.grid_columnconfigure(idx, weight=1)
+            bottom_row.grid_rowconfigure(0, weight=1)
 
         if self._keyboard_mode != "numeric":
             action_row = tk.Frame(self._keyboard_content, bg="#1C2434")
-            action_row.pack(fill="x")
-            self._keyboard_btn(action_row, "123", self._toggle_keyboard_mode, expand=False, bg_color="#253048", fg_color="#66C6FF")
-            self._keyboard_btn(action_row, "space", lambda: self._insert_key(" "), expand=True, bg_color="#2C374F", fg_color="#66C6FF")
+            action_row.pack(fill="x", pady=(8, 0))
+            RoundedKey(
+                action_row, "123", command=self._toggle_keyboard_mode,
+                bg="#2B3550", hover="#354766", press="#41547E",
+                fg="#66C6FF", font=self._key_font, height=60,
+            ).grid(row=0, column=0, sticky="nsew", padx=4)
+            RoundedKey(
+                action_row, "space", command=lambda: self._insert_key(" "),
+                bg="#2B3550", hover="#354766", press="#41547E",
+                fg="#66C6FF", font=self._key_font, height=60,
+            ).grid(row=0, column=1, sticky="nsew", padx=4)
+            action_row.grid_columnconfigure(0, weight=25)
+            action_row.grid_columnconfigure(1, weight=75)
+            action_row.grid_rowconfigure(0, weight=1)
 
     def _get_keyboard_target(self):
         focused = self.focus_get()
