@@ -24,7 +24,7 @@ def get_connection():
 
 # ─── Schema creation ─────────────────────────────────────────────────────────
 def init_db():
-    """Create the tables if they don't exist and seed initial data."""
+    """Create the tables if they don't exist and seed only local user accounts."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -65,7 +65,7 @@ def init_db():
     """)
 
     # ── Seed data (only if tables are empty) ─────────────────────────────
-    if cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
+    if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
         zones = ["Zone 1", "Zone 2", "Zone 3"]
         cur.executemany("INSERT INTO zones (name) VALUES (?)",
                         [(z,) for z in zones])

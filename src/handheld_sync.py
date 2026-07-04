@@ -5,7 +5,7 @@ Online:
 - Reads/writes via Supabase REST.
 
 Offline:
-- Writes are queued in local PostgreSQL.
+- Writes are queued in local SQLite on the Pi.
 - Reads use local cached consumers/meters.
 """
 
@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -52,11 +53,6 @@ class SyncConfig:
     supabase_url: str
     supabase_anon_key: str
     supabase_service_role_key: str
-    local_pg_host: str
-    local_pg_port: int
-    local_pg_db: str
-    local_pg_user: str
-    local_pg_password: str
     main_pg_host: str
     main_pg_port: int
     main_pg_db: str
@@ -78,16 +74,6 @@ class SyncConfig:
             "SUPABASE_URL",
             "SUPABASE_ANON_KEY",
             "SUPABASE_SERVICE_ROLE_KEY",
-            "LOCAL_PG_HOST",
-            "LOCAL_PG_PORT",
-            "LOCAL_PG_DB",
-            "LOCAL_PG_USER",
-            "LOCAL_PG_PASSWORD",
-            "MAIN_PG_HOST",
-            "MAIN_PG_PORT",
-            "MAIN_PG_DB",
-            "MAIN_PG_USER",
-            "MAIN_PG_PASSWORD",
         ]
 
         missing = [k for k in required if not os.getenv(k)]
@@ -104,11 +90,6 @@ class SyncConfig:
             supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
             supabase_anon_key=supabase_anon_key,
             supabase_service_role_key=supabase_service_role_key,
-            local_pg_host=os.getenv("LOCAL_PG_HOST", ""),
-            local_pg_port=int(os.getenv("LOCAL_PG_PORT", "5432")),
-            local_pg_db=os.getenv("LOCAL_PG_DB", ""),
-            local_pg_user=os.getenv("LOCAL_PG_USER", ""),
-            local_pg_password=os.getenv("LOCAL_PG_PASSWORD", ""),
             main_pg_host=os.getenv("MAIN_PG_HOST", ""),
             main_pg_port=int(os.getenv("MAIN_PG_PORT", "5432")),
             main_pg_db=os.getenv("MAIN_PG_DB", ""),
@@ -151,46 +132,47 @@ class LocalSyncStore:
         raise NotImplementedError
 
 
-class PostgresLocalSyncStore(LocalSyncStore):
-    def __init__(self, cfg: SyncConfig):
-        try:
-            import psycopg2
-            from psycopg2.extras import RealDictCursor
-        except ImportError as exc:
-            raise RuntimeError(
-                "psycopg2 is required for local PostgreSQL sync storage. Install it with `pip install psycopg2-binary`."
-            ) from exc
-        self._psycopg2 = psycopg2
-        self._dict_cursor = RealDictCursor
-        self._cfg = cfg
+class SQLiteLocalSyncStore(LocalSyncStore):
+    def __init__(self, _cfg: SyncConfig):
+        self._db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "meter.db"))
 
     def _connect(self):
-        return self._psycopg2.connect(
-            host=self._cfg.local_pg_host,
-            port=self._cfg.local_pg_port,
-            dbname=self._cfg.local_pg_db,
-            user=self._cfg.local_pg_user,
-            password=self._cfg.local_pg_password,
-        )
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    @staticmethod
+    def _deserialize_row(row: sqlite3.Row) -> dict:
+        data = dict(row)
+        for key in ("payload", "server_payload"):
+            if key in data and isinstance(data[key], str) and data[key]:
+                try:
+                    data[key] = json.loads(data[key])
+                except Exception:
+                    data[key] = {}
+            elif key in data and data[key] is None:
+                data[key] = {} if key == "server_payload" else data[key]
+        return data
 
     def ensure_schema(self) -> None:
         sql = """
         CREATE TABLE IF NOT EXISTS sync_queue_meter_readings (
-            id BIGSERIAL PRIMARY KEY,
-            operation VARCHAR(20) NOT NULL,
-            operation_id UUID NOT NULL UNIQUE,
-            reading_id UUID NOT NULL,
-            consumer_id BIGINT NOT NULL,
-            reading_date DATE NOT NULL,
-            payload JSONB NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            operation_id TEXT NOT NULL UNIQUE,
+            reading_id TEXT NOT NULL,
+            consumer_id INTEGER NOT NULL,
+            reading_date TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
             retries INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             conflict_reason TEXT,
-            server_payload JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            synced_at TIMESTAMPTZ
+            server_payload TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            synced_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_sync_queue_status_created_at
@@ -200,27 +182,26 @@ class PostgresLocalSyncStore(LocalSyncStore):
           ON sync_queue_meter_readings (consumer_id, reading_date, operation_id);
 
         CREATE TABLE IF NOT EXISTS sync_audit_log (
-            id BIGSERIAL PRIMARY KEY,
-            queue_id BIGINT,
-            status VARCHAR(20) NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_id INTEGER,
+            status TEXT NOT NULL,
             message TEXT NOT NULL,
-            payload JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            payload TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS handheld_consumers_cache (
-            id BIGINT PRIMARY KEY,
+            id INTEGER PRIMARY KEY,
             meter_no TEXT,
             acct_no TEXT,
             name TEXT NOT NULL,
             zone_name TEXT,
             previous_reading INTEGER,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
+            conn.executescript(sql)
             conn.commit()
 
     def cache_consumers(self, consumers: list[dict]) -> None:
@@ -228,29 +209,28 @@ class PostgresLocalSyncStore(LocalSyncStore):
             return
         sql = """
         INSERT INTO handheld_consumers_cache (id, meter_no, acct_no, name, zone_name, previous_reading, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (id) DO UPDATE SET
-            meter_no = EXCLUDED.meter_no,
-            acct_no = EXCLUDED.acct_no,
-            name = EXCLUDED.name,
-            zone_name = EXCLUDED.zone_name,
-            previous_reading = EXCLUDED.previous_reading,
-            updated_at = NOW()
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            meter_no = excluded.meter_no,
+            acct_no = excluded.acct_no,
+            name = excluded.name,
+            zone_name = excluded.zone_name,
+            previous_reading = excluded.previous_reading,
+            updated_at = CURRENT_TIMESTAMP
         """
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                for item in consumers:
-                    cur.execute(
-                        sql,
-                        (
-                            item.get("id"),
-                            item.get("meter_no"),
-                            item.get("acct_no"),
-                            item.get("name", ""),
-                            item.get("zone_name"),
-                            item.get("previous_reading"),
-                        ),
-                    )
+            for item in consumers:
+                conn.execute(
+                    sql,
+                    (
+                        item.get("id"),
+                        item.get("meter_no"),
+                        item.get("acct_no"),
+                        item.get("name", ""),
+                        item.get("zone_name"),
+                        item.get("previous_reading"),
+                    ),
+                )
             conn.commit()
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
@@ -260,14 +240,12 @@ class PostgresLocalSyncStore(LocalSyncStore):
         """
         params: tuple = ()
         if zone_name:
-            base += " WHERE zone_name = %s"
+            base += " WHERE zone_name = ?"
             params = (zone_name,)
         base += " ORDER BY meter_no"
         with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(base, params)
-                rows = cur.fetchall()
-        return list(rows)
+            rows = conn.execute(base, params).fetchall()
+        return [dict(row) for row in rows]
 
     def enqueue_operation(self, operation: str, payload: dict) -> dict:
         operation_id = payload.get("operation_id") or str(uuid.uuid4())
@@ -277,25 +255,30 @@ class PostgresLocalSyncStore(LocalSyncStore):
         sql = """
         INSERT INTO sync_queue_meter_readings (
             operation, operation_id, reading_id, consumer_id, reading_date, payload, status
-        ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'pending')
-        RETURNING id, operation_id, reading_id, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
         """
         with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(
-                    sql,
-                    (
-                        operation,
-                        operation_id,
-                        reading_id,
-                        payload["consumer_id"],
-                        payload["reading_date"],
-                        json.dumps(payload),
-                    ),
-                )
-                row = cur.fetchone()
+            cur = conn.execute(
+                sql,
+                (
+                    operation,
+                    operation_id,
+                    reading_id,
+                    payload["consumer_id"],
+                    payload["reading_date"],
+                    json.dumps(payload),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id, operation_id, reading_id, status, created_at
+                FROM sync_queue_meter_readings
+                WHERE id = ?
+                """,
+                (cur.lastrowid,),
+            ).fetchone()
             conn.commit()
-        return dict(row)
+        return dict(row) if row else {}
 
     def list_pending(self) -> list[dict]:
         sql = """
@@ -305,60 +288,54 @@ class PostgresLocalSyncStore(LocalSyncStore):
         ORDER BY id ASC
         """
         with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql)
-                rows = cur.fetchall()
-        return list(rows)
+            rows = conn.execute(sql).fetchall()
+        return [self._deserialize_row(row) for row in rows]
 
     def mark_synced(self, queue_id: int) -> None:
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE sync_queue_meter_readings
-                    SET status='synced', synced_at=NOW(), updated_at=NOW(), last_error=NULL
-                    WHERE id = %s
-                    """,
-                    (queue_id,),
-                )
+            conn.execute(
+                """
+                UPDATE sync_queue_meter_readings
+                SET status='synced', synced_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP, last_error=NULL
+                WHERE id = ?
+                """,
+                (queue_id,),
+            )
             conn.commit()
 
     def mark_failed(self, queue_id: int, reason: str) -> None:
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE sync_queue_meter_readings
-                    SET status='failed', retries=retries+1, last_error=%s, updated_at=NOW()
-                    WHERE id=%s
-                    """,
-                    (reason[:1000], queue_id),
-                )
+            conn.execute(
+                """
+                UPDATE sync_queue_meter_readings
+                SET status='failed', retries=retries+1, last_error=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (reason[:1000], queue_id),
+            )
             conn.commit()
 
     def mark_conflict(self, queue_id: int, reason: str, server_payload: dict | None = None) -> None:
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE sync_queue_meter_readings
-                    SET status='conflict', conflict_reason=%s, server_payload=%s::jsonb, updated_at=NOW()
-                    WHERE id=%s
-                    """,
-                    (reason[:1000], json.dumps(server_payload or {}), queue_id),
-                )
+            conn.execute(
+                """
+                UPDATE sync_queue_meter_readings
+                SET status='conflict', conflict_reason=?, server_payload=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (reason[:1000], json.dumps(server_payload or {}), queue_id),
+            )
             conn.commit()
 
     def log_audit(self, queue_id: int | None, status: str, message: str, payload: dict | None = None) -> None:
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO sync_audit_log(queue_id, status, message, payload)
-                    VALUES (%s, %s, %s, %s::jsonb)
-                    """,
-                    (queue_id, status, message[:2000], json.dumps(payload or {})),
-                )
+            conn.execute(
+                """
+                INSERT INTO sync_audit_log(queue_id, status, message, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                (queue_id, status, message[:2000], json.dumps(payload or {})),
+            )
             conn.commit()
 
     def get_recent_audit(self, limit: int = 20) -> list[dict]:
@@ -366,13 +343,11 @@ class PostgresLocalSyncStore(LocalSyncStore):
         SELECT id, queue_id, status, message, payload, created_at
         FROM sync_audit_log
         ORDER BY id DESC
-        LIMIT %s
+        LIMIT ?
         """
         with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (max(1, min(limit, 200)),))
-                rows = cur.fetchall()
-        return list(rows)
+            rows = conn.execute(sql, (max(1, min(limit, 200)),)).fetchall()
+        return [self._deserialize_row(row) for row in rows]
 
 
 class SupabaseRestClient:
@@ -716,10 +691,11 @@ class HandheldSyncDataAccess:
         cfg = SyncConfig.from_env(fail_fast=fail_fast)
         main_pg_client = None
         try:
-            main_pg_client = MainPostgresClient(cfg)
+            if cfg.main_pg_host and cfg.main_pg_db and cfg.main_pg_user:
+                main_pg_client = MainPostgresClient(cfg)
         except Exception:
             main_pg_client = None
-        return cls(PostgresLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
+        return cls(SQLiteLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
 
     def is_online(self) -> bool:
         return self.remote.is_online()
@@ -803,11 +779,11 @@ class HandheldSyncDataAccess:
         has_failed = any(row.get("status") == "failed" for row in pending)
         has_pending = len(pending) > 0
         if has_failed:
-            save_target = "Local Queue (sync retry pending)"
+            save_target = "Local SQLite Queue (sync retry pending)"
         elif status == "Online":
             save_target = "Supabase (online)"
         else:
-            save_target = "Local Queue (offline)"
+            save_target = "Local SQLite Queue (offline)"
         backup_state = "Backed up to main system" if (status == "Online" and not has_pending) else "Not fully backed up"
         last_sync = self.get_last_successful_sync_time()
         return {

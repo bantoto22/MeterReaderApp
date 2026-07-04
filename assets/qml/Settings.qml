@@ -238,13 +238,48 @@ Rectangle {
                         }
                     }
 
+                    Rectangle {
+                        Layout.fillWidth: true
+                        radius: 7
+                        color: "#F8FAFD"
+                        border.color: "#D8E1EC"
+                        implicitHeight: wifiHintText.implicitHeight + 24
+
+                        Text {
+                            id: wifiHintText
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            text: {
+                                var networks = bridgeObj ? bridgeObj.wifiNetworks : []
+                                var current = cmbWifi.editText.length ? cmbWifi.editText : cmbWifi.currentText
+                                if (current.length > 0)
+                                    return "Selected network: " + current
+                                if (networks && networks.length > 0)
+                                    return networks.length + " network(s) available nearby."
+                                return "Scan for nearby Wi-Fi networks, then choose one to connect."
+                            }
+                            color: "#526176"
+                            font.family: "Montserrat"
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    Text {
+                        text: "Network"
+                        color: "#111827"
+                        font.family: "Montserrat"
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 16
                         ComboBox {
                             id: cmbWifi
                             Layout.fillWidth: true
-                            editable: true
+                            editable: false
                             model: bridgeObj ? bridgeObj.wifiNetworks : []
                             font.family: "Montserrat"
                             font.pixelSize: 11
@@ -316,6 +351,15 @@ Rectangle {
                             enabled: bridgeObj ? !bridgeObj.wifiBusy : false
                             onClicked: { if (bridgeObj) bridgeObj.scanWifiNetworks() }
                         }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Choose a network from the scan results, then enter its password below."
+                        color: "#526176"
+                        font.family: "Montserrat"
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
                     }
 
                     RowLayout {

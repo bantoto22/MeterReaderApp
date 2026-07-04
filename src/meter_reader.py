@@ -909,12 +909,13 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
         def _task():
             try:
-                if self._sync_dal.is_online():
-                    self._hydrate_local_consumers_from_sync()
-                    self.after(0, self._refresh_zone_stats)
-                    self.after(0, lambda: self._refresh_sync_status_ui("auto-pull complete"))
+                online = self._sync_dal.is_online()
+                mirrored = self._hydrate_local_consumers_from_sync()
+                self.after(0, self._refresh_zone_stats)
+                if online:
+                    self.after(0, lambda count=mirrored: self._refresh_sync_status_ui(f"auto-pull complete ({count} mirrored)"))
                 else:
-                    self.after(0, lambda: self._refresh_sync_status_ui("offline"))
+                    self.after(0, lambda count=mirrored: self._refresh_sync_status_ui(f"offline, fallback pull ({count} mirrored)"))
             except Exception as exc:
                 self.after(0, lambda: self._refresh_sync_status_ui(f"auto-pull failed: {exc}"))
             finally:
@@ -1365,6 +1366,47 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         host.bind("<Configure>", _resize)
         return body
 
+    def _make_scrollable_body(self, parent, max_width=1180):
+        """Create a vertically scrollable body for longer touchscreen pages."""
+        host = tk.Frame(parent, bg=BG_COLOR)
+        host.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(host, bg=BG_COLOR, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        body = tk.Frame(canvas, bg=BG_COLOR)
+        window_id = canvas.create_window((0, 0), window=body, anchor="n")
+
+        def _resize(event=None):
+            canvas_width = max(1, canvas.winfo_width())
+            side_margin = 20 if canvas_width < 720 else 48
+            width = min(max_width, max(280, canvas_width - side_margin))
+            canvas.itemconfigure(window_id, width=width)
+
+        def _update_scrollregion(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_mousewheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_mousewheel(event=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
+        def _unbind_mousewheel(event=None):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Configure>", _resize)
+        body.bind("<Configure>", _update_scrollregion)
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+        _resize()
+        return body
+
     @staticmethod
     def _section_title(parent, text, size=13):
         row = tk.Frame(parent, bg=parent["bg"])
@@ -1694,8 +1736,8 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._profile_btn.pack(side="right")
         self._profile_btn.bind("<Button-1>", lambda e, b=self._profile_btn: self._show_profile_menu(b))
 
-        # -- Main Content Container (No Scrollbar) ------------------------
-        main = self._make_centered_body(self.meter_entry_frame, max_width=1120)
+        # -- Main Content Container ---------------------------------------
+        main = self._make_scrollable_body(self.meter_entry_frame, max_width=1120)
 
         px = 0
 
@@ -1925,7 +1967,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._progress_content = tk.Frame(self.progress_frame, bg=BG_COLOR)
         self._progress_content.pack(fill="both", expand=True)
         
-        main = self._make_centered_body(self._progress_content, max_width=1240)
+        main = self._make_scrollable_body(self._progress_content, max_width=1240)
 
         px = 0
 
@@ -1968,7 +2010,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             fg=WHITE,
         ).pack(expand=True)
 
-        main = self._make_centered_body(self.settings_frame, max_width=1160)
+        main = self._make_scrollable_body(self.settings_frame, max_width=1160)
 
         def _settings_icon(parent, kind):
             icon = tk.Canvas(parent, width=58, height=58, bg=WHITE, highlightthickness=0)
@@ -2136,13 +2178,14 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         wifi_inner = wifi_card.inner_frame
 
         self._wifi_status_var = tk.StringVar(value="Status: Unknown")
-        self._wifi_hint_var = tk.StringVar(value="Nearby internet connections will appear here after scan.")
+        self._wifi_hint_var = tk.StringVar(value="Scan for nearby Wi-Fi networks, then choose one to connect.")
         self._wifi_ssid_var = tk.StringVar()
         self._wifi_pwd_var = tk.StringVar()
         self._wifi_networks = []
         self._wifi_scan_busy = False
         self._wifi_connect_busy = False
         self._wifi_scan_silent = False
+        self._wifi_auto_scan_interval_ms = 15000
 
         wifi_header = tk.Frame(wifi_inner, bg=WHITE)
         wifi_header.pack(fill="x", pady=(0, 18))
@@ -2160,14 +2203,39 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         )
         self._wifi_status_label.pack(anchor="w", pady=(8, 0))
 
+        status_chip_row = tk.Frame(wifi_inner, bg=WHITE)
+        status_chip_row.pack(fill="x", pady=(0, 16))
+        self._wifi_hint_label = tk.Label(
+            status_chip_row,
+            textvariable=self._wifi_hint_var,
+            font=(FONT_FAMILY, 10),
+            fg=MID_TEXT,
+            bg="#F8FAFD",
+            padx=14,
+            pady=10,
+            anchor="w",
+            justify="left",
+        )
+        self._wifi_hint_label.pack(fill="x")
+
+        tk.Label(
+            wifi_inner,
+            text="Network",
+            font=(FONT_FAMILY, 11, "bold"),
+            fg=DARK_TEXT,
+            bg=WHITE,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 6))
+
         scan_row = tk.Frame(wifi_inner, bg=WHITE)
         scan_row.pack(fill="x", pady=(0, 12))
 
         self._wifi_combo = ttk.Combobox(
-            scan_row, textvariable=self._wifi_ssid_var, state="normal",
+            scan_row, textvariable=self._wifi_ssid_var, state="readonly",
             font=(FONT_FAMILY, 11), style="Figma.TCombobox"
         )
         self._wifi_combo.pack(side="left", fill="x", expand=True, ipady=7)
+        self._wifi_combo.bind("<<ComboboxSelected>>", self._on_wifi_network_selected)
 
         self._wifi_scan_btn = RoundedButton(
             scan_row, text="Scan", command=self._scan_wifi_networks,
@@ -2179,35 +2247,13 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
         tk.Label(
             wifi_inner,
-            textvariable=self._wifi_hint_var,
+            text="Choose a network from the scan results, then enter its password below.",
             font=(FONT_FAMILY, 10),
             fg=MID_TEXT,
             bg=WHITE,
             anchor="w",
             justify="left",
         ).pack(fill="x", pady=(0, 8))
-
-        networks_panel = tk.Frame(wifi_inner, bg=WHITE)
-        networks_panel.pack(fill="x", pady=(0, 12))
-
-        self._wifi_network_list = tk.Listbox(
-            networks_panel,
-            height=5,
-            font=(FONT_FAMILY, 10),
-            bg=INPUT_BG,
-            fg=DARK_TEXT,
-            bd=0,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=INPUT_BORDER,
-            highlightcolor=ACCENT_BLUE,
-            activestyle="none",
-            selectbackground="#DBEAFE",
-            selectforeground=DARK_TEXT,
-            exportselection=False,
-        )
-        self._wifi_network_list.pack(fill="x")
-        self._wifi_network_list.bind("<<ListboxSelect>>", self._on_wifi_network_selected)
 
         conn_row = tk.Frame(wifi_inner, bg=WHITE)
         conn_row.pack(fill="x")
@@ -2263,6 +2309,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._power_off_btn.pack(side="left")
 
         self.after(500, lambda: self._scan_wifi_networks(silent=True))
+        self.after(self._wifi_auto_scan_interval_ms, self._poll_wifi_networks)
         self.after(2000, self._poll_wifi_status)
 
     def _redraw_zone_card(self, event=None):
@@ -2715,33 +2762,26 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             self._wifi_status_label.config(fg=color)
 
     def _refresh_wifi_network_list(self):
-        if not hasattr(self, "_wifi_network_list") or not self._wifi_network_list.winfo_exists():
-            return
-
-        self._wifi_network_list.delete(0, "end")
         if self._wifi_networks:
-            for network in self._wifi_networks:
-                self._wifi_network_list.insert("end", network)
             self._wifi_hint_var.set(
-                f"Available internet connections in range: {len(self._wifi_networks)}"
+                f"{len(self._wifi_networks)} network(s) available nearby."
             )
         else:
-            self._wifi_hint_var.set("No nearby internet connections found yet. Tap Scan to refresh.")
+            self._wifi_hint_var.set("No nearby Wi-Fi networks found. Tap Scan to refresh.")
 
     def _on_wifi_network_selected(self, event=None):
-        if not hasattr(self, "_wifi_network_list") or not self._wifi_network_list.curselection():
-            return
-        index = self._wifi_network_list.curselection()[0]
-        if 0 <= index < len(self._wifi_networks):
-            self._wifi_ssid_var.set(self._wifi_networks[index])
+        selected = self._wifi_ssid_var.get().strip()
+        if selected:
+            self._wifi_hint_var.set(f"Selected network: {selected}")
 
     def _scan_wifi_networks(self, silent: bool = False):
         if self._wifi_scan_busy:
             return
         self._wifi_scan_busy = True
         self._wifi_scan_silent = silent
-        self._set_wifi_status("Status: Scanning...", PRIMARY_BLUE)
-        self._wifi_hint_var.set("Scanning for nearby internet connections...")
+        if not silent:
+            self._set_wifi_status("Status: Scanning...", PRIMARY_BLUE)
+        self._wifi_hint_var.set("Scanning for nearby Wi-Fi networks...")
         self._wifi_scan_btn.text = "Scanning..."
         threading.Thread(target=self._scan_wifi_networks_thread, daemon=True).start()
 
@@ -2792,7 +2832,8 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             self._wifi_networks = []
             self._wifi_combo["values"] = []
             self._refresh_wifi_network_list()
-            self._set_wifi_status(f"Status: Error - {error}", INVALID_TEXT)
+            if not silent:
+                self._set_wifi_status(f"Status: Error - {error}", INVALID_TEXT)
             if not silent:
                 messagebox.showerror("Wi-Fi Scan Failed", error)
             return
@@ -2802,10 +2843,17 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._refresh_wifi_network_list()
         if self._wifi_networks and not self._wifi_ssid_var.get():
             self._wifi_ssid_var.set(self._wifi_networks[0])
+        if silent:
+            return
         if self._wifi_networks:
             self._set_wifi_status(f"Status: Scan Complete ({len(self._wifi_networks)} found)", SUCCESS_TEXT)
         else:
             self._set_wifi_status("Status: No networks found", WARNING_TEXT)
+
+    def _poll_wifi_networks(self):
+        if not self._wifi_scan_busy and not self._wifi_connect_busy:
+            self._scan_wifi_networks(silent=True)
+        self.after(self._wifi_auto_scan_interval_ms, self._poll_wifi_networks)
 
     def _connect_to_wifi(self):
         if self._wifi_connect_busy:

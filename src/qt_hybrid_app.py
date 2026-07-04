@@ -218,6 +218,7 @@ class AppBridge(QObject):
         self._wifi_status_color = "#526176"
         self._wifi_networks = []
         self._wifi_busy = False
+        self._wifi_scan_silent = False
 
         self._overall_percentage = 0
         self._overall_fraction = "0/0"
@@ -243,6 +244,11 @@ class AppBridge(QObject):
         self._wifi_timer.timeout.connect(self.refreshWifiStatus)
         self._wifi_timer.start()
 
+        self._wifi_scan_timer = QTimer(self)
+        self._wifi_scan_timer.setInterval(15_000)
+        self._wifi_scan_timer.timeout.connect(self.refreshWifiNetworks)
+        self._wifi_scan_timer.start()
+
         self._auto_pull_timer = QTimer(self)
         self._auto_pull_timer.timeout.connect(self._run_auto_pull)
         self._reset_auto_pull_timer()
@@ -252,6 +258,7 @@ class AppBridge(QObject):
         self.update_stats()
         self._init_sync()
         self.refreshWifiStatus()
+        self.refreshWifiNetworks()
 
     # Properties
     @Property(int, notify=zoneRemainingCountChanged)
@@ -700,13 +707,14 @@ class AppBridge(QObject):
         self.wifiStatusChanged.emit()
         self.wifiStatusColorChanged.emit()
 
-    @Slot()
-    def scanWifiNetworks(self) -> None:
+    def _start_wifi_scan(self, silent: bool = False) -> None:
         if self._wifi_busy:
             return
+        self._wifi_scan_silent = silent
         self._set_wifi_busy(True, "Status: Scanning...")
-        self._wifi_status_color = "#2563EB"
-        self.wifiStatusColorChanged.emit()
+        if not silent:
+            self._wifi_status_color = "#2563EB"
+            self.wifiStatusColorChanged.emit()
 
         def _task() -> None:
             try:
@@ -747,16 +755,29 @@ class AppBridge(QObject):
 
         threading.Thread(target=_task, daemon=True).start()
 
+    @Slot()
+    def scanWifiNetworks(self) -> None:
+        self._start_wifi_scan(False)
+
+    @Slot()
+    def refreshWifiNetworks(self) -> None:
+        self._start_wifi_scan(True)
+
     def _finish_wifi_scan(self, networks: list, error: str) -> None:
         self._set_wifi_busy(False)
+        silent = self._wifi_scan_silent
+        self._wifi_scan_silent = False
         if error:
             self._wifi_networks = []
             self.wifiNetworksChanged.emit()
-            self._set_wifi_status(f"Status: Error - {error}", "#EF4444")
-            self.alertRequested.emit("Wi-Fi Scan Failed", error)
+            if not silent:
+                self._set_wifi_status(f"Status: Error - {error}", "#EF4444")
+                self.alertRequested.emit("Wi-Fi Scan Failed", error)
             return
         self._wifi_networks = list(networks)
         self.wifiNetworksChanged.emit()
+        if silent:
+            return
         if networks:
             self._set_wifi_status(f"Status: Scan Complete ({len(networks)} found)", "#10B981")
         else:

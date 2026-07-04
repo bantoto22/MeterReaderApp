@@ -56,7 +56,7 @@ pip install PySide6
 
 The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
 - Online mode: Supabase read/write.
-- Offline mode: local PostgreSQL cache + `sync_queue_meter_readings`.
+- Offline mode: local SQLite cache + `sync_queue_meter_readings`.
 - Reconnect: FIFO queue flush with conflict detection and audit logs.
 
 ### Environment
@@ -64,15 +64,15 @@ The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
 1. Copy `.env.example` to `.env`.
 2. Fill in:
    - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
-   - `LOCAL_PG_HOST`, `LOCAL_PG_PORT`, `LOCAL_PG_DB`, `LOCAL_PG_USER`, `LOCAL_PG_PASSWORD`
    - `MAIN_PG_HOST`, `MAIN_PG_PORT`, `MAIN_PG_DB`, `MAIN_PG_USER`, `MAIN_PG_PASSWORD`
 3. Enable sync by setting `HANDHELD_SYNC_ENABLED=1`.
 
 If sync is enabled and required env vars are missing, the sync layer raises a clear startup/config error.
 
-### Migration
+### Local Storage
 
-Apply `sql/migrations/001_handheld_sync.sql` to local PostgreSQL for queue/cache/audit tables.
+The handheld queue, sync audit log, and consumer cache are stored in the Pi's local SQLite database.
+`MAIN_PG_*` is only used as a remote LAN fallback source for consumer pulls when Supabase is unavailable.
 
 ### Handheld UI
 
