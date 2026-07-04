@@ -6,7 +6,6 @@ Redesigned to fit tightly on a 480x660 screen with a single card group.
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import ttkbootstrap as tb
 import threading
 import time
 import math
@@ -18,6 +17,11 @@ import socket
 import subprocess
 from datetime import datetime, timezone
 from PIL import Image, ImageTk
+
+try:
+    import ttkbootstrap as tb
+except ImportError:
+    tb = None
 try:
     from .database import (
         init_db,
@@ -776,9 +780,12 @@ class ModernTabButton(tk.Frame):
 
 
 # --- Main Application --------------------------------------------------------
-class MeterReaderApp(tb.Window):
+class MeterReaderApp(tb.Window if tb else tk.Tk):
     def __init__(self):
-        super().__init__(themename="cosmo")
+        if tb:
+            super().__init__(themename="cosmo")
+        else:
+            super().__init__()
         self.update_idletasks()
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
