@@ -2,3 +2,4 @@ PySide6
 Pillow
 psycopg2-binary
 python-dotenv
+ttkbootstrap

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 
 Rectangle {
     id: loginRoot
@@ -107,6 +108,15 @@ Rectangle {
                     color: "#FFFFFF"
                     border.color: "#E2E8F0"
                     border.width: 1
+
+                    layer.enabled: true
+                    layer.effect: MultiEffect {
+                        shadowEnabled: true
+                        shadowBlur: 0.8
+                        shadowHorizontalOffset: 0
+                        shadowVerticalOffset: 4
+                        shadowColor: "#15000000"
+                    }
 
                     property int formCardPadding: loginRoot.narrowScreen ? 16 : 24
 

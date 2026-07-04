@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 
 Rectangle {
     id: progressRoot
@@ -116,6 +117,16 @@ Rectangle {
                         border.color: "#1F4FC4"
                         border.width: 1
                         clip: true
+                        
+                        layer.enabled: true
+                        layer.effect: MultiEffect {
+                            shadowEnabled: true
+                            shadowBlur: 0.8
+                            shadowHorizontalOffset: 0
+                            shadowVerticalOffset: 4
+                            shadowColor: "#20000000"
+                        }
+
                         scale: progressCardMouse.pressed ? 0.985 : 1.0
                         transformOrigin: Item.Center
                         Behavior on scale { NumberAnimation { duration: 90 } }
@@ -136,7 +147,6 @@ Rectangle {
                                 visible: false
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 0
-
                                 ColumnLayout {
                                     anchors.fill: parent
                                     anchors.margins: 20
