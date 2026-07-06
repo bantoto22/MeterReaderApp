@@ -22,6 +22,8 @@ import time
 import uuid
 from urllib import error, parse, request
 
+sqlite3.register_adapter(Decimal, float)
+
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -332,6 +334,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             return float(value)
         return value
 
+    @classmethod
+    def _sqlite_safe_row(cls, item: dict) -> dict:
+        return {key: cls._sqlite_safe(value) for key, value in item.items()}
+
     def _ensure_columns(self, conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
         for name, definition in column_defs.items():
@@ -457,29 +463,30 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         """
         with self._connect() as conn:
             for item in consumers:
+                row = self._sqlite_safe_row(item)
                 conn.execute(
                     sql,
                     (
-                        self._sqlite_safe(item.get("id")),
-                        self._sqlite_safe(item.get("meter_no")),
-                        self._sqlite_safe(item.get("acct_no")),
-                        self._sqlite_safe(item.get("name", "")),
-                        self._sqlite_safe(item.get("zone_name")),
-                        self._sqlite_safe(item.get("classification_id")),
-                        self._sqlite_safe(item.get("classification_name")),
-                        self._sqlite_safe(item.get("minimum_cubic")),
-                        self._sqlite_safe(item.get("minimum_rate")),
-                        self._sqlite_safe(item.get("excess_rate_per_cubic")),
-                        self._sqlite_safe(item.get("due_days")),
-                        self._sqlite_safe(item.get("penalty_percent")),
-                        self._sqlite_safe(item.get("amount_due")),
-                        self._sqlite_safe(item.get("due_date")),
-                        self._sqlite_safe(item.get("penalty")),
-                        self._sqlite_safe(item.get("previous_penalty")),
-                        self._sqlite_safe(item.get("total_after_due_date")),
-                        self._sqlite_safe(item.get("bill_status")),
-                        self._sqlite_safe(item.get("late_fee")),
-                        self._sqlite_safe(item.get("previous_reading")),
+                        row.get("id"),
+                        row.get("meter_no"),
+                        row.get("acct_no"),
+                        row.get("name", ""),
+                        row.get("zone_name"),
+                        row.get("classification_id"),
+                        row.get("classification_name"),
+                        row.get("minimum_cubic"),
+                        row.get("minimum_rate"),
+                        row.get("excess_rate_per_cubic"),
+                        row.get("due_days"),
+                        row.get("penalty_percent"),
+                        row.get("amount_due"),
+                        row.get("due_date"),
+                        row.get("penalty"),
+                        row.get("previous_penalty"),
+                        row.get("total_after_due_date"),
+                        row.get("bill_status"),
+                        row.get("late_fee"),
+                        row.get("previous_reading"),
                     ),
                 )
             conn.commit()
