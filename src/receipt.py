@@ -11,35 +11,87 @@ import tkinter as tk
 
 FONT_FAMILY = "Montserrat"
 
-DEFAULT_MINIMUM_CUBIC = 0
-DEFAULT_MINIMUM_RATE = 50.00
-DEFAULT_EXCESS_RATE = 7.50
-DEFAULT_PENALTY_PERCENT = 10.0
-DEFAULT_DUE_DAYS = 11
-
-
-def _to_float(value, default: float) -> float:
+def _require_float(consumer: dict, field_name: str) -> float:
+    value = consumer.get(field_name)
+    if value is None or value == "":
+        raise ValueError(f"Missing synced billing field: {field_name}")
     try:
-        if value is None or value == "":
-            return default
         return float(value)
-    except (TypeError, ValueError):
-        return default
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid synced billing field: {field_name}") from exc
 
 
-def _to_int(value, default: int) -> int:
+def _require_int(consumer: dict, field_name: str) -> int:
+    value = consumer.get(field_name)
+    if value is None or value == "":
+        raise ValueError(f"Missing synced billing field: {field_name}")
     try:
-        if value is None or value == "":
-            return default
         return int(float(value))
-    except (TypeError, ValueError):
-        return default
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid synced billing field: {field_name}") from exc
+
+
+def _require_billing_profile(consumer: dict) -> None:
+    if not consumer.get("classification_id"):
+        raise ValueError("Billing data is not synced for this consumer yet. Sync from PostgreSQL/Supabase before printing.")
+    if not (consumer.get("classification_name") or "").strip():
+        raise ValueError("Billing data is not synced for this consumer yet. Sync from PostgreSQL/Supabase before printing.")
+    for field_name in (
+        "minimum_cubic",
+        "minimum_rate",
+        "excess_rate_per_cubic",
+        "due_days",
+    ):
+        if consumer.get(field_name) is None or consumer.get(field_name) == "":
+            raise ValueError(f"Billing data is incomplete for this consumer. Missing synced field: {field_name}")
+
+
+def _parse_date(value: str) -> datetime.date:
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("Billing data is incomplete for this consumer. Missing synced field: due_date")
+    raw = raw.split("T", 1)[0].split(" ", 1)[0]
+    try:
+        return datetime.date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("Billing data has an invalid due_date value.") from exc
+
+
+def _calculate_penalty(
+    consumer: dict,
+    amount_due: float,
+    due_date: datetime.date,
+    reference_date: datetime.date,
+) -> tuple[float, float, str, str]:
+    existing_penalty = max(0.0, float(consumer.get("penalty") or 0.0))
+    late_fee = consumer.get("late_fee")
+    late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
+    bill_status = str(consumer.get("bill_status") or "Unpaid").strip()
+    is_overdue = bill_status.lower() != "paid" and reference_date > due_date
+
+    if is_overdue:
+        computed_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
+        if computed_penalty > existing_penalty:
+            applied_penalty = computed_penalty
+            penalty_source = "computed overdue penalty"
+        elif existing_penalty > computed_penalty:
+            applied_penalty = existing_penalty
+            penalty_source = "stored database penalty"
+        else:
+            applied_penalty = existing_penalty
+            penalty_source = "higher value between both"
+    else:
+        applied_penalty = existing_penalty
+        penalty_source = "stored database penalty" if existing_penalty > 0 else "computed overdue penalty"
+
+    total_after_due_date = round(amount_due + applied_penalty, 2)
+    return applied_penalty, total_after_due_date, penalty_source, bill_status
 
 
 def _compute_bill(consumption: int, consumer: dict) -> tuple[float, int, float, float]:
-    minimum_cubic = _to_int(consumer.get("minimum_cubic"), DEFAULT_MINIMUM_CUBIC)
-    minimum_rate = _to_float(consumer.get("minimum_rate"), DEFAULT_MINIMUM_RATE)
-    excess_rate = _to_float(consumer.get("excess_rate_per_cubic"), DEFAULT_EXCESS_RATE)
+    minimum_cubic = _require_int(consumer, "minimum_cubic")
+    minimum_rate = _require_float(consumer, "minimum_rate")
+    excess_rate = _require_float(consumer, "excess_rate_per_cubic")
     safe_consumption = max(consumption, 0)
     if safe_consumption <= minimum_cubic:
         current_bill = minimum_rate
@@ -55,20 +107,21 @@ def build_receipt_text(
     exception: str,
     reader_name: str = "Field Reader",
 ) -> str:
+    _require_billing_profile(consumer)
     consumption = present - previous
     current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
-    prev_balance = 0.00
-    penalty_percent = _to_float(consumer.get("penalty_percent"), DEFAULT_PENALTY_PERCENT)
-    due_days = _to_int(consumer.get("due_days"), DEFAULT_DUE_DAYS)
-    penalty_rate = penalty_percent / 100.0
-    penalty = round(current_bill * penalty_rate, 2)
-    total_amount = round(current_bill + prev_balance + penalty, 2)
-    after_due = round(total_amount + (total_amount * penalty_rate), 2)
 
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%I:%M %p")
-    due_date = (now + datetime.timedelta(days=due_days)).strftime("%Y-%m-%d")
+    due_days = _require_int(consumer, "due_days")
+    amount_due = float(consumer.get("amount_due") or current_bill)
+    due_date_value = consumer.get("due_date")
+    due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (now.date() + datetime.timedelta(days=due_days))
+    due_date = due_date_obj.isoformat()
+    penalty, after_due, penalty_source, bill_status = _calculate_penalty(consumer, amount_due, due_date_obj, now.date())
+    late_fee = consumer.get("late_fee")
+    late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
 
     divider = "--------------------------------"
     border = "================================"
@@ -87,6 +140,7 @@ def build_receipt_text(
         f" Prev Read  : {previous}",
         f" Curr Read  : {present}",
         f" Consumption: {consumption} m3",
+        f" Bill Status: {bill_status}",
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
@@ -98,10 +152,11 @@ def build_receipt_text(
         f" Min Rate   : PHP {minimum_rate:>8.2f}",
         f" Excess Rate: PHP {excess_rate:>8.2f}",
         f" Current Bill: PHP {current_bill:>8.2f}",
-        f" Prev Balance: PHP {prev_balance:>8.2f}",
-        f" Penalty {penalty_percent:>4.0f}%: PHP {penalty:>8.2f}",
+        f" Late Fee   : {late_fee_percent:>8.2f}%",
+        f" Penalty     : PHP {penalty:>8.2f}",
+        f" Penalty Src : {penalty_source}",
         border,
-        f" TOTAL AMOUNT: PHP {total_amount:>8.2f}",
+        f" TOTAL AMOUNT: PHP {amount_due:>8.2f}",
         f" After Due   : PHP {after_due:>8.2f}",
         f" Due Date    : {due_date}",
         divider,

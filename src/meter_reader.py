@@ -3482,8 +3482,26 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             return
         if not self._sync_dal:
             return
+        consumer = self._current_consumer or {}
         payload = {
             "consumer_id": consumer_id,
+            "acct_no": consumer.get("acct_no"),
+            "meter_no": consumer.get("meter_no"),
+            "zone_name": consumer.get("zone_name"),
+            "classification_id": consumer.get("classification_id"),
+            "classification_name": consumer.get("classification_name"),
+            "minimum_cubic": consumer.get("minimum_cubic"),
+            "minimum_rate": consumer.get("minimum_rate"),
+            "excess_rate_per_cubic": consumer.get("excess_rate_per_cubic"),
+            "due_days": consumer.get("due_days"),
+            "late_fee": consumer.get("late_fee"),
+            "amount_due": consumer.get("amount_due"),
+            "due_date": consumer.get("due_date"),
+            "penalty": consumer.get("penalty"),
+            "previous_penalty": consumer.get("previous_penalty"),
+            "total_after_due_date": consumer.get("total_after_due_date"),
+            "bill_status": consumer.get("bill_status"),
+            "previous_reading": consumer.get("previous_reading"),
             "present_reading": present,
             "consumption": consumption,
             "exception": exception,

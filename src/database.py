@@ -49,11 +49,18 @@ def init_db():
             previous_reading INTEGER NOT NULL DEFAULT 0,
             classification_id INTEGER,
             classification_name TEXT,
-            minimum_cubic INTEGER DEFAULT 0,
-            minimum_rate REAL DEFAULT 50.0,
-            excess_rate_per_cubic REAL DEFAULT 7.5,
-            due_days INTEGER DEFAULT 11,
-            penalty_percent REAL DEFAULT 10.0,
+            minimum_cubic INTEGER,
+            minimum_rate REAL,
+            excess_rate_per_cubic REAL,
+            due_days INTEGER,
+            penalty_percent REAL,
+            amount_due REAL,
+            due_date TEXT,
+            penalty REAL,
+            previous_penalty REAL,
+            total_after_due_date REAL,
+            bill_status TEXT,
+            late_fee REAL,
             zone_id          INTEGER NOT NULL,
             FOREIGN KEY (zone_id) REFERENCES zones(id)
         );
@@ -104,11 +111,18 @@ def init_db():
         {
             "classification_id": "INTEGER",
             "classification_name": "TEXT",
-            "minimum_cubic": "INTEGER DEFAULT 0",
-            "minimum_rate": "REAL DEFAULT 50.0",
-            "excess_rate_per_cubic": "REAL DEFAULT 7.5",
-            "due_days": "INTEGER DEFAULT 11",
-            "penalty_percent": "REAL DEFAULT 10.0",
+            "minimum_cubic": "INTEGER",
+            "minimum_rate": "REAL",
+            "excess_rate_per_cubic": "REAL",
+            "due_days": "INTEGER",
+            "penalty_percent": "REAL",
+            "amount_due": "REAL",
+            "due_date": "TEXT",
+            "penalty": "REAL",
+            "previous_penalty": "REAL",
+            "total_after_due_date": "REAL",
+            "bill_status": "TEXT",
+            "late_fee": "REAL",
         },
     )
 
@@ -224,6 +238,8 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -235,6 +251,8 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -255,6 +273,8 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -269,6 +289,8 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -439,6 +461,13 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             c.excess_rate_per_cubic,
             c.due_days,
             c.penalty_percent,
+            c.amount_due,
+            c.due_date,
+            c.penalty,
+            c.previous_penalty,
+            c.total_after_due_date,
+            c.bill_status,
+            c.late_fee,
             CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
             r.present_reading as reading_value,
             r.consumption,
@@ -473,6 +502,16 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     conn = get_connection()
     cur = conn.cursor()
 
+    def _optional_int(value):
+        if value is None or value == "":
+            return None
+        return int(float(value))
+
+    def _optional_float(value):
+        if value is None or value == "":
+            return None
+        return float(value)
+
     zone_names = sorted({(c.get("zone_name") or "Unassigned").strip() for c in consumers if c.get("meter_no")})
     for zone_name in zone_names:
         cur.execute("INSERT OR IGNORE INTO zones (name) VALUES (?)", (zone_name,))
@@ -495,11 +534,18 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         previous_reading = int(c.get("previous_reading") or 0)
         classification_id = c.get("classification_id")
         classification_name = (c.get("classification_name") or "").strip() or None
-        minimum_cubic = int(c.get("minimum_cubic") or 0)
-        minimum_rate = float(c.get("minimum_rate") or 50.0)
-        excess_rate_per_cubic = float(c.get("excess_rate_per_cubic") or 7.5)
-        due_days = int(c.get("due_days") or 11)
-        penalty_percent = float(c.get("penalty_percent") or 10.0)
+        minimum_cubic = _optional_int(c.get("minimum_cubic"))
+        minimum_rate = _optional_float(c.get("minimum_rate"))
+        excess_rate_per_cubic = _optional_float(c.get("excess_rate_per_cubic"))
+        due_days = _optional_int(c.get("due_days"))
+        penalty_percent = _optional_float(c.get("penalty_percent"))
+        amount_due = _optional_float(c.get("amount_due"))
+        due_date = (str(c.get("due_date")).strip() if c.get("due_date") not in (None, "") else None)
+        penalty = _optional_float(c.get("penalty"))
+        previous_penalty = _optional_float(c.get("previous_penalty"))
+        total_after_due_date = _optional_float(c.get("total_after_due_date"))
+        bill_status = (str(c.get("bill_status")).strip() if c.get("bill_status") not in (None, "") else None)
+        late_fee = _optional_float(c.get("late_fee"))
         cid = c.get("id")
 
         if cid is not None:
@@ -508,9 +554,10 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 INSERT INTO consumers (
                     id, meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, zone_id
+                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
@@ -523,12 +570,20 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
+                    amount_due = excluded.amount_due,
+                    due_date = excluded.due_date,
+                    penalty = excluded.penalty,
+                    previous_penalty = excluded.previous_penalty,
+                    total_after_due_date = excluded.total_after_due_date,
+                    bill_status = excluded.bill_status,
+                    late_fee = excluded.late_fee,
                     zone_id = excluded.zone_id
                 """,
                 (
                     int(cid), meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, zone_id,
+                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
         else:
@@ -537,9 +592,10 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 INSERT INTO consumers (
                     meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, zone_id
+                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = excluded.name,
@@ -551,12 +607,20 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
+                    amount_due = excluded.amount_due,
+                    due_date = excluded.due_date,
+                    penalty = excluded.penalty,
+                    previous_penalty = excluded.previous_penalty,
+                    total_after_due_date = excluded.total_after_due_date,
+                    bill_status = excluded.bill_status,
+                    late_fee = excluded.late_fee,
                     zone_id = excluded.zone_id
                 """,
                 (
                     meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, zone_id,
+                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
         upserted += 1

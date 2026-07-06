@@ -12,7 +12,8 @@ Offline:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import json
 import os
 import sqlite3
@@ -46,6 +47,176 @@ def _load_env_fallback(env_path: str) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_date(value) -> date | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        pass
+    raw = raw.split("T", 1)[0].split(" ", 1)[0]
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _parse_datetime(value) -> datetime | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        d = _parse_date(raw)
+        return datetime.combine(d, datetime.min.time()) if d else None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _reading_date(value) -> date:
+    parsed = _parse_date(value)
+    return parsed or datetime.now().date()
+
+
+def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_per_cubic) -> float:
+    safe_consumption = max(consumption, 0)
+    minimum_cubic_int = _safe_int(minimum_cubic)
+    minimum_rate_val = _safe_float(minimum_rate)
+    excess_rate_val = _safe_float(excess_rate_per_cubic)
+    if safe_consumption <= minimum_cubic_int:
+        return round(minimum_rate_val, 2)
+    return round(minimum_rate_val + ((safe_consumption - minimum_cubic_int) * excess_rate_val), 2)
+
+
+def _calculate_visible_penalty(
+    amount_due,
+    due_date_value,
+    bill_status,
+    existing_penalty,
+    late_fee,
+    reference_date: date,
+) -> tuple[float, float]:
+    amount_due_val = max(0.0, _safe_float(amount_due))
+    stored_penalty = max(0.0, _safe_float(existing_penalty))
+    late_fee_percent = _safe_float(late_fee, 10.0) or 10.0
+    due_date_obj = _parse_date(due_date_value)
+    status_text = str(bill_status or "Unpaid").strip().lower()
+    is_overdue = status_text != "paid" and due_date_obj is not None and reference_date > due_date_obj
+    if is_overdue:
+        computed_penalty = round(amount_due_val * (late_fee_percent / 100.0), 2)
+        applied_penalty = max(stored_penalty, computed_penalty)
+    else:
+        applied_penalty = stored_penalty
+    total_after_due_date = round(amount_due_val + applied_penalty, 2)
+    return applied_penalty, total_after_due_date
+
+
+def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) -> dict:
+    reference_date = _reading_date(reading.get("reading_date"))
+    present_reading = _safe_int(reading.get("present_reading"))
+    consumption = _safe_int(reading.get("consumption"))
+    previous_reading = _safe_int(reading.get("previous_reading"), present_reading - consumption)
+    current_charge = _compute_charge(
+        consumption,
+        context.get("minimum_cubic"),
+        context.get("minimum_rate"),
+        context.get("excess_rate_per_cubic"),
+    )
+
+    latest_bill_sync_id = str(context.get("bill_sync_id") or "").strip()
+    current_sync_id = str(reading.get("reading_id") or "").strip()
+    same_bill = latest_bill_sync_id and current_sync_id and latest_bill_sync_id == current_sync_id
+
+    due_days = _safe_int(context.get("due_days"), 15) or 15
+    previous_penalty, previous_total_after_due = _calculate_visible_penalty(
+        context.get("amount_due"),
+        context.get("due_date"),
+        context.get("bill_status"),
+        context.get("penalty"),
+        context.get("late_fee"),
+        reference_date,
+    )
+
+    latest_bill_status = str(context.get("bill_status") or "").strip().lower()
+    latest_bill_total = max(_safe_float(context.get("total_after_due_date")), previous_total_after_due)
+    carried_balance = 0.0
+    carried_penalty = 0.0
+    if same_bill:
+        carried_balance = _safe_float(context.get("previous_balance"))
+        carried_penalty = _safe_float(context.get("previous_penalty"))
+    elif latest_bill_status and latest_bill_status != "paid":
+        carried_balance = latest_bill_total
+        carried_penalty = previous_penalty
+
+    bill_date = datetime.combine(reference_date, datetime.min.time())
+    due_date = datetime.combine(reference_date + timedelta(days=due_days), datetime.min.time())
+    amount_due = round(current_charge + carried_balance, 2)
+    total_amount = amount_due
+    total_after_due_date = amount_due
+    reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())
+
+    existing_setting_id = context.get("setting_id")
+    setting_id = None if existing_setting_id in (None, "") else _safe_int(existing_setting_id)
+
+    return {
+        "sync_id": reading_sync_id,
+        "consumer_id": _safe_int(reading.get("consumer_id")),
+        "reading_id": int(remote_reading_id),
+        "billing_officer_id": None,
+        "billing_month": bill_date.strftime("%B %Y"),
+        "date_covered_from": bill_date.isoformat(sep=" "),
+        "date_covered_to": bill_date.isoformat(sep=" "),
+        "bill_date": bill_date.isoformat(sep=" "),
+        "due_date": due_date.isoformat(sep=" "),
+        "disconnection_date": None,
+        "class_cost": round(current_charge, 2),
+        "water_charge": round(current_charge, 2),
+        "meter_maintenance_fee": 0.0,
+        "connection_fee": 0.0,
+        "amount_due": amount_due,
+        "previous_balance": round(carried_balance, 2),
+        "previous_penalty": round(carried_penalty, 2),
+        "penalty": 0.0,
+        "total_amount": total_amount,
+        "total_after_due_date": total_after_due_date,
+        "status": "Unpaid",
+        "setting_id": setting_id,
+        "source_site_id": "meter-reader-device",
+        "sync_status": "synced",
+        "last_synced_at": datetime.now().replace(tzinfo=None).isoformat(sep=" "),
+        "created_by_device": "meter-reader-device",
+        "updated_by_device": "meter-reader-device",
+        "deleted_at": None,
+    }
 
 
 @dataclass
@@ -155,6 +326,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 data[key] = {} if key == "server_payload" else data[key]
         return data
 
+    @staticmethod
+    def _sqlite_safe(value):
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
     def _ensure_columns(self, conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
         for name, definition in column_defs.items():
@@ -209,6 +386,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             excess_rate_per_cubic REAL,
             due_days INTEGER,
             penalty_percent REAL,
+            amount_due REAL,
+            due_date TEXT,
+            penalty REAL,
+            previous_penalty REAL,
+            total_after_due_date REAL,
+            bill_status TEXT,
+            late_fee REAL,
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -226,6 +410,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "excess_rate_per_cubic": "REAL",
                     "due_days": "INTEGER",
                     "penalty_percent": "REAL",
+                    "amount_due": "REAL",
+                    "due_date": "TEXT",
+                    "penalty": "REAL",
+                    "previous_penalty": "REAL",
+                    "total_after_due_date": "REAL",
+                    "bill_status": "TEXT",
+                    "late_fee": "REAL",
                 },
             )
             conn.commit()
@@ -237,9 +428,11 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         INSERT INTO handheld_consumers_cache (
             id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
             minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+            amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+            bill_status, late_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
@@ -252,6 +445,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             excess_rate_per_cubic = excluded.excess_rate_per_cubic,
             due_days = excluded.due_days,
             penalty_percent = excluded.penalty_percent,
+            amount_due = excluded.amount_due,
+            due_date = excluded.due_date,
+            penalty = excluded.penalty,
+            previous_penalty = excluded.previous_penalty,
+            total_after_due_date = excluded.total_after_due_date,
+            bill_status = excluded.bill_status,
+            late_fee = excluded.late_fee,
             previous_reading = excluded.previous_reading,
             updated_at = CURRENT_TIMESTAMP
         """
@@ -260,19 +460,26 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 conn.execute(
                     sql,
                     (
-                        item.get("id"),
-                        item.get("meter_no"),
-                        item.get("acct_no"),
-                        item.get("name", ""),
-                        item.get("zone_name"),
-                        item.get("classification_id"),
-                        item.get("classification_name"),
-                        item.get("minimum_cubic"),
-                        item.get("minimum_rate"),
-                        item.get("excess_rate_per_cubic"),
-                        item.get("due_days"),
-                        item.get("penalty_percent"),
-                        item.get("previous_reading"),
+                        self._sqlite_safe(item.get("id")),
+                        self._sqlite_safe(item.get("meter_no")),
+                        self._sqlite_safe(item.get("acct_no")),
+                        self._sqlite_safe(item.get("name", "")),
+                        self._sqlite_safe(item.get("zone_name")),
+                        self._sqlite_safe(item.get("classification_id")),
+                        self._sqlite_safe(item.get("classification_name")),
+                        self._sqlite_safe(item.get("minimum_cubic")),
+                        self._sqlite_safe(item.get("minimum_rate")),
+                        self._sqlite_safe(item.get("excess_rate_per_cubic")),
+                        self._sqlite_safe(item.get("due_days")),
+                        self._sqlite_safe(item.get("penalty_percent")),
+                        self._sqlite_safe(item.get("amount_due")),
+                        self._sqlite_safe(item.get("due_date")),
+                        self._sqlite_safe(item.get("penalty")),
+                        self._sqlite_safe(item.get("previous_penalty")),
+                        self._sqlite_safe(item.get("total_after_due_date")),
+                        self._sqlite_safe(item.get("bill_status")),
+                        self._sqlite_safe(item.get("late_fee")),
+                        self._sqlite_safe(item.get("previous_reading")),
                     ),
                 )
             conn.commit()
@@ -281,6 +488,8 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         base = """
         SELECT id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
                minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+               amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+               bill_status, late_fee,
                previous_reading
         FROM handheld_consumers_cache
         """
@@ -402,7 +611,7 @@ class SupabaseRestClient:
         self._anon_key = cfg.supabase_anon_key
         self._service_key = cfg.supabase_service_role_key
         self._schema = cfg.supabase_db_schema or "public"
-        self._meterreadings_columns: set[str] | None = None
+        self._table_columns_cache: dict[str, set[str]] = {}
 
     def _req(self, method: str, table_or_path: str, *, query: dict | None = None, payload: dict | list | None = None,
              use_service_key: bool = False, extra_headers: dict | None = None) -> tuple[int, object]:
@@ -440,11 +649,23 @@ class SupabaseRestClient:
         status, _ = self._req("GET", "/rest/v1/", use_service_key=False)
         return 200 <= status < 500 and status != 0
 
+    def _load_latest_admin_settings(self) -> dict:
+        status, data = self._req(
+            "GET",
+            "admin_settings",
+            query={"select": "late_fee", "limit": "1"},
+            use_service_key=True,
+        )
+        if status >= 400 or not isinstance(data, list) or not data:
+            return {}
+        row = data[0]
+        return row if isinstance(row, dict) else {}
+
     def _load_latest_billing_settings(self) -> dict:
         status, data = self._req(
             "GET",
             "billing_settings",
-            query={"select": "setting_id,due_days,penalty_percent", "order": "setting_id.desc", "limit": "1"},
+            query={"select": "due_days", "order": "setting_id.desc", "limit": "1"},
             use_service_key=True,
         )
         if status >= 400 or not isinstance(data, list) or not data:
@@ -474,6 +695,33 @@ class SupabaseRestClient:
                 continue
         return rates
 
+    def _load_latest_bills_by_consumer(self) -> dict[int, dict]:
+        status, data = self._req(
+            "GET",
+            "bills",
+            query={
+                "select": "bill_id,consumer_id,reading_id,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
+                "order": "bill_id.desc",
+            },
+            use_service_key=True,
+        )
+        if status >= 400 or not isinstance(data, list):
+            return {}
+        bills: dict[int, dict] = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            consumer_id = row.get("consumer_id")
+            if consumer_id is None:
+                continue
+            try:
+                key = int(consumer_id)
+            except (TypeError, ValueError):
+                continue
+            if key not in bills:
+                bills[key] = row
+        return bills
+
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         # Use service key so handheld can fetch assignments even when anon/RLS policy is restrictive.
         # Primary target schema provided by user:
@@ -500,8 +748,10 @@ class SupabaseRestClient:
             raise RuntimeError(f"Supabase read failed: {data}")
         if not isinstance(data, list):
             return []
-        latest_settings = self._load_latest_billing_settings()
+        admin_settings = self._load_latest_admin_settings()
+        billing_settings = self._load_latest_billing_settings()
         rates_by_classification = self._load_waterrates_by_classification()
+        bills_by_consumer = self._load_latest_bills_by_consumer()
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
@@ -529,6 +779,10 @@ class SupabaseRestClient:
                 rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else None
             except (TypeError, ValueError):
                 rate_row = None
+            try:
+                bill_row = bills_by_consumer.get(int(cid)) if cid is not None else None
+            except (TypeError, ValueError):
+                bill_row = None
             prev = (
                 row.get("previous_reading")
                 if row.get("previous_reading") is not None
@@ -546,20 +800,27 @@ class SupabaseRestClient:
                     "minimum_cubic": (rate_row or {}).get("minimum_cubic"),
                     "minimum_rate": (rate_row or {}).get("minimum_rate"),
                     "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
-                    "due_days": latest_settings.get("due_days"),
-                    "penalty_percent": latest_settings.get("penalty_percent"),
+                    "due_days": billing_settings.get("due_days"),
+                    "amount_due": (bill_row or {}).get("amount_due"),
+                    "due_date": (bill_row or {}).get("due_date"),
+                    "penalty": (bill_row or {}).get("penalty"),
+                    "previous_penalty": (bill_row or {}).get("previous_penalty"),
+                    "total_after_due_date": (bill_row or {}).get("total_after_due_date"),
+                    "bill_status": (bill_row or {}).get("status"),
+                    "late_fee": admin_settings.get("late_fee"),
                     "previous_reading": prev if prev is not None else 0,
                 }
             )
         return normalized
 
-    def _get_meterreadings_columns(self) -> set[str]:
-        if self._meterreadings_columns is not None:
-            return self._meterreadings_columns
+    def _get_table_columns(self, table_name: str) -> set[str]:
+        cached = self._table_columns_cache.get(table_name)
+        if cached is not None:
+            return cached
         status, data = self._req("GET", "/rest/v1/", use_service_key=True)
         cols: set[str] = set()
         if status == 200 and isinstance(data, dict):
-            path_obj = data.get("paths", {}).get("/meterreadings", {})
+            path_obj = data.get("paths", {}).get(f"/{table_name}", {})
             # Try to collect insert-able/readable params from OpenAPI shape.
             for method in ("post", "patch", "get"):
                 m = path_obj.get(method, {})
@@ -570,10 +831,10 @@ class SupabaseRestClient:
                         cols.update(props.keys())
         # Fallback: probe one row and use keys from response.
         if not cols:
-            st2, d2 = self._req("GET", "meterreadings", query={"select": "*", "limit": "1"}, use_service_key=True)
+            st2, d2 = self._req("GET", table_name, query={"select": "*", "limit": "1"}, use_service_key=True)
             if st2 < 400 and isinstance(d2, list) and d2 and isinstance(d2[0], dict):
                 cols.update(d2[0].keys())
-        self._meterreadings_columns = cols
+        self._table_columns_cache[table_name] = cols
         return cols
 
     def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
@@ -592,18 +853,58 @@ class SupabaseRestClient:
         return None
 
     def get_consumer_context(self, consumer_id: int) -> dict:
-        # Prefer a broad select to avoid hard-failing when some expected columns
-        # (for example route_id) do not exist in a given deployment.
         query = {
-            "select": "*",
-            "id": f"eq.{consumer_id}",
+            "select": "consumer_id,account_number,meter_number,classification_id,previous_reading,last_reading,status,zone:zone_id(zone_name),classification:classification_id(classification_name)",
+            "consumer_id": f"eq.{consumer_id}",
             "limit": "1",
         }
         status, data = self._req("GET", "consumer", query=query, use_service_key=True)
-        if status >= 400 or not isinstance(data, list) or not data:
+        if status >= 400 or not isinstance(data, list) or not data or not isinstance(data[0], dict):
             return {}
-        row = data[0]
-        return row if isinstance(row, dict) else {}
+        consumer_row = data[0]
+        classification_id = consumer_row.get("classification_id")
+        rates_by_classification = self._load_waterrates_by_classification()
+        admin_settings = self._load_latest_admin_settings()
+        billing_settings = self._load_latest_billing_settings()
+        bills_by_consumer = self._load_latest_bills_by_consumer()
+        meter_status, meter_data = self._req(
+            "GET",
+            "meter",
+            query={"select": "meter_id,meter_serial_number,consumer_id", "consumer_id": f"eq.{consumer_id}", "limit": "1"},
+            use_service_key=True,
+        )
+        meter_row = meter_data[0] if meter_status < 400 and isinstance(meter_data, list) and meter_data and isinstance(meter_data[0], dict) else {}
+        latest_bill = bills_by_consumer.get(int(consumer_id), {})
+        try:
+            rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else {}
+        except (TypeError, ValueError):
+            rate_row = {}
+        zone_obj = consumer_row.get("zone")
+        classification_obj = consumer_row.get("classification")
+        return {
+            "consumer_id": consumer_id,
+            "acct_no": consumer_row.get("account_number"),
+            "meter_no": consumer_row.get("meter_number") or meter_row.get("meter_serial_number"),
+            "zone_name": zone_obj.get("zone_name") if isinstance(zone_obj, dict) else None,
+            "classification_id": classification_id,
+            "classification_name": classification_obj.get("classification_name") if isinstance(classification_obj, dict) else None,
+            "minimum_cubic": rate_row.get("minimum_cubic"),
+            "minimum_rate": rate_row.get("minimum_rate"),
+            "excess_rate_per_cubic": rate_row.get("excess_rate_per_cubic"),
+            "due_days": billing_settings.get("due_days"),
+            "late_fee": admin_settings.get("late_fee"),
+            "previous_reading": consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading"),
+            "amount_due": latest_bill.get("amount_due"),
+            "due_date": latest_bill.get("due_date"),
+            "penalty": latest_bill.get("penalty"),
+            "previous_penalty": latest_bill.get("previous_penalty"),
+            "previous_balance": latest_bill.get("previous_balance"),
+            "total_after_due_date": latest_bill.get("total_after_due_date"),
+            "bill_status": latest_bill.get("status"),
+            "bill_sync_id": latest_bill.get("sync_id"),
+            "bill_reading_id": latest_bill.get("reading_id"),
+            "meter_id": meter_row.get("meter_id"),
+        }
 
     def _build_remote_payload(self, payload: dict) -> dict:
         rid = payload.get("reading_id")
@@ -619,11 +920,19 @@ class SupabaseRestClient:
             "reading_id": rid_int,
             "consumer_id": payload.get("consumer_id"),
             # Remote schema uses current_reading instead of present_reading.
+            "sync_id": payload.get("reading_id"),
             "current_reading": payload.get("present_reading"),
+            "previous_reading": payload.get("previous_reading"),
             "consumption": payload.get("consumption"),
+            "excess_consumption": max(0, _safe_int(payload.get("consumption")) - _safe_int(payload.get("minimum_cubic"))),
             # Remote schema uses notes instead of exception.
             "notes": payload.get("exception"),
-            "reading_date": payload.get("reading_date"),
+            "reading_date": _parse_datetime(payload.get("reading_date")).isoformat(sep=" ") if _parse_datetime(payload.get("reading_date")) else None,
+            "source_site_id": "meter-reader-device",
+            "sync_status": "synced",
+            "last_synced_at": datetime.now().replace(tzinfo=None).isoformat(sep=" "),
+            "created_by_device": "meter-reader-device",
+            "updated_by_device": "meter-reader-device",
         }
 
         consumer_id = payload.get("consumer_id")
@@ -634,7 +943,7 @@ class SupabaseRestClient:
             candidate_payload.setdefault("meter_reader_id", ctx.get("meter_reader_id"))
 
         candidate_payload = {k: v for k, v in candidate_payload.items() if v is not None}
-        allowed = self._get_meterreadings_columns()
+        allowed = self._get_table_columns("meterreadings")
         remote_payload = {k: v for k, v in candidate_payload.items() if (not allowed or k in allowed)}
         if not remote_payload:
             raise RuntimeError("No compatible columns found for meterreadings payload.")
@@ -656,9 +965,7 @@ class SupabaseRestClient:
         headers = {
             "Prefer": "resolution=merge-duplicates,return=representation",
         }
-        query = {}
-        if "reading_id" in remote_payload:
-            query["on_conflict"] = "reading_id"
+        query = {"on_conflict": "sync_id"} if remote_payload.get("sync_id") else {}
 
         status, data = self._req(
             "POST",
@@ -673,6 +980,36 @@ class SupabaseRestClient:
         if isinstance(data, list) and data:
             return data[0]
         return remote_payload
+
+    def upsert_bill(self, payload: dict) -> dict:
+        allowed = self._get_table_columns("bills")
+        remote_payload = {k: v for k, v in payload.items() if (not allowed or k in allowed)}
+        headers = {"Prefer": "resolution=merge-duplicates,return=representation"}
+        status, data = self._req(
+            "POST",
+            "bills",
+            payload=remote_payload,
+            use_service_key=True,
+            extra_headers=headers,
+            query={"on_conflict": "sync_id"},
+        )
+        if status >= 400:
+            raise RuntimeError(f"Supabase bill write failed: {data}")
+        if isinstance(data, list) and data:
+            return data[0]
+        return remote_payload
+
+    def save_reading_bundle(self, payload: dict) -> dict:
+        context = self.get_consumer_context(int(payload["consumer_id"]))
+        merged = dict(context)
+        merged.update(payload)
+        remote_reading = self.upsert_meter_reading(merged)
+        remote_reading_id = remote_reading.get("reading_id")
+        if remote_reading_id is None:
+            raise RuntimeError("Supabase did not return a reading_id for billing sync.")
+        bill_payload = _build_bill_payload(merged, context, int(remote_reading_id))
+        remote_bill = self.upsert_bill(bill_payload)
+        return {"meterreading": remote_reading, "bill": remote_bill}
 
 
 class MainPostgresClient:
@@ -694,6 +1031,16 @@ class MainPostgresClient:
             user=self._cfg.main_pg_user,
             password=self._cfg.main_pg_password,
         )
+
+    def is_online(self) -> bool:
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return True
+        except Exception:
+            return False
 
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         where = """
@@ -719,18 +1066,36 @@ class MainPostgresClient:
             wr.minimum_rate,
             wr.excess_rate_per_cubic,
             bs.due_days,
-            bs.penalty_percent,
+            lb.amount_due,
+            lb.due_date,
+            lb.penalty,
+            lb.previous_penalty,
+            lb.total_after_due_date,
+            lb.status AS bill_status,
+            adm.late_fee,
             COALESCE(prev.last_reading, 0)::int AS previous_reading
         FROM {self._schema}.consumer c
         JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
         LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
         LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
         LEFT JOIN (
-            SELECT due_days, penalty_percent
+            SELECT due_days
             FROM {self._schema}.billing_settings
             ORDER BY setting_id DESC
             LIMIT 1
         ) bs ON TRUE
+        LEFT JOIN (
+            SELECT late_fee
+            FROM {self._schema}.admin_settings
+            LIMIT 1
+        ) adm ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
+            FROM {self._schema}.bills b
+            WHERE b.consumer_id = c.consumer_id
+            ORDER BY b.bill_id DESC
+            LIMIT 1
+        ) lb ON TRUE
         JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
         LEFT JOIN (
@@ -770,18 +1135,36 @@ class MainPostgresClient:
                         wr.minimum_rate,
                         wr.excess_rate_per_cubic,
                         bs.due_days,
-                        bs.penalty_percent,
+                        lb.amount_due,
+                        lb.due_date,
+                        lb.penalty,
+                        lb.previous_penalty,
+                        lb.total_after_due_date,
+                        lb.status AS bill_status,
+                        adm.late_fee,
                         COALESCE(prev.last_reading, 0)::int AS previous_reading
                     FROM {self._schema}.consumer c
                     JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
                     LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
                     LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
                     LEFT JOIN (
-                        SELECT due_days, penalty_percent
+                        SELECT due_days
                         FROM {self._schema}.billing_settings
                         ORDER BY setting_id DESC
                         LIMIT 1
                     ) bs ON TRUE
+                    LEFT JOIN (
+                        SELECT late_fee
+                        FROM {self._schema}.admin_settings
+                        LIMIT 1
+                    ) adm ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
+                        FROM {self._schema}.bills b
+                        WHERE b.consumer_id = c.consumer_id
+                        ORDER BY b.bill_id DESC
+                        LIMIT 1
+                    ) lb ON TRUE
                     LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
                     LEFT JOIN (
                         SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
@@ -794,6 +1177,244 @@ class MainPostgresClient:
                     cur.execute(fb_sql, fb_params)
                     rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+    def get_consumer_context(self, consumer_id: int) -> dict:
+        sql = f"""
+        SELECT
+            c.consumer_id,
+            c.account_number AS acct_no,
+            COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+            z.zone_name,
+            c.classification_id,
+            cls.classification_name,
+            wr.minimum_cubic,
+            wr.minimum_rate,
+            wr.excess_rate_per_cubic,
+            bs.setting_id,
+            bs.due_days,
+            adm.late_fee,
+            m.meter_id,
+            COALESCE(prev.last_reading, 0)::int AS previous_reading,
+            lb.amount_due,
+            lb.due_date,
+            lb.previous_balance,
+            lb.penalty,
+            lb.previous_penalty,
+            lb.total_after_due_date,
+            lb.status AS bill_status,
+            lb.sync_id AS bill_sync_id,
+            lb.reading_id AS bill_reading_id
+        FROM {self._schema}.consumer c
+        JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+        LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
+        LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+        LEFT JOIN (
+            SELECT setting_id, due_days
+            FROM {self._schema}.billing_settings
+            ORDER BY setting_id DESC
+            LIMIT 1
+        ) bs ON TRUE
+        LEFT JOIN (
+            SELECT late_fee
+            FROM {self._schema}.admin_settings
+            ORDER BY settings_id DESC
+            LIMIT 1
+        ) adm ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT amount_due, due_date, previous_balance, penalty, previous_penalty, total_after_due_date, status, sync_id, reading_id
+            FROM {self._schema}.bills b
+            WHERE b.consumer_id = c.consumer_id
+            ORDER BY b.bill_id DESC
+            LIMIT 1
+        ) lb ON TRUE
+        LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
+        LEFT JOIN (
+            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+            FROM {self._schema}.meterreadings mr
+            GROUP BY mr.consumer_id
+        ) prev ON prev.consumer_id = c.consumer_id
+        WHERE c.consumer_id = %s
+        LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (consumer_id,))
+                row = cur.fetchone()
+        return dict(row) if row else {}
+
+    def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
+        reading_dt = _parse_datetime(reading_date)
+        if reading_dt is None:
+            return None
+        sql = f"""
+        SELECT reading_id, consumer_id, reading_date, updated_at, current_reading AS present_reading, sync_id
+        FROM {self._schema}.meterreadings
+        WHERE consumer_id = %s
+          AND DATE(reading_date) = %s
+          AND deleted_at IS NULL
+        ORDER BY updated_at DESC, reading_id DESC
+        LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (consumer_id, reading_dt.date()))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_meter_reading(self, payload: dict) -> dict:
+        context = self.get_consumer_context(int(payload["consumer_id"]))
+        merged = dict(context)
+        merged.update(payload)
+        reading_dt = _parse_datetime(merged.get("reading_date")) or datetime.now().replace(tzinfo=None)
+        previous_reading = _safe_int(merged.get("previous_reading"), _safe_int(merged.get("present_reading")) - _safe_int(merged.get("consumption")))
+        sql = f"""
+        INSERT INTO {self._schema}.meterreadings (
+            route_id, consumer_id, meter_id, meter_reader_id, created_date, reading_status,
+            previous_reading, current_reading, consumption, excess_consumption, notes,
+            status, reading_date, sync_id, created_at, updated_at, source_site_id,
+            sync_status, last_synced_at, created_by_device, updated_by_device, deleted_at
+        ) VALUES (
+            %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s,
+            %s, CURRENT_TIMESTAMP, %s, %s, NULL
+        )
+        ON CONFLICT (sync_id) DO UPDATE SET
+            route_id = EXCLUDED.route_id,
+            meter_id = EXCLUDED.meter_id,
+            meter_reader_id = EXCLUDED.meter_reader_id,
+            previous_reading = EXCLUDED.previous_reading,
+            current_reading = EXCLUDED.current_reading,
+            consumption = EXCLUDED.consumption,
+            excess_consumption = EXCLUDED.excess_consumption,
+            notes = EXCLUDED.notes,
+            reading_status = EXCLUDED.reading_status,
+            status = EXCLUDED.status,
+            reading_date = EXCLUDED.reading_date,
+            source_site_id = EXCLUDED.source_site_id,
+            sync_status = EXCLUDED.sync_status,
+            last_synced_at = EXCLUDED.last_synced_at,
+            updated_by_device = EXCLUDED.updated_by_device
+        RETURNING *
+        """
+        params = (
+            merged.get("route_id"),
+            int(merged["consumer_id"]),
+            merged.get("meter_id"),
+            merged.get("meter_reader_id"),
+            "Flagged" if merged.get("is_flagged") else "Pending",
+            previous_reading,
+            _safe_float(merged.get("present_reading")),
+            _safe_float(merged.get("consumption")),
+            max(0, _safe_float(merged.get("consumption")) - _safe_float(merged.get("minimum_cubic"))),
+            merged.get("exception"),
+            "Active",
+            reading_dt,
+            str(merged.get("reading_id") or uuid.uuid4()),
+            "meter-reader-device",
+            "synced",
+            "meter-reader-device",
+            "meter-reader-device",
+        )
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                conn.commit()
+        return dict(row) if row else {}
+
+    def upsert_bill(self, payload: dict) -> dict:
+        sql = f"""
+        INSERT INTO {self._schema}.bills (
+            consumer_id, reading_id, billing_officer_id, billing_month, date_covered_from,
+            date_covered_to, bill_date, due_date, disconnection_date, class_cost, water_charge,
+            meter_maintenance_fee, connection_fee, amount_due, previous_balance, previous_penalty,
+            penalty, total_amount, total_after_due_date, status, setting_id, sync_id,
+            created_at, updated_at, source_site_id, sync_status, last_synced_at,
+            created_by_device, updated_by_device, deleted_at
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s, %s, %s,
+            %s, %s, NULL
+        )
+        ON CONFLICT (sync_id) DO UPDATE SET
+            consumer_id = EXCLUDED.consumer_id,
+            reading_id = EXCLUDED.reading_id,
+            billing_officer_id = EXCLUDED.billing_officer_id,
+            billing_month = EXCLUDED.billing_month,
+            date_covered_from = EXCLUDED.date_covered_from,
+            date_covered_to = EXCLUDED.date_covered_to,
+            bill_date = EXCLUDED.bill_date,
+            due_date = EXCLUDED.due_date,
+            disconnection_date = EXCLUDED.disconnection_date,
+            class_cost = EXCLUDED.class_cost,
+            water_charge = EXCLUDED.water_charge,
+            meter_maintenance_fee = EXCLUDED.meter_maintenance_fee,
+            connection_fee = EXCLUDED.connection_fee,
+            amount_due = EXCLUDED.amount_due,
+            previous_balance = EXCLUDED.previous_balance,
+            previous_penalty = EXCLUDED.previous_penalty,
+            penalty = EXCLUDED.penalty,
+            total_amount = EXCLUDED.total_amount,
+            total_after_due_date = EXCLUDED.total_after_due_date,
+            status = EXCLUDED.status,
+            setting_id = EXCLUDED.setting_id,
+            source_site_id = EXCLUDED.source_site_id,
+            sync_status = EXCLUDED.sync_status,
+            last_synced_at = EXCLUDED.last_synced_at,
+            updated_by_device = EXCLUDED.updated_by_device
+        RETURNING *
+        """
+        params = (
+            payload.get("consumer_id"),
+            payload.get("reading_id"),
+            payload.get("billing_officer_id"),
+            _safe_int(payload.get("billing_month"), 0) if False else payload.get("billing_month"),
+            _parse_datetime(payload.get("date_covered_from")),
+            _parse_datetime(payload.get("date_covered_to")),
+            _parse_datetime(payload.get("bill_date")),
+            _parse_datetime(payload.get("due_date")),
+            _parse_datetime(payload.get("disconnection_date")),
+            _safe_float(payload.get("class_cost")),
+            _safe_float(payload.get("water_charge")),
+            _safe_float(payload.get("meter_maintenance_fee")),
+            _safe_float(payload.get("connection_fee")),
+            _safe_float(payload.get("amount_due")),
+            _safe_float(payload.get("previous_balance")),
+            _safe_float(payload.get("previous_penalty")),
+            _safe_float(payload.get("penalty")),
+            _safe_float(payload.get("total_amount")),
+            _safe_float(payload.get("total_after_due_date")),
+            payload.get("status") or "Unpaid",
+            payload.get("setting_id"),
+            payload.get("sync_id"),
+            payload.get("source_site_id") or "meter-reader-device",
+            payload.get("sync_status") or "synced",
+            _parse_datetime(payload.get("last_synced_at")) or datetime.now().replace(tzinfo=None),
+            payload.get("created_by_device") or "meter-reader-device",
+            payload.get("updated_by_device") or "meter-reader-device",
+        )
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                conn.commit()
+        return dict(row) if row else {}
+
+    def save_reading_bundle(self, payload: dict) -> dict:
+        context = self.get_consumer_context(int(payload["consumer_id"]))
+        merged = dict(context)
+        merged.update(payload)
+        reading_row = self.upsert_meter_reading(merged)
+        reading_id = reading_row.get("reading_id")
+        if reading_id is None:
+            raise RuntimeError("MAIN_PG did not return a reading_id for billing sync.")
+        bill_payload = _build_bill_payload(merged, context, int(reading_id))
+        bill_row = self.upsert_bill(bill_payload)
+        return {"meterreading": reading_row, "bill": bill_row}
 
 
 class HandheldSyncDataAccess:
@@ -828,6 +1449,28 @@ class HandheldSyncDataAccess:
     def is_online(self) -> bool:
         return self.remote.is_online()
 
+    def _available_targets(self) -> list[tuple[str, object]]:
+        targets: list[tuple[str, object]] = []
+        if self.remote:
+            targets.append(("Supabase", self.remote))
+        if self.main_pg:
+            targets.append(("MAIN_PG", self.main_pg))
+        return targets
+
+    def _sync_reading_to_targets(self, reading: dict) -> tuple[dict[str, dict], list[str]]:
+        results: dict[str, dict] = {}
+        errors: list[str] = []
+        for label, target in self._available_targets():
+            try:
+                bundle_writer = getattr(target, "save_reading_bundle", None)
+                if callable(bundle_writer):
+                    results[label] = bundle_writer(reading)
+                else:
+                    results[label] = {"meterreading": target.upsert_meter_reading(reading)}
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+        return results, errors
+
     def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
         if self.is_online():
             try:
@@ -861,26 +1504,30 @@ class HandheldSyncDataAccess:
 
     def saveMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
-        if self.is_online():
-            try:
-                remote_result = self.remote.upsert_meter_reading(reading)
-                self.local.log_audit(None, "success", "Online save to Supabase", {"reading_id": reading["reading_id"]})
-                return {"status": "synced", "remote": remote_result, "reading": reading}
-            except Exception as exc:
-                self.local.log_audit(None, "failed", f"Online save failed, queued offline: {exc}", reading)
+        results, errors = self._sync_reading_to_targets(reading)
+        if results:
+            if errors:
+                self.local.log_audit(None, "success", f"Reading synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            else:
+                self.local.log_audit(None, "success", "Reading and bill synced", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            return {"status": "synced", "remote": results, "reading": reading, "errors": errors}
+        if errors:
+            self.local.log_audit(None, "failed", f"Online save failed, queued offline: {'; '.join(errors)}", reading)
         queued = self.local.enqueue_operation("create", reading)
         self.local.log_audit(queued["id"], "pending", "Queued offline create operation", reading)
         return {"status": "queued", "queue": queued, "reading": reading}
 
     def updateMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
-        if self.is_online():
-            try:
-                remote_result = self.remote.upsert_meter_reading(reading)
-                self.local.log_audit(None, "success", "Online update to Supabase", {"reading_id": reading["reading_id"]})
-                return {"status": "synced", "remote": remote_result, "reading": reading}
-            except Exception as exc:
-                self.local.log_audit(None, "failed", f"Online update failed, queued offline: {exc}", reading)
+        results, errors = self._sync_reading_to_targets(reading)
+        if results:
+            if errors:
+                self.local.log_audit(None, "success", f"Reading update synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            else:
+                self.local.log_audit(None, "success", "Reading update and bill synced", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            return {"status": "synced", "remote": results, "reading": reading, "errors": errors}
+        if errors:
+            self.local.log_audit(None, "failed", f"Online update failed, queued offline: {'; '.join(errors)}", reading)
         queued = self.local.enqueue_operation("update", reading)
         self.local.log_audit(queued["id"], "pending", "Queued offline update operation", reading)
         return {"status": "queued", "queue": queued, "reading": reading}
@@ -903,16 +1550,25 @@ class HandheldSyncDataAccess:
 
     def get_sync_snapshot(self) -> dict:
         pending = self.listPendingSyncReadings()
-        status = "Online" if self.is_online() else "Offline"
+        remote_online = self.is_online()
+        pg_online = self.main_pg.is_online() if self.main_pg else False
+        if remote_online and pg_online:
+            status = "Online"
+        elif remote_online or pg_online:
+            status = "Partial"
+        else:
+            status = "Offline"
         has_failed = any(row.get("status") == "failed" for row in pending)
         has_pending = len(pending) > 0
         if has_failed:
             save_target = "Local SQLite Queue (sync retry pending)"
         elif status == "Online":
-            save_target = "Supabase (online)"
+            save_target = "Supabase + MAIN_PG"
+        elif status == "Partial":
+            save_target = "One remote target available"
         else:
             save_target = "Local SQLite Queue (offline)"
-        backup_state = "Backed up to main system" if (status == "Online" and not has_pending) else "Not fully backed up"
+        backup_state = "Backed up to main system" if ((remote_online or pg_online) and not has_pending) else "Not fully backed up"
         last_sync = self.get_last_successful_sync_time()
         return {
             "status": status,
@@ -924,7 +1580,7 @@ class HandheldSyncDataAccess:
         }
 
     def syncPendingReadings(self) -> dict:
-        if not self.is_online():
+        if not self.is_online() and not (self.main_pg and self.main_pg.is_online()):
             self.local.log_audit(None, "failed", "Sync skipped, offline")
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
 
@@ -937,11 +1593,8 @@ class HandheldSyncDataAccess:
             queue_id = row["id"]
             payload = row["payload"]
             try:
-                # Validate early when the remote implementation exposes a preflight hook.
-                preflight = getattr(self.remote, "_build_remote_payload", None)
-                if callable(preflight):
-                    preflight(payload)
-                existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
+                conflict_source = self.remote if self.is_online() else self.main_pg
+                existing = conflict_source.find_existing_reading(payload["consumer_id"], payload["reading_date"]) if conflict_source else None
                 if existing and existing.get("updated_at") and payload.get("updated_at"):
                     if str(existing["updated_at"]) > str(payload["updated_at"]):
                         reason = "Server has newer reading for same consumer/date."
@@ -950,9 +1603,14 @@ class HandheldSyncDataAccess:
                         conflicts += 1
                         continue
 
-                self.remote.upsert_meter_reading(payload)
+                results, errors = self._sync_reading_to_targets(payload)
+                if not results:
+                    raise RuntimeError("; ".join(errors) if errors else "No sync target accepted the queue row.")
                 self.local.mark_synced(queue_id)
-                self.local.log_audit(queue_id, "success", "Queue row synced", payload)
+                message = "Queue row synced"
+                if errors:
+                    message += f" with partial target failures: {'; '.join(errors)}"
+                self.local.log_audit(queue_id, "success", message, {"payload": payload, "targets": list(results.keys())})
                 synced += 1
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc))

@@ -662,6 +662,23 @@ class AppBridge(QObject):
 
         threading.Thread(target=_task, daemon=True).start()
 
+    def _reload_current_consumer_from_db(self) -> None:
+        if not self._consumer:
+            return
+        meter_no = (self._consumer.get("meter_no") or "").strip()
+        if not meter_no:
+            return
+        refreshed = search_consumer(meter_no, unread_only=False)
+        if refreshed is None:
+            return
+        self._consumer = refreshed
+        self._account_no = str(refreshed.get("acct_no") or refreshed["id"])
+        self._consumer_name = refreshed["name"]
+        self._previous_reading = str(refreshed["previous_reading"])
+        self.accountNoChanged.emit()
+        self.consumerNameChanged.emit()
+        self.previousReadingChanged.emit()
+
     def _finish_sync_task(self, result: dict) -> None:
         keep_busy = bool(result.get("keep_busy"))
         if not keep_busy:
@@ -679,6 +696,9 @@ class AppBridge(QObject):
         self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
         self._zones = get_all_zone_names()
         self.zonesChanged.emit()
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
+        self._reload_current_consumer_from_db()
         self.update_stats()
         self._refresh_sync_snapshot()
         if result.get("kind") == "sync" and not result.get("silent"):
@@ -691,8 +711,26 @@ class AppBridge(QObject):
     def _save_to_sync_layer(self, consumer_id: int, present: int, consumption: int, exception: str, flagged: bool) -> None:
         if not self._sync_dal or not self._auto_push_enabled:
             return
+        consumer = self._consumer or {}
         payload = {
             "consumer_id": consumer_id,
+            "acct_no": consumer.get("acct_no"),
+            "meter_no": consumer.get("meter_no"),
+            "zone_name": consumer.get("zone_name"),
+            "classification_id": consumer.get("classification_id"),
+            "classification_name": consumer.get("classification_name"),
+            "minimum_cubic": consumer.get("minimum_cubic"),
+            "minimum_rate": consumer.get("minimum_rate"),
+            "excess_rate_per_cubic": consumer.get("excess_rate_per_cubic"),
+            "due_days": consumer.get("due_days"),
+            "late_fee": consumer.get("late_fee"),
+            "amount_due": consumer.get("amount_due"),
+            "due_date": consumer.get("due_date"),
+            "penalty": consumer.get("penalty"),
+            "previous_penalty": consumer.get("previous_penalty"),
+            "total_after_due_date": consumer.get("total_after_due_date"),
+            "bill_status": consumer.get("bill_status"),
+            "previous_reading": consumer.get("previous_reading"),
             "present_reading": present,
             "consumption": consumption,
             "exception": exception,
@@ -1064,6 +1102,7 @@ class AppBridge(QObject):
             return
 
         try:
+            self._reload_current_consumer_from_db()
             present = int(self._present_reading)
             previous = int(self._consumer["previous_reading"])
             if present < previous:
@@ -1213,6 +1252,36 @@ class AppBridge(QObject):
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
 
         threading.Thread(target=_task, daemon=True).start()
+
+    @Slot()
+    def printTestReceipt(self) -> None:
+        test_receipt = "\n".join(
+            [
+                "================================",
+                " SAN LORENZO RUIZ WATERWORKS",
+                " Billing and Payment",
+                "================================",
+                " SAN LORENZO RUIZ WATERWORKS SYSTEM || Billing and Payment",
+                "================================",
+                "",
+                " Test Print",
+                f" Date  : {datetime.now().strftime('%Y-%m-%d')}",
+                f" Time  : {datetime.now().strftime('%I:%M %p')}",
+                "",
+                " GP58 printer check",
+                "================================",
+                "",
+                "",
+                "",
+            ]
+        )
+        if can_use_system_printer():
+            try:
+                send_to_system_printer(test_receipt)
+            except Exception as exc:
+                self.alertRequested.emit("Printer Error", f"Unable to print test receipt to the GP58 over USB.\n\n{exc}")
+                return
+        self.receiptPreviewRequested.emit("Test Print Preview", test_receipt)
 
     @Slot()
     def powerOffDevice(self) -> None:

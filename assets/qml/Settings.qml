@@ -203,6 +203,7 @@ Rectangle {
                         Layout.fillWidth: true
                         spacing: 12
                         ActionButton { text: "Sync Now"; Layout.preferredWidth: 138; onClicked: { if (bridgeObj) bridgeObj.syncNow() } }
+                        ActionButton { text: "Test Print"; buttonColor: "#0F766E"; hoverColor: "#115E59"; Layout.preferredWidth: 138; onClicked: { if (bridgeObj) bridgeObj.printTestReceipt() } }
                         ActionButton { text: "View Logs"; buttonColor: "#111827"; hoverColor: "#1F2937"; Layout.preferredWidth: 138; onClicked: logsDialog.open() }
                     }
                 }
