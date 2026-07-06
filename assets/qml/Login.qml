@@ -9,9 +9,10 @@ Rectangle {
     height: parent ? parent.height : 800
     clip: true
 
+    property bool compactScreen: width <= 420
     property bool narrowScreen: width < 600
-    property int horizontalPadding: narrowScreen ? 16 : 24
-    property int verticalPadding: narrowScreen ? 20 : 28
+    property int horizontalPadding: compactScreen ? 22 : (narrowScreen ? 16 : 24)
+    property int verticalPadding: compactScreen ? 16 : (narrowScreen ? 20 : 28)
 
     color: "#F4F7FB"
 
@@ -32,10 +33,13 @@ Rectangle {
 
             ColumnLayout {
                 id: loginColumn
-                width: Math.min(contentWrapper.width - (loginRoot.horizontalPadding * 2), loginRoot.narrowScreen ? contentWrapper.width - (loginRoot.horizontalPadding * 2) : 420)
+                width: Math.min(
+                    contentWrapper.width - (loginRoot.horizontalPadding * 2),
+                    loginRoot.compactScreen ? 320 : (loginRoot.narrowScreen ? contentWrapper.width - (loginRoot.horizontalPadding * 2) : 420)
+                )
                 x: Math.max(loginRoot.horizontalPadding, (contentWrapper.width - width) / 2)
                 y: loginRoot.verticalPadding
-                spacing: loginRoot.narrowScreen ? 16 : 20
+                spacing: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 20)
                 transform: Translate { id: shakeOffset }
 
                 // Logo Image with Entry Animation
@@ -43,8 +47,8 @@ Rectangle {
                     id: logoImg
                     Layout.alignment: Qt.AlignHCenter
                     source: "../images/SLR logo 1.png"
-                    Layout.preferredWidth: loginRoot.narrowScreen ? 72 : 80
-                    Layout.preferredHeight: loginRoot.narrowScreen ? 72 : 80
+                    Layout.preferredWidth: loginRoot.compactScreen ? 64 : (loginRoot.narrowScreen ? 72 : 80)
+                    Layout.preferredHeight: loginRoot.compactScreen ? 64 : (loginRoot.narrowScreen ? 72 : 80)
                     fillMode: Image.PreserveAspectFit
 
                     // Soft entry scale and opacity animation
@@ -80,7 +84,7 @@ Rectangle {
                         Layout.alignment: Qt.AlignHCenter
                         Layout.fillWidth: true
                         text: "San Lorenzo Ruiz Waterworks System"
-                        font.pixelSize: loginRoot.narrowScreen ? 17 : 18
+                        font.pixelSize: loginRoot.compactScreen ? 15 : (loginRoot.narrowScreen ? 17 : 18)
                         font.family: "Montserrat"
                         font.bold: true
                         color: "#0f172a"
@@ -92,7 +96,7 @@ Rectangle {
                         Layout.alignment: Qt.AlignHCenter
                         Layout.fillWidth: true
                         text: "Water Billing and Payment Record Management System"
-                        font.pixelSize: loginRoot.narrowScreen ? 10 : 11
+                        font.pixelSize: loginRoot.compactScreen ? 9 : (loginRoot.narrowScreen ? 10 : 11)
                         font.family: "Montserrat"
                         color: "#475569"
                         horizontalAlignment: Text.AlignHCenter
@@ -118,13 +122,13 @@ Rectangle {
                         shadowColor: "#15000000"
                     }
 
-                    property int formCardPadding: loginRoot.narrowScreen ? 16 : 24
+                    property int formCardPadding: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 24)
 
                     ColumnLayout {
                         id: formLayout
                         anchors.fill: parent
                         anchors.margins: parent.formCardPadding
-                        spacing: 14
+                        spacing: loginRoot.compactScreen ? 12 : 14
 
                         // Username field
                         ColumnLayout {
@@ -142,7 +146,7 @@ Rectangle {
                             TextField {
                                 id: txtUsername
                                 Layout.fillWidth: true
-                                implicitHeight: 44
+                                implicitHeight: loginRoot.compactScreen ? 40 : 44
                                 placeholderText: "Enter your username"
                                 font.pixelSize: 13
                                 font.family: "Montserrat"
@@ -176,7 +180,7 @@ Rectangle {
                             TextField {
                                 id: txtPassword
                                 Layout.fillWidth: true
-                                implicitHeight: 44
+                                implicitHeight: loginRoot.compactScreen ? 40 : 44
                                 placeholderText: "Enter your password"
                                 echoMode: TextInput.Password
                                 font.pixelSize: 13
@@ -212,8 +216,9 @@ Rectangle {
                         // Login Button
                         Button {
                             id: loginButton
-                            Layout.fillWidth: true
-                            implicitHeight: 44
+                            Layout.alignment: Qt.AlignHCenter
+                            Layout.preferredWidth: loginRoot.compactScreen ? Math.min(parent.width, 220) : parent.width
+                            implicitHeight: loginRoot.compactScreen ? 40 : 44
                             scale: loginButton.pressed ? 0.96 : 1.0
 
                             Behavior on scale {
@@ -223,7 +228,7 @@ Rectangle {
                             contentItem: Text {
                                 text: "Log In"
                                 color: "white"
-                                font.pixelSize: 13
+                                font.pixelSize: loginRoot.compactScreen ? 12 : 13
                                 font.family: "Montserrat"
                                 font.bold: true
                                 horizontalAlignment: Text.AlignHCenter
