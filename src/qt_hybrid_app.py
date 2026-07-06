@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
+os.environ.setdefault("QT_IM_MODULE", "qtvirtualkeyboard")
 
 if os.name == "nt":
     pyside_spec = importlib.util.find_spec("PySide6")
@@ -71,9 +72,19 @@ except ImportError:
         SyncConfig = None
 
 try:
-    from .receipt import build_receipt_text, can_use_system_printer, send_to_system_printer
+    from .receipt import (
+        build_receipt_text,
+        can_use_system_printer,
+        print_test_receipt,
+        send_to_system_printer,
+    )
 except ImportError:
-    from receipt import build_receipt_text, can_use_system_printer, send_to_system_printer
+    from receipt import (
+        build_receipt_text,
+        can_use_system_printer,
+        print_test_receipt,
+        send_to_system_printer,
+    )
 
 
 class LoginBridge(QObject):
@@ -165,11 +176,13 @@ class AppBridge(QObject):
     wifiStatusColorChanged = Signal()
     wifiNetworksChanged = Signal()
     wifiBusyChanged = Signal()
+    testPrintBusyChanged = Signal()
     syncTaskFinished = Signal(object)
     wifiScanFinished = Signal(object, str)
     wifiConnectFinished = Signal(bool, str, str)
     wifiStatusResult = Signal(str, str)
     powerOffFailed = Signal(str)
+    testPrintFinished = Signal(bool, str)
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -229,6 +242,7 @@ class AppBridge(QObject):
         self._wifi_networks = []
         self._wifi_busy = False
         self._wifi_scan_silent = False
+        self._test_print_busy = False
 
         self._overall_percentage = 0
         self._overall_fraction = "0/0"
@@ -248,6 +262,7 @@ class AppBridge(QObject):
         self.wifiConnectFinished.connect(self._finish_wifi_connect)
         self.wifiStatusResult.connect(self._set_wifi_status)
         self.powerOffFailed.connect(self._finish_power_off_failure)
+        self.testPrintFinished.connect(self._finish_test_print)
 
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(5_000)
@@ -554,6 +569,10 @@ class AppBridge(QObject):
     @Property(bool, notify=wifiBusyChanged)
     def wifiBusy(self) -> bool:
         return self._wifi_busy
+
+    @Property(bool, notify=testPrintBusyChanged)
+    def testPrintBusy(self) -> bool:
+        return self._test_print_busy
 
     # Circular progress stats properties
     @Property(int, notify=overallPercentageChanged)
@@ -1255,33 +1274,34 @@ class AppBridge(QObject):
 
     @Slot()
     def printTestReceipt(self) -> None:
-        test_receipt = "\n".join(
-            [
-                "================================",
-                " SAN LORENZO RUIZ WATERWORKS",
-                " Billing and Payment",
-                "================================",
-                " SAN LORENZO RUIZ WATERWORKS SYSTEM || Billing and Payment",
-                "================================",
-                "",
-                " Test Print",
-                f" Date  : {datetime.now().strftime('%Y-%m-%d')}",
-                f" Time  : {datetime.now().strftime('%I:%M %p')}",
-                "",
-                " GP58 printer check",
-                "================================",
-                "",
-                "",
-                "",
-            ]
-        )
-        if can_use_system_printer():
+        if self._test_print_busy:
+            return
+
+        self._test_print_busy = True
+        self.testPrintBusyChanged.emit()
+
+        def _task() -> None:
             try:
-                send_to_system_printer(test_receipt)
+                preview_text = print_test_receipt()
+                self.testPrintFinished.emit(True, preview_text)
             except Exception as exc:
-                self.alertRequested.emit("Printer Error", f"Unable to print test receipt to the GP58 over USB.\n\n{exc}")
-                return
-        self.receiptPreviewRequested.emit("Test Print Preview", test_receipt)
+                self.testPrintFinished.emit(False, str(exc) or "Unknown printer error.")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_test_print(self, success: bool, payload: str) -> None:
+        self._test_print_busy = False
+        self.testPrintBusyChanged.emit()
+        if success:
+            self.alertRequested.emit("Printer Test", "Test print sent successfully.")
+            self.receiptPreviewRequested.emit("Test Print Preview", payload)
+            return
+
+        detail = payload.strip()
+        friendly = "Unable to print. Please check that the thermal printer is connected and powered on."
+        if detail:
+            friendly = f"{friendly}\n\nDetails: {detail}"
+        self.alertRequested.emit("Printer Error", friendly)
 
     @Slot()
     def powerOffDevice(self) -> None:

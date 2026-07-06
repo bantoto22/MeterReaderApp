@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
     id: meterEntryRoot
@@ -8,6 +9,7 @@ Rectangle {
 
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property bool showSuggestions: bridgeObj && bridgeObj.searchSuggestions && bridgeObj.searchSuggestions.length > 0
+    readonly property bool compactScreen: width <= 420
     readonly property var currentConsumption: {
         if (!bridgeObj || bridgeObj.consumption === "-") return 0
         return parseInt(bridgeObj.consumption)
@@ -105,16 +107,13 @@ Rectangle {
         }
     }
 
-    ScrollView {
+    ScrollablePage {
         anchors.fill: parent
-        contentWidth: parent.width
+        maxContentWidth: 440
 
         ColumnLayout {
-            width: Math.min(parent.width - 40, 1120)
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.top: parent.top
-            anchors.topMargin: 16
-            spacing: 16
+            Layout.fillWidth: true
+            spacing: TouchMetrics.sectionSpacing
 
             ColumnLayout {
                 Layout.fillWidth: true
@@ -124,7 +123,7 @@ Rectangle {
                     Layout.fillWidth: true
                     Text {
                         text: "Search by Meter No."
-                        font.pixelSize: 13
+                        font.pixelSize: TouchMetrics.bodyText
                         font.family: "Montserrat"
                         font.bold: true
                         color: "#111827"
@@ -132,11 +131,11 @@ Rectangle {
                     Item { Layout.fillWidth: true }
                     ComboBox {
                         id: cmbEntryZone
-                        Layout.preferredWidth: Math.min(190, meterEntryRoot.width * 0.36)
+                        Layout.preferredWidth: Math.min(210, meterEntryRoot.width * 0.42)
                         model: bridgeObj ? bridgeObj.zones : []
                         currentIndex: bridgeObj ? Math.max(0, bridgeObj.zones.indexOf(bridgeObj.selectedZone)) : 0
-                        background: Rectangle { implicitHeight: 38; radius: 7; color: "#2563EB" }
-                        contentItem: Text { text: cmbEntryZone.currentText; color: "white"; font.family: "Montserrat"; font.pixelSize: 11; font.bold: true; verticalAlignment: Text.AlignVCenter; leftPadding: 12 }
+                        background: Rectangle { implicitHeight: TouchMetrics.inputHeight; radius: 7; color: "#2563EB" }
+                        contentItem: Text { text: cmbEntryZone.currentText; color: "white"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true; verticalAlignment: Text.AlignVCenter; leftPadding: 12 }
                         onActivated: { if (bridgeObj && currentText) bridgeObj.selectedZone = currentText }
                     }
                 }
@@ -154,7 +153,8 @@ Rectangle {
                             Layout.fillWidth: true
                             placeholderText: "Type 001, 002..."
                             text: bridgeObj ? bridgeObj.searchQuery : ""
-                            font.pixelSize: 13
+                            inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferLowercase
+                            font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             color: "#0F172A"
                             placeholderTextColor: "#94A3B8"
@@ -216,14 +216,14 @@ Rectangle {
 
                     Button {
                         id: btnSearch
-                        implicitWidth: 44
-                        implicitHeight: 44
+                        implicitWidth: TouchMetrics.iconButtonSize
+                        implicitHeight: TouchMetrics.iconButtonSize
                         scale: btnSearch.pressed ? 0.94 : 1.0
                         Behavior on scale { NumberAnimation { duration: 80 } }
 
                         contentItem: Text {
                             text: "Go"
-                            font.pixelSize: 11
+                            font.pixelSize: TouchMetrics.helperText
                             font.family: "Montserrat"
                             font.bold: true
                             color: "white"
@@ -242,23 +242,24 @@ Rectangle {
 
             Rectangle {
                 Layout.fillWidth: true
-                implicitHeight: 410
+                implicitHeight: detailsColumn.implicitHeight + (meterEntryRoot.compactScreen ? 28 : 40)
                 radius: 8
                 color: "#FFFFFF"
                 border.color: "#E2E8F0"
                 border.width: 1
 
                 ColumnLayout {
+                    id: detailsColumn
                     anchors.fill: parent
-                    anchors.margins: 20
-                    spacing: 14
+                    anchors.margins: meterEntryRoot.compactScreen ? 14 : 20
+                    spacing: meterEntryRoot.compactScreen ? 12 : 14
 
                     RowLayout {
                         spacing: 10
                         Rectangle { width: 4; height: 18; radius: 2; color: "#1D4ED8" }
                         Text {
                             text: "Consumer Details"
-                            font.pixelSize: 14
+                            font.pixelSize: TouchMetrics.sectionTitle
                             font.family: "Montserrat"
                             font.bold: true
                             color: "#0F172A"
@@ -267,30 +268,30 @@ Rectangle {
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Text { text: "Account No."; font.pixelSize: 13; font.family: "Montserrat"; color: "#64748B" }
+                        Text { text: "Account No."; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; color: "#64748B" }
                         Item { Layout.fillWidth: true }
-                        Text { text: bridgeObj ? bridgeObj.accountNo : "-"; font.pixelSize: 13; font.family: "Montserrat"; font.bold: true; color: "#0F172A" }
+                        Text { text: bridgeObj ? bridgeObj.accountNo : "-"; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; font.bold: true; color: "#0F172A" }
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Text { text: "Name"; font.pixelSize: 13; font.family: "Montserrat"; color: "#64748B" }
+                        Text { text: "Name"; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; color: "#64748B" }
                         Item { Layout.fillWidth: true }
-                        Text { text: bridgeObj ? bridgeObj.consumerName : "-"; font.pixelSize: 13; font.family: "Montserrat"; font.bold: true; color: "#0F172A"; elide: Text.ElideRight; Layout.maximumWidth: 200 }
+                        Text { text: bridgeObj ? bridgeObj.consumerName : "-"; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; font.bold: true; color: "#0F172A"; elide: Text.ElideRight; Layout.maximumWidth: 220 }
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Text { text: "Previous Reading"; font.pixelSize: 13; font.family: "Montserrat"; color: "#64748B" }
+                        Text { text: "Previous Reading"; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; color: "#64748B" }
                         Item { Layout.fillWidth: true }
-                        Text { text: bridgeObj ? bridgeObj.previousReading : "-"; font.pixelSize: 13; font.family: "Montserrat"; font.bold: true; color: "#0F172A" }
+                        Text { text: bridgeObj ? bridgeObj.previousReading : "-"; font.pixelSize: TouchMetrics.bodyText; font.family: "Montserrat"; font.bold: true; color: "#0F172A" }
                     }
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#F1F5F9" }
 
                     Text {
                         text: "Present Reading"
-                        font.pixelSize: 14
+                        font.pixelSize: TouchMetrics.sectionTitle
                         font.family: "Montserrat"
                         font.bold: true
                         color: "#0F172A"
@@ -301,7 +302,8 @@ Rectangle {
                         Layout.fillWidth: true
                         placeholderText: "Enter current reading..."
                         text: bridgeObj ? bridgeObj.presentReading : ""
-                        font.pixelSize: 15
+                        inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
+                        font.pixelSize: 18
                         font.family: "Montserrat"
                         color: "#0F172A"
                         placeholderTextColor: "#94A3B8"
@@ -327,7 +329,7 @@ Rectangle {
                             spacing: 2
                             Text {
                                 text: "Consumption"
-                                font.pixelSize: 13
+                                font.pixelSize: TouchMetrics.bodyText
                                 font.family: "Montserrat"
                                 font.bold: true
                                 color: "#0F172A"
@@ -338,7 +340,7 @@ Rectangle {
                                     var cons = bridgeObj.consumption
                                     return cons === "-" ? "-" : (cons < 0 ? "INVALID READING" : cons + " m³")
                                 }
-                                font.pixelSize: 14
+                                font.pixelSize: 18
                                 font.family: "Montserrat"
                                 font.bold: true
                                 color: bridgeObj ? bridgeObj.validationColor : "#64748B"
@@ -366,7 +368,7 @@ Rectangle {
                                 anchors.fill: parent
                                 anchors.margins: 8
                                 text: bridgeObj ? bridgeObj.validationMessage : ""
-                                font.pixelSize: 10
+                                font.pixelSize: TouchMetrics.helperText
                                 font.family: "Montserrat"
                                 font.bold: true
                                 color: bridgeObj ? bridgeObj.validationColor : "#64748B"
@@ -385,7 +387,7 @@ Rectangle {
 
                         Text {
                             text: "Exception"
-                            font.pixelSize: 13
+                            font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
                             color: "#0F172A"
@@ -398,7 +400,7 @@ Rectangle {
                             currentIndex: bridgeObj ? Math.max(0, bridgeObj.exceptions.indexOf(bridgeObj.selectedException)) : 0
 
                             background: Rectangle {
-                                implicitHeight: 40
+                                implicitHeight: TouchMetrics.inputHeight
                                 radius: 8
                                 border.color: cmbException.focus ? "#3B82F6" : "#E2E8F0"
                                 border.width: 1
@@ -408,7 +410,7 @@ Rectangle {
                             contentItem: Text {
                                 text: cmbException.currentText
                                 font.family: "Montserrat"
-                                font.pixelSize: 13
+                                font.pixelSize: TouchMetrics.bodyText
                                 color: "#0F172A"
                                 verticalAlignment: Text.AlignVCenter
                                 leftPadding: 10
@@ -420,7 +422,7 @@ Rectangle {
                                 contentItem: Text {
                                     text: modelData
                                     font.family: "Montserrat"
-                                    font.pixelSize: 13
+                                    font.pixelSize: TouchMetrics.bodyText
                                     color: dlg.highlighted ? "#FFFFFF" : "#0F172A"
                                     verticalAlignment: Text.AlignVCenter
                                 }
@@ -444,7 +446,7 @@ Rectangle {
             Button {
                 id: btnPrint
                 Layout.fillWidth: true
-                implicitHeight: 52
+                implicitHeight: 56
                 scale: btnPrint.pressed ? 0.96 : 1.0
                 Behavior on scale { NumberAnimation { duration: 80 } }
 
@@ -466,7 +468,7 @@ Rectangle {
                             font.bold: true
                             font.family: "Montserrat"
                             color: "white"
-                            font.pixelSize: 14
+                            font.pixelSize: TouchMetrics.buttonText
                             font.letterSpacing: 1.5
                             verticalAlignment: Text.AlignVCenter
                         }
@@ -483,13 +485,13 @@ Rectangle {
             Button {
                 id: btnReprint
                 Layout.fillWidth: true
-                implicitHeight: 48
+                implicitHeight: TouchMetrics.buttonHeight
                 enabled: bridgeObj ? bridgeObj.canReprint : false
                 contentItem: Text {
                     text: "Reprint Last Receipt"
                     color: btnReprint.enabled ? "#2563EB" : "#94A3B8"
                     font.family: "Montserrat"
-                    font.pixelSize: 12
+                    font.pixelSize: TouchMetrics.buttonText
                     font.bold: true
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -500,17 +502,17 @@ Rectangle {
 
             RowLayout {
                 Layout.fillWidth: true
-                Text { text: "Paper Status (Test):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10 }
+                Text { text: "Paper Status (Test):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText }
                 Item { Layout.fillWidth: true }
                 Repeater {
                     model: ["OK", "Low", "Out", "Jam"]
                     Button {
-                        implicitWidth: 54
-                        implicitHeight: 34
+                        implicitWidth: 64
+                        implicitHeight: 40
                         contentItem: Text {
                             text: modelData
                             font.family: "Montserrat"
-                            font.pixelSize: 10
+                            font.pixelSize: TouchMetrics.helperText
                             font.bold: true
                             color: modelData === "OK" ? "#10B981" : (modelData === "Low" ? "#F59E0B" : "#EF4444")
                             horizontalAlignment: Text.AlignHCenter

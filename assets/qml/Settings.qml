@@ -1,13 +1,16 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
     id: settingsRoot
     color: "#F4F7FB"
 
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
+    readonly property bool compactScreen: width <= 420
     readonly property bool wideLayout: width >= 760
+    readonly property bool compactActionRow: width < 520
 
     Dialog {
         id: powerDialog
@@ -34,12 +37,12 @@ Rectangle {
         id: control
         property color buttonColor: "#2563EB"
         property color hoverColor: "#1D4ED8"
-        implicitHeight: 46
+        implicitHeight: TouchMetrics.buttonHeight
         contentItem: Text {
             text: control.text
             color: "white"
             font.family: "Montserrat"
-            font.pixelSize: 11
+            font.pixelSize: TouchMetrics.buttonText
             font.bold: true
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -56,23 +59,23 @@ Rectangle {
         contentItem: Text {
             text: sw.labelText
             font.family: "Montserrat"
-            font.pixelSize: 11
+            font.pixelSize: TouchMetrics.bodyText
             font.bold: true
             color: "#111827"
             verticalAlignment: Text.AlignVCenter
             leftPadding: sw.indicator.width + 10
         }
         indicator: Rectangle {
-            implicitWidth: 42
-            implicitHeight: 22
+            implicitWidth: 52
+            implicitHeight: 30
             radius: 11
             color: sw.checked ? "#2563EB" : "#D8E1EC"
             Rectangle {
                 x: sw.checked ? parent.width - width - 3 : 3
                 y: 3
-                width: 16
-                height: 16
-                radius: 8
+                width: 24
+                height: 24
+                radius: 12
                 color: "white"
                 Behavior on x { NumberAnimation { duration: 140 } }
             }
@@ -94,23 +97,23 @@ Rectangle {
                 wrapMode: TextEdit.Wrap
                 color: "#111827"
                 font.family: "Montserrat"
-                font.pixelSize: 11
+                font.pixelSize: TouchMetrics.bodyText
                 background: Rectangle { color: "#F8FAFD"; radius: 6 }
             }
         }
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
 
-    ScrollView {
+    ScrollablePage {
         anchors.fill: parent
-        contentWidth: parent.width
+        maxContentWidth: 460
+        sidePadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
+        topPadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
+        bottomPadding: settingsRoot.compactScreen ? 20 : 36
 
         ColumnLayout {
-            width: Math.min(parent.width - 40, 1160)
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.top: parent.top
-            anchors.topMargin: 20
-            spacing: 14
+            Layout.fillWidth: true
+            spacing: settingsRoot.compactScreen ? TouchMetrics.compactSectionSpacing : TouchMetrics.sectionSpacing
 
             Rectangle {
                 Layout.fillWidth: true
@@ -137,8 +140,8 @@ Rectangle {
                         }
                         ColumnLayout {
                             spacing: 6
-                            Text { text: "Sync Diagnostics"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: 16; font.bold: true }
-                            Text { text: "Sync: " + (bridgeObj ? bridgeObj.syncStatus : "Offline"); color: bridgeObj ? bridgeObj.syncStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: 11; font.bold: true }
+                            Text { text: "Sync Diagnostics"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.sectionTitle; font.bold: true }
+                            Text { text: "Sync: " + (bridgeObj ? bridgeObj.syncStatus : "Offline"); color: bridgeObj ? bridgeObj.syncStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true }
                         }
                     }
 
@@ -151,11 +154,11 @@ Rectangle {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 9
-                            Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11 }
-                            Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Last pull mirrored: " + (bridgeObj ? bridgeObj.lastPullMirror : 0) + " records"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11 }
+                            Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
+                            Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Last pull mirrored: " + (bridgeObj ? bridgeObj.lastPullMirror : 0) + " records"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
                         }
 
                         Rectangle {
@@ -180,16 +183,18 @@ Rectangle {
                             }
                             RowLayout {
                                 Layout.fillWidth: true
-                                Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 11 }
+                                Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
                                 TextField {
                                     id: txtInterval
-                                    Layout.preferredWidth: 88
+                                    Layout.preferredWidth: 108
+                                    implicitHeight: TouchMetrics.inputHeight
                                     text: bridgeObj ? bridgeObj.pullInterval : 60
+                                    inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
                                     validator: IntValidator { bottom: 15 }
                                     horizontalAlignment: Text.AlignHCenter
                                     color: "#111827"
                                     font.family: "Montserrat"
-                                    font.pixelSize: 11
+                                    font.pixelSize: TouchMetrics.bodyText
                                     background: Rectangle { radius: 7; color: "#F8FAFD"; border.color: txtInterval.activeFocus ? "#60A5FA" : "#C9D5E3" }
                                     onEditingFinished: { if (bridgeObj && text.length) bridgeObj.pullInterval = parseInt(text) }
                                 }
@@ -199,12 +204,72 @@ Rectangle {
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#D8E1EC" }
 
-                    RowLayout {
+                    GridLayout {
                         Layout.fillWidth: true
-                        spacing: 12
-                        ActionButton { text: "Sync Now"; Layout.preferredWidth: 138; onClicked: { if (bridgeObj) bridgeObj.syncNow() } }
-                        ActionButton { text: "Test Print"; buttonColor: "#0F766E"; hoverColor: "#115E59"; Layout.preferredWidth: 138; onClicked: { if (bridgeObj) bridgeObj.printTestReceipt() } }
-                        ActionButton { text: "View Logs"; buttonColor: "#111827"; hoverColor: "#1F2937"; Layout.preferredWidth: 138; onClicked: logsDialog.open() }
+                        columns: settingsRoot.compactActionRow ? 2 : 3
+                        columnSpacing: 12
+                        rowSpacing: 12
+                        ActionButton {
+                            text: "Sync Now"
+                            Layout.fillWidth: true
+                            onClicked: { if (bridgeObj) bridgeObj.syncNow() }
+                        }
+                        ActionButton {
+                            text: "View Logs"
+                            buttonColor: "#111827"
+                            hoverColor: "#1F2937"
+                            Layout.fillWidth: true
+                            onClicked: logsDialog.open()
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: printerCardContent.implicitHeight + 48
+                radius: 8
+                color: "white"
+                border.color: "#D8E1EC"
+
+                ColumnLayout {
+                    id: printerCardContent
+                    anchors.fill: parent
+                    anchors.margins: 24
+                    spacing: 14
+
+                    Text {
+                        text: "Printer Settings"
+                        color: "#111827"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.sectionTitle
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Send a direct ESC/POS test receipt to the USB thermal printer connected at /dev/usb/lp0."
+                        color: "#526176"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        text: "Printer Status: " + (bridgeObj && bridgeObj.testPrintBusy ? "Printing..." : "Ready")
+                        color: bridgeObj && bridgeObj.testPrintBusy ? "#B45309" : "#0F766E"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        font.bold: true
+                    }
+
+                    ActionButton {
+                        text: bridgeObj && bridgeObj.testPrintBusy ? "Printing..." : "Test Print"
+                        buttonColor: "#0F766E"
+                        hoverColor: "#115E59"
+                        Layout.fillWidth: true
+                        enabled: bridgeObj ? !bridgeObj.testPrintBusy : false
+                        onClicked: { if (bridgeObj) bridgeObj.printTestReceipt() }
                     }
                 }
             }
@@ -234,8 +299,8 @@ Rectangle {
                         }
                         ColumnLayout {
                             spacing: 6
-                            Text { text: "Connectivity"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: 16; font.bold: true }
-                            Text { text: bridgeObj ? bridgeObj.wifiStatus : "Status: Checking..."; color: bridgeObj ? bridgeObj.wifiStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: 11; elide: Text.ElideRight; Layout.maximumWidth: settingsRoot.width - 140 }
+                            Text { text: "Connectivity"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.sectionTitle; font.bold: true }
+                            Text { text: bridgeObj ? bridgeObj.wifiStatus : "Status: Checking..."; color: bridgeObj ? bridgeObj.wifiStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; elide: Text.ElideRight; Layout.maximumWidth: settingsRoot.width - 140 }
                         }
                     }
 
@@ -261,7 +326,7 @@ Rectangle {
                             }
                             color: "#526176"
                             font.family: "Montserrat"
-                            font.pixelSize: 11
+                            font.pixelSize: TouchMetrics.bodyText
                             wrapMode: Text.WordWrap
                         }
                     }
@@ -270,7 +335,7 @@ Rectangle {
                         text: "Network"
                         color: "#111827"
                         font.family: "Montserrat"
-                        font.pixelSize: 11
+                        font.pixelSize: TouchMetrics.bodyText
                         font.bold: true
                     }
 
@@ -283,7 +348,7 @@ Rectangle {
                             editable: false
                             model: bridgeObj ? bridgeObj.wifiNetworks : []
                             font.family: "Montserrat"
-                            font.pixelSize: 11
+                            font.pixelSize: TouchMetrics.bodyText
                             leftPadding: 14
                             rightPadding: 42
 
@@ -319,7 +384,7 @@ Rectangle {
 
                             delegate: ItemDelegate {
                                 width: cmbWifi.width
-                                implicitHeight: 42
+                                implicitHeight: TouchMetrics.inputHeight
                                 highlighted: cmbWifi.highlightedIndex === index
                                 contentItem: Text {
                                     text: modelData
@@ -340,7 +405,7 @@ Rectangle {
                             }
 
                             background: Rectangle {
-                                implicitHeight: 48
+                                implicitHeight: TouchMetrics.inputHeight
                                 radius: 7
                                 color: "#F8FAFD"
                                 border.color: cmbWifi.activeFocus ? "#60A5FA" : "#C9D5E3"
@@ -359,7 +424,7 @@ Rectangle {
                         text: "Choose a network from the scan results, then enter its password below."
                         color: "#526176"
                         font.family: "Montserrat"
-                        font.pixelSize: 11
+                        font.pixelSize: TouchMetrics.bodyText
                         wrapMode: Text.WordWrap
                     }
 
@@ -371,10 +436,11 @@ Rectangle {
                             Layout.fillWidth: true
                             placeholderText: "Password"
                             echoMode: TextInput.Password
+                            inputMethodHints: Qt.ImhHiddenText | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
                             color: "#111827"
                             font.family: "Montserrat"
-                            font.pixelSize: 11
-                            background: Rectangle { implicitHeight: 48; radius: 7; color: "#F8FAFD"; border.color: txtWifiPassword.activeFocus ? "#60A5FA" : "#C9D5E3" }
+                            font.pixelSize: TouchMetrics.bodyText
+                            background: Rectangle { implicitHeight: TouchMetrics.inputHeight; radius: 7; color: "#F8FAFD"; border.color: txtWifiPassword.activeFocus ? "#60A5FA" : "#C9D5E3" }
                             onAccepted: btnConnect.clicked()
                         }
                         ActionButton {
@@ -413,7 +479,7 @@ Rectangle {
                         text: "Power"
                         color: "#111827"
                         font.family: "Montserrat"
-                        font.pixelSize: 16
+                        font.pixelSize: TouchMetrics.sectionTitle
                         font.bold: true
                     }
 
@@ -422,7 +488,7 @@ Rectangle {
                         text: "Use this before switching off external power to help prevent Raspberry Pi OS corruption."
                         color: "#526176"
                         font.family: "Montserrat"
-                        font.pixelSize: 11
+                        font.pixelSize: TouchMetrics.bodyText
                         wrapMode: Text.WordWrap
                     }
 
@@ -430,7 +496,8 @@ Rectangle {
                         text: "Power Off Device"
                         buttonColor: "#B91C1C"
                         hoverColor: "#991B1B"
-                        Layout.preferredWidth: 168
+                        Layout.fillWidth: settingsRoot.compactScreen
+                        Layout.preferredWidth: settingsRoot.compactScreen ? -1 : 168
                         onClicked: powerDialog.open()
                     }
                 }

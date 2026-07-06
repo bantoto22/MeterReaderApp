@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
     id: progressRoot
@@ -9,6 +10,7 @@ Rectangle {
 
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property real compPercent: bridgeObj ? bridgeObj.zoneCompletionPercentage : 0.0
+    readonly property bool compactScreen: width <= 420
     property int pendingReprintConsumerId: -1
 
     Dialog {
@@ -48,16 +50,13 @@ Rectangle {
         currentIndex: bridgeObj && bridgeObj.progressDetailsVisible ? 1 : 0
 
         Item {
-            ScrollView {
+            ScrollablePage {
                 anchors.fill: parent
-                contentWidth: parent.width
+                maxContentWidth: 440
 
                 ColumnLayout {
-                    width: Math.min(parent.width - 40, 1240)
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: parent.top
-                    anchors.topMargin: 16
-                    spacing: 16
+                    Layout.fillWidth: true
+                    spacing: TouchMetrics.sectionSpacing
 
                     ColumnLayout {
                         Layout.fillWidth: true
@@ -65,7 +64,7 @@ Rectangle {
 
                         Text {
                             text: "Assigned Zone"
-                            font.pixelSize: 13
+                            font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
                             color: "#334155"
@@ -78,7 +77,7 @@ Rectangle {
                             currentIndex: bridgeObj ? Math.max(0, bridgeObj.zones.indexOf(bridgeObj.selectedZone)) : 0
 
                             background: Rectangle {
-                                implicitHeight: 54
+                                implicitHeight: TouchMetrics.buttonHeight
                                 radius: 8
                                 border.color: cmbProgressZone.focus ? "#3B82F6" : "#E2E8F0"
                                 border.width: 1
@@ -88,7 +87,7 @@ Rectangle {
                             contentItem: Text {
                                 text: cmbProgressZone.currentText
                                 font.family: "Montserrat"
-                                font.pixelSize: 13
+                                font.pixelSize: TouchMetrics.bodyText
                                 color: "#0F172A"
                                 verticalAlignment: Text.AlignVCenter
                                 leftPadding: 10
@@ -111,7 +110,7 @@ Rectangle {
                     Rectangle {
                         id: zoneProgressCard
                         Layout.fillWidth: true
-                        implicitHeight: 340
+                        implicitHeight: progressCardContent.implicitHeight + (progressRoot.compactScreen ? 28 : 40)
                         radius: 8
                         color: "#1F4FC4"
                         border.color: "#1F4FC4"
@@ -232,15 +231,16 @@ Rectangle {
                                 }
 
                                 ColumnLayout {
+                                    id: progressCardContent
                                     anchors.fill: parent
-                                    anchors.margins: 20
-                                    spacing: 12
+                                    anchors.margins: progressRoot.compactScreen ? 14 : 20
+                                    spacing: progressRoot.compactScreen ? 10 : 12
 
                                     Text {
                                         Layout.alignment: Qt.AlignHCenter
                                         text: "Today's Progress"
                                         color: "white"
-                                        font.pixelSize: 12
+                                        font.pixelSize: TouchMetrics.bodyText
                                         font.family: "Montserrat"
                                         font.bold: true
                                         font.letterSpacing: 1.2
@@ -250,7 +250,7 @@ Rectangle {
                                         Layout.alignment: Qt.AlignHCenter
                                         text: bridgeObj ? bridgeObj.zoneReadFraction : "0/0"
                                         color: "white"
-                                        font.pixelSize: 52
+                                        font.pixelSize: 56
                                         font.family: "Montserrat"
                                         font.bold: true
                                     }
@@ -259,7 +259,7 @@ Rectangle {
                                         Layout.alignment: Qt.AlignHCenter
                                         text: "Meters Read"
                                         color: "#93C5FD"
-                                        font.pixelSize: 12
+                                        font.pixelSize: TouchMetrics.bodyText
                                         font.family: "Montserrat"
                                     }
 
@@ -301,7 +301,7 @@ Rectangle {
                                                     Layout.alignment: Qt.AlignHCenter
                                                     text: bridgeObj ? bridgeObj.zoneRemainingCount : "0"
                                                     color: "white"
-                                                    font.pixelSize: 24
+                                                    font.pixelSize: 28
                                                     font.family: "Montserrat"
                                                     font.bold: true
                                                 }
@@ -309,7 +309,7 @@ Rectangle {
                                                     Layout.alignment: Qt.AlignHCenter
                                                     text: "Remaining"
                                                     color: "#93C5FD"
-                                                    font.pixelSize: 11
+                                                    font.pixelSize: TouchMetrics.helperText
                                                     font.family: "Montserrat"
                                                 }
                                             }
@@ -329,7 +329,7 @@ Rectangle {
                                                     Layout.alignment: Qt.AlignHCenter
                                                     text: bridgeObj ? bridgeObj.zoneFlaggedCount : "0"
                                                     color: "#FBBF24"
-                                                    font.pixelSize: 24
+                                                    font.pixelSize: 28
                                                     font.family: "Montserrat"
                                                     font.bold: true
                                                 }
@@ -337,7 +337,7 @@ Rectangle {
                                                     Layout.alignment: Qt.AlignHCenter
                                                     text: "Flagged"
                                                     color: "#93C5FD"
-                                                    font.pixelSize: 11
+                                                    font.pixelSize: TouchMetrics.helperText
                                                     font.family: "Montserrat"
                                                 }
                                             }
@@ -348,7 +348,7 @@ Rectangle {
                                         Layout.alignment: Qt.AlignHCenter
                                         text: "Tap for details"
                                         color: "#93C5FD"
-                                        font.pixelSize: 9
+                                        font.pixelSize: TouchMetrics.helperText
                                         font.family: "Montserrat"
                                     }
                                 }
@@ -358,29 +358,30 @@ Rectangle {
 
                     Rectangle {
                         Layout.fillWidth: true
-                        implicitHeight: 150
+                        implicitHeight: zoneSummaryContent.implicitHeight + (progressRoot.compactScreen ? 26 : 36)
                         radius: 8
                         color: "white"
                         border.color: "#D8E1EC"
 
                         RowLayout {
+                            id: zoneSummaryContent
                             anchors.fill: parent
-                            anchors.margins: 26
+                            anchors.margins: progressRoot.compactScreen ? 16 : 26
                             ColumnLayout {
                                 spacing: 5
-                                Text { text: bridgeObj ? bridgeObj.selectedZone : "-"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: 22; font.bold: true }
-                                Text { text: (bridgeObj ? bridgeObj.zoneReadFraction.split("/")[1] : "0") + " households assigned"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10 }
+                                Text { text: bridgeObj ? bridgeObj.selectedZone : "-"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.pageTitle; font.bold: true }
+                                Text { text: (bridgeObj ? bridgeObj.zoneReadFraction.split("/")[1] : "0") + " households assigned"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText }
                                 RowLayout {
                                     spacing: 10
-                                    Text { text: (bridgeObj ? bridgeObj.zoneCompletionPercentage : 0) + "%"; color: "#10B981"; font.family: "Montserrat"; font.pixelSize: 31; font.bold: true }
-                                    Text { text: "Complete"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: 10; font.bold: true; Layout.alignment: Qt.AlignBottom }
+                                    Text { text: (bridgeObj ? bridgeObj.zoneCompletionPercentage : 0) + "%"; color: "#10B981"; font.family: "Montserrat"; font.pixelSize: 34; font.bold: true }
+                                    Text { text: "Complete"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; font.bold: true; Layout.alignment: Qt.AlignBottom }
                                 }
                             }
                             Item { Layout.fillWidth: true }
                             Button {
-                                implicitWidth: 116
-                                implicitHeight: 44
-                                contentItem: Text { text: "Sync Now"; color: "#2563EB"; font.family: "Montserrat"; font.pixelSize: 10; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                implicitWidth: 140
+                                implicitHeight: TouchMetrics.buttonHeight
+                                contentItem: Text { text: "Sync Now"; color: "#2563EB"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                                 background: Rectangle { radius: 7; color: parent.hovered ? "#DBEAFE" : "white"; border.color: "#BFDBFE" }
                                 onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                             }
@@ -391,20 +392,19 @@ Rectangle {
         }
 
         Item {
-            ScrollView {
+            ScrollablePage {
                 anchors.fill: parent
-                contentWidth: parent.width
+                maxContentWidth: 450
+                sidePadding: width <= 420 ? 10 : 15
+                topPadding: 12
 
                 ColumnLayout {
-                    width: parent.width - 30
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: parent.top
-                    anchors.topMargin: 12
-                    spacing: 12
+                    Layout.fillWidth: true
+                    spacing: TouchMetrics.sectionSpacing
 
                     Rectangle {
                         Layout.fillWidth: true
-                        height: 50
+                        implicitHeight: progressRoot.compactScreen ? 46 : 50
                         radius: 12
                         clip: true
                         color: "#1D4ED8"
@@ -416,8 +416,8 @@ Rectangle {
 
                             Button {
                                 id: btnBackDetails
-                                implicitWidth: 42
-                                implicitHeight: 42
+                                implicitWidth: TouchMetrics.iconButtonSize
+                                implicitHeight: TouchMetrics.iconButtonSize
                                 scale: pressed ? 0.92 : 1.0
                                 Behavior on scale { NumberAnimation { duration: 80 } }
                                 text: "<"
@@ -425,7 +425,7 @@ Rectangle {
                                 contentItem: Text {
                                     text: "<"
                                     color: "white"
-                                    font.pixelSize: 18
+                                    font.pixelSize: TouchMetrics.buttonText
                                     font.bold: true
                                     horizontalAlignment: Text.AlignHCenter
                                     verticalAlignment: Text.AlignVCenter
@@ -438,7 +438,7 @@ Rectangle {
                                 text: bridgeObj ? (bridgeObj.selectedZone + " - Details") : "Details"
                                 color: "white"
                                 font.family: "Montserrat"
-                                font.pixelSize: 14
+                                font.pixelSize: 18
                                 font.bold: true
                                 horizontalAlignment: Text.AlignHCenter
                             }
@@ -465,7 +465,7 @@ Rectangle {
                                 return "Total: " + rows.length + " | Read: " + readCount + " | Remaining: " + (rows.length - readCount)
                             }
                             font.family: "Montserrat"
-                            font.pixelSize: 11
+                            font.pixelSize: TouchMetrics.bodyText
                             font.bold: true
                             color: "#0F172A"
                         }
@@ -485,7 +485,7 @@ Rectangle {
                         readonly property real statusColumnWidth: columnsWidth * 0.16
                         readonly property real readingColumnWidth: columnsWidth * 0.16
                         readonly property real actionColumnWidth: columnsWidth * 0.16
-                        implicitHeight: Math.min(520, Math.max(142, 52 + rowCount * 44))
+                        implicitHeight: Math.min(560, Math.max(160, 58 + rowCount * TouchMetrics.tableRowHeight))
 
                         ColumnLayout {
                             anchors.fill: parent
@@ -496,11 +496,11 @@ Rectangle {
                                 Layout.fillWidth: true
                                 spacing: 8
 
-                                Rectangle { Layout.preferredWidth: detailsTable.meterColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Meter"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.preferredWidth: detailsTable.nameColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Name"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.preferredWidth: detailsTable.statusColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Status"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.preferredWidth: detailsTable.readingColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Reading"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
-                                Rectangle { Layout.preferredWidth: detailsTable.actionColumnWidth; Layout.preferredHeight: 38; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Action"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: 9 } }
+                                Rectangle { Layout.preferredWidth: detailsTable.meterColumnWidth; Layout.preferredHeight: TouchMetrics.tableHeaderHeight; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Meter"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: TouchMetrics.helperText } }
+                                Rectangle { Layout.preferredWidth: detailsTable.nameColumnWidth; Layout.preferredHeight: TouchMetrics.tableHeaderHeight; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Name"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: TouchMetrics.helperText } }
+                                Rectangle { Layout.preferredWidth: detailsTable.statusColumnWidth; Layout.preferredHeight: TouchMetrics.tableHeaderHeight; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Status"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: TouchMetrics.helperText } }
+                                Rectangle { Layout.preferredWidth: detailsTable.readingColumnWidth; Layout.preferredHeight: TouchMetrics.tableHeaderHeight; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Reading"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: TouchMetrics.helperText } }
+                                Rectangle { Layout.preferredWidth: detailsTable.actionColumnWidth; Layout.preferredHeight: TouchMetrics.tableHeaderHeight; color: "#E2E8F0"; Text { anchors.centerIn: parent; text: "Action"; font.family: "Montserrat"; font.bold: true; color: "#64748B"; font.pixelSize: TouchMetrics.helperText } }
                             }
 
                             ListView {
@@ -512,17 +512,17 @@ Rectangle {
 
                                 delegate: Rectangle {
                                     width: ListView.view.width
-                                    height: 43
+                                    height: TouchMetrics.tableRowHeight
                                     color: modelData.is_read ? "#E8F5E9" : "white"
 
                                     RowLayout {
                                         anchors.fill: parent
                                         spacing: 8
 
-                                        Text { Layout.preferredWidth: detailsTable.meterColumnWidth; text: modelData.meter_no; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; leftPadding: 8 }
-                                        Text { Layout.preferredWidth: detailsTable.nameColumnWidth; text: modelData.name; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignLeft; leftPadding: 8 }
-                                        Text { Layout.preferredWidth: detailsTable.statusColumnWidth; text: modelData.is_read ? "Read" : "Pending"; font.family: "Montserrat"; font.pixelSize: 9; font.bold: true; color: modelData.is_read ? "#10B981" : "#64748B"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                                        Text { Layout.preferredWidth: detailsTable.readingColumnWidth; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.family: "Montserrat"; font.pixelSize: 9; color: "#0F172A"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                        Text { Layout.preferredWidth: detailsTable.meterColumnWidth; text: modelData.meter_no; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; leftPadding: 8 }
+                                        Text { Layout.preferredWidth: detailsTable.nameColumnWidth; text: modelData.name; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignLeft; leftPadding: 8 }
+                                        Text { Layout.preferredWidth: detailsTable.statusColumnWidth; text: modelData.is_read ? "Read" : "Pending"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; font.bold: true; color: modelData.is_read ? "#10B981" : "#64748B"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                        Text { Layout.preferredWidth: detailsTable.readingColumnWidth; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
                                         Button {
                                             id: btnRowPrint
                                             Layout.preferredWidth: detailsTable.actionColumnWidth
@@ -536,7 +536,7 @@ Rectangle {
                                                 color: btnRowPrint.pressed ? "#DBEAFE" : (btnRowPrint.hovered ? "#EFF6FF" : "transparent")
                                                 Behavior on color { ColorAnimation { duration: 120 } }
                                             }
-                                            contentItem: Text { text: "Print"; color: "#1D4ED8"; font.pixelSize: 10; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                            contentItem: Text { text: "Print"; color: "#1D4ED8"; font.pixelSize: TouchMetrics.helperText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                                             onClicked: {
                                                 pendingReprintConsumerId = modelData.id
                                                 reprintConfirmDialog.open()
@@ -548,7 +548,7 @@ Rectangle {
                                             text: "-"
                                             color: "#64748B"
                                             font.family: "Montserrat"
-                                            font.pixelSize: 9
+                                            font.pixelSize: TouchMetrics.helperText
                                             horizontalAlignment: Text.AlignHCenter
                                             verticalAlignment: Text.AlignVCenter
                                         }

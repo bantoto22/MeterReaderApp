@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
     id: mainContainerRoot
@@ -10,6 +11,8 @@ Rectangle {
 
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property int currentActiveTab: bridgeObj ? bridgeObj.currentTab : 0
+    readonly property bool compactScreen: width <= 420
+    readonly property int keyboardInset: appKeyboard.visibleHeight
 
     function showToast(message) {
         toastText.text = message
@@ -34,7 +37,7 @@ Rectangle {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 28
+        height: 32
         color: "#0B1220"
         z: 30
 
@@ -42,7 +45,7 @@ Rectangle {
             anchors.centerIn: parent
             text: bridgeObj ? bridgeObj.statusTime : "--:--"
             color: "white"
-            font.pixelSize: 11
+            font.pixelSize: TouchMetrics.smallText
             font.family: "Montserrat"
             font.bold: true
         }
@@ -53,7 +56,7 @@ Rectangle {
             anchors.rightMargin: 64
             text: bridgeObj ? ("PAPER " + bridgeObj.paperStatus.toUpperCase()) : "PAPER --"
             color: bridgeObj && bridgeObj.paperStatus.toLowerCase() === "ok" ? "#43A047" : "#F59E0B"
-            font.pixelSize: 10
+            font.pixelSize: TouchMetrics.smallText
             font.family: "Montserrat"
         }
 
@@ -63,7 +66,7 @@ Rectangle {
             anchors.rightMargin: 12
             text: bridgeObj ? (bridgeObj.batteryLevel + "%") : "--%"
             color: "white"
-            font.pixelSize: 10
+            font.pixelSize: TouchMetrics.smallText
             font.family: "Montserrat"
             font.bold: true
         }
@@ -84,8 +87,8 @@ Rectangle {
         id: profilePopup
         x: parent.width - width - 12
         y: 76
-        width: 200
-        height: 136
+        width: 240
+        height: 176
         modal: true
         focus: true
 
@@ -103,7 +106,7 @@ Rectangle {
 
             Text {
                 text: bridgeObj ? bridgeObj.readerName : "User"
-                font.pixelSize: 13
+                font.pixelSize: TouchMetrics.bodyText
                 font.family: "Montserrat"
                 font.bold: true
                 color: "#0F172A"
@@ -115,7 +118,7 @@ Rectangle {
 
             Text {
                 text: bridgeObj ? ("ID: " + bridgeObj.readerId) : "ID: --"
-                font.pixelSize: 10
+                font.pixelSize: TouchMetrics.helperText
                 font.family: "Montserrat"
                 color: "#64748B"
                 horizontalAlignment: Text.AlignHCenter
@@ -127,8 +130,8 @@ Rectangle {
 
             Button {
                 Layout.alignment: Qt.AlignHCenter
-                Layout.preferredWidth: 152
-                Layout.preferredHeight: 40
+                Layout.preferredWidth: 170
+                Layout.preferredHeight: TouchMetrics.buttonHeight
                 text: "Log Out"
                 scale: pressed ? 0.96 : 1.0
                 Behavior on scale { NumberAnimation { duration: 80 } }
@@ -136,7 +139,7 @@ Rectangle {
                     text: "Log Out"
                     color: "white"
                     font.family: "Montserrat"
-                    font.pixelSize: 11
+                    font.pixelSize: TouchMetrics.buttonText
                     font.bold: true
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -158,8 +161,8 @@ Rectangle {
         id: toastPopup
         x: (parent.width - width) / 2
         y: 40
-        width: 240
-        height: 48
+        width: Math.min(parent.width - 32, 360)
+        height: 64
         modal: false
         focus: false
         closePolicy: Popup.NoAutoClose
@@ -179,7 +182,7 @@ Rectangle {
             verticalAlignment: Text.AlignVCenter
             color: "white"
             font.family: "Montserrat"
-            font.pixelSize: 11
+            font.pixelSize: TouchMetrics.bodyText
             font.bold: true
             wrapMode: Text.WordWrap
         }
@@ -217,7 +220,7 @@ Rectangle {
             wrapMode: Text.WordWrap
             color: "#111827"
             font.family: "Montserrat"
-            font.pixelSize: 12
+            font.pixelSize: TouchMetrics.bodyText
         }
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
@@ -237,7 +240,7 @@ Rectangle {
                 wrapMode: TextEdit.NoWrap
                 color: "#111827"
                 font.family: "Courier New"
-                font.pixelSize: 12
+                font.pixelSize: TouchMetrics.codeText
                 background: Rectangle { color: "#F8FAFD"; radius: 6 }
             }
         }
@@ -253,8 +256,8 @@ Rectangle {
 
         Rectangle {
             anchors.centerIn: parent
-            width: 180
-            height: 120
+            width: 220
+            height: 150
             radius: 18
             color: "#111827"
             border.color: "#334155"
@@ -266,18 +269,18 @@ Rectangle {
 
                 BusyIndicator {
                     running: bridgeObj && bridgeObj.operationBusy
-                    width: 28
-                    height: 28
+                    width: 36
+                    height: 36
                 }
 
                 Text {
                     text: bridgeObj ? bridgeObj.operationBusyMessage : "Working..."
                     color: "white"
                     font.family: "Montserrat"
-                    font.pixelSize: 12
+                    font.pixelSize: TouchMetrics.bodyText
                     font.bold: true
                     horizontalAlignment: Text.AlignHCenter
-                    Layout.preferredWidth: 150
+                    Layout.preferredWidth: 180
                     wrapMode: Text.WordWrap
                 }
             }
@@ -286,13 +289,13 @@ Rectangle {
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.topMargin: 28
+        anchors.topMargin: statusBar.height
         spacing: 0
 
         Rectangle {
             id: navBar
             Layout.fillWidth: true
-            height: 64
+            height: mainContainerRoot.compactScreen ? TouchMetrics.compactNavHeight : 70
             color: "#111827"
 
             RowLayout {
@@ -306,7 +309,7 @@ Rectangle {
                     contentItem: Text {
                         text: "Meter Entry"
                         color: currentActiveTab === 0 ? "#FFFFFF" : "#A8B4C5"
-                        font.pixelSize: 13
+                        font.pixelSize: mainContainerRoot.compactScreen ? TouchMetrics.compactTabText : TouchMetrics.tabText
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -323,7 +326,7 @@ Rectangle {
                     contentItem: Text {
                         text: "Progress"
                         color: currentActiveTab === 1 ? "#FFFFFF" : "#A8B4C5"
-                        font.pixelSize: 13
+                        font.pixelSize: mainContainerRoot.compactScreen ? TouchMetrics.compactTabText : TouchMetrics.tabText
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -340,7 +343,7 @@ Rectangle {
                     contentItem: Text {
                         text: "Settings"
                         color: currentActiveTab === 2 ? "#FFFFFF" : "#A8B4C5"
-                        font.pixelSize: 13
+                        font.pixelSize: mainContainerRoot.compactScreen ? TouchMetrics.compactTabText : TouchMetrics.tabText
                         font.family: "Montserrat"
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
@@ -375,7 +378,7 @@ Rectangle {
 
         Rectangle {
             Layout.fillWidth: true
-            height: 56
+            height: mainContainerRoot.compactScreen ? TouchMetrics.compactTopBarHeight : TouchMetrics.topBarHeight
             gradient: Gradient {
                 GradientStop { position: 0.0; color: "#2563EB" }
                 GradientStop { position: 1.0; color: "#1D4ED8" }
@@ -385,19 +388,19 @@ Rectangle {
                 anchors.fill: parent
                 anchors.leftMargin: 16
                 anchors.rightMargin: 16
-                spacing: 8
+                spacing: 12
 
                 Image {
                     source: "../images/SLR logo 1.png"
-                    Layout.preferredWidth: 26
-                    Layout.preferredHeight: 26
+                    Layout.preferredWidth: 34
+                    Layout.preferredHeight: 34
                     fillMode: Image.PreserveAspectFit
                 }
 
                 Text {
                     text: "Water Meter Reading System"
                     color: "white"
-                    font.pixelSize: 14
+                    font.pixelSize: mainContainerRoot.compactScreen ? TouchMetrics.bodyText : 18
                     font.family: "Montserrat"
                     font.bold: true
                 }
@@ -408,14 +411,14 @@ Rectangle {
                     text: bridgeObj ? bridgeObj.readerName : "User"
                     color: "white"
                     font.family: "Montserrat"
-                    font.pixelSize: 11
+                    font.pixelSize: mainContainerRoot.compactScreen ? TouchMetrics.helperText : TouchMetrics.bodyText
                     font.bold: true
                 }
 
                 Rectangle {
-                    width: 32
-                    height: 32
-                    radius: 16
+                    width: TouchMetrics.iconButtonSize
+                    height: TouchMetrics.iconButtonSize
+                    radius: TouchMetrics.iconButtonSize / 2
                     color: "#DBEAFE"
                     scale: profilePressed ? 0.95 : 1.0
 
@@ -427,7 +430,7 @@ Rectangle {
                         anchors.centerIn: parent
                         text: "U"
                         color: "#1E40AF"
-                        font.pixelSize: 12
+                        font.pixelSize: TouchMetrics.bodyText
                         font.family: "Montserrat"
                         font.bold: true
                     }
@@ -447,6 +450,7 @@ Rectangle {
             id: contentStack
             Layout.fillWidth: true
             Layout.fillHeight: true
+            Layout.bottomMargin: mainContainerRoot.keyboardInset
             currentIndex: currentActiveTab
 
             Loader {
@@ -467,5 +471,9 @@ Rectangle {
                 Layout.fillHeight: true
             }
         }
+    }
+
+    KeyboardPanel {
+        id: appKeyboard
     }
 }

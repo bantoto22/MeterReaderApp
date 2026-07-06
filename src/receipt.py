@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import os
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import tkinter as tk
 
 FONT_FAMILY = "Montserrat"
+RAW_PRINTER_DEVICE = "/dev/usb/lp0"
 
 def _require_float(consumer: dict, field_name: str) -> float:
     value = consumer.get(field_name)
@@ -177,6 +179,88 @@ def can_use_system_printer() -> bool:
     if os.name == "nt":
         return False
     return shutil.which("lp") is not None or shutil.which("lpr") is not None
+
+
+def build_test_receipt_text(now: datetime.datetime | None = None) -> str:
+    now = now or datetime.datetime.now()
+    return "\n".join(
+        [
+            "SAN LORENZO RUIZ WATERWORKS SYSTEM",
+            "Billing and Payment System",
+            "",
+            "TEST PRINT",
+            "",
+            "Printer connection successful.",
+            "Device: Meter Reader Handheld",
+            "Status: Ready",
+            "",
+            f"Date: {now.strftime('%Y-%m-%d')}",
+            f"Time: {now.strftime('%I:%M %p')}",
+            "",
+            "--------------------------------",
+            "This is a printer test receipt.",
+            "--------------------------------",
+        ]
+    )
+
+
+def _build_test_receipt_escpos(now: datetime.datetime | None = None) -> bytes:
+    now = now or datetime.datetime.now()
+    nl = b"\n"
+    init = b"\x1b@"
+    align_left = b"\x1ba\x00"
+    align_center = b"\x1ba\x01"
+    bold_on = b"\x1bE\x01"
+    bold_off = b"\x1bE\x00"
+    double_size = b"\x1d!\x11"
+    normal_size = b"\x1d!\x00"
+    feed_lines = b"\n\n\n\n"
+
+    body = build_test_receipt_text(now)
+    body_lines = body.splitlines()
+    heading_lines = body_lines[:2]
+    remaining_lines = body_lines[2:]
+
+    chunks: list[bytes] = [init, align_center, bold_on, double_size]
+    for line in heading_lines:
+        chunks.append(line.encode("ascii", errors="replace") + nl)
+    chunks.extend([normal_size, bold_off, nl, bold_on])
+    chunks.append("TEST PRINT".encode("ascii") + nl)
+    chunks.extend([bold_off, nl, align_left])
+    for line in remaining_lines[2:]:
+        chunks.append(line.encode("ascii", errors="replace") + nl)
+    chunks.append(feed_lines)
+    return b"".join(chunks)
+
+
+def print_test_receipt(device_path: str = RAW_PRINTER_DEVICE) -> str:
+    if os.name == "nt":
+        raise RuntimeError("Raw USB printer testing is available only on the Raspberry Pi Linux device.")
+
+    if not os.path.exists(device_path):
+        raise RuntimeError("Printer device /dev/usb/lp0 was not found.")
+
+    print_data = _build_test_receipt_escpos()
+    try:
+        with open(device_path, "wb") as printer:
+            printer.write(print_data)
+            printer.flush()
+    except PermissionError as exc:
+        raise RuntimeError("Permission denied while accessing /dev/usb/lp0.") from exc
+    except BlockingIOError as exc:
+        raise RuntimeError("Printer device /dev/usb/lp0 is busy.") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("Printer device /dev/usb/lp0 was not found.") from exc
+    except OSError as exc:
+        if exc.errno in {errno.EBUSY, errno.EAGAIN}:
+            raise RuntimeError("Printer device /dev/usb/lp0 is busy.") from exc
+        if exc.errno in {errno.ENODEV, errno.ENXIO}:
+            raise RuntimeError("Printer appears to be disconnected from /dev/usb/lp0.") from exc
+        if exc.errno in {errno.EIO, errno.EPIPE}:
+            raise RuntimeError("Write failure while sending data to /dev/usb/lp0.") from exc
+        raise RuntimeError(str(exc) or "Unknown printer write failure.") from exc
+
+    return build_test_receipt_text()
 
 
 def send_to_system_printer(receipt_text: str, printer_name: str | None = None) -> None:

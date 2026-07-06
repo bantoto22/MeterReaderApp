@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
     id: loginRoot
@@ -11,36 +12,26 @@ Rectangle {
 
     property bool compactScreen: width <= 420
     property bool narrowScreen: width < 600
-    property int horizontalPadding: compactScreen ? 22 : (narrowScreen ? 16 : 24)
-    property int verticalPadding: compactScreen ? 16 : (narrowScreen ? 20 : 28)
+    property int horizontalPadding: compactScreen ? TouchMetrics.compactPageMargin : (narrowScreen ? 16 : 24)
+    property int verticalPadding: compactScreen ? TouchMetrics.compactPageMargin : (narrowScreen ? 20 : 28)
+    property int keyboardInset: loginKeyboard.visibleHeight
 
     color: "#F4F7FB"
 
-    Flickable {
-        id: loginScroller
+    ScrollablePage {
         anchors.fill: parent
-        clip: true
-        contentWidth: width
-        contentHeight: contentWrapper.height
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
+        anchors.bottomMargin: loginRoot.keyboardInset
+        maxContentWidth: loginRoot.compactScreen ? 320 : 420
+        sidePadding: loginRoot.horizontalPadding
+        topPadding: loginRoot.verticalPadding
+        bottomPadding: loginRoot.verticalPadding + loginRoot.keyboardInset + 18
+        contentSpacing: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 20)
 
-        Item {
-            id: contentWrapper
-            width: loginScroller.width
-            height: loginColumn.implicitHeight + (loginRoot.verticalPadding * 2)
-
-            ColumnLayout {
-                id: loginColumn
-                width: Math.min(
-                    contentWrapper.width - (loginRoot.horizontalPadding * 2),
-                    loginRoot.compactScreen ? 320 : (loginRoot.narrowScreen ? contentWrapper.width - (loginRoot.horizontalPadding * 2) : 420)
-                )
-                x: Math.max(loginRoot.horizontalPadding, (contentWrapper.width - width) / 2)
-                y: loginRoot.verticalPadding
-                spacing: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 20)
-                transform: Translate { id: shakeOffset }
+        ColumnLayout {
+            id: loginColumn
+            Layout.fillWidth: true
+            spacing: loginRoot.compactScreen ? 12 : (loginRoot.narrowScreen ? 16 : 20)
+            transform: Translate { id: shakeOffset }
 
                 // Logo Image with Entry Animation
                 Image {
@@ -84,7 +75,7 @@ Rectangle {
                         Layout.alignment: Qt.AlignHCenter
                         Layout.fillWidth: true
                         text: "San Lorenzo Ruiz Waterworks System"
-                        font.pixelSize: loginRoot.compactScreen ? 15 : (loginRoot.narrowScreen ? 17 : 18)
+                        font.pixelSize: loginRoot.compactScreen ? 20 : TouchMetrics.pageTitle
                         font.family: "Montserrat"
                         font.bold: true
                         color: "#0f172a"
@@ -96,7 +87,7 @@ Rectangle {
                         Layout.alignment: Qt.AlignHCenter
                         Layout.fillWidth: true
                         text: "Water Billing and Payment Record Management System"
-                        font.pixelSize: loginRoot.compactScreen ? 9 : (loginRoot.narrowScreen ? 10 : 11)
+                        font.pixelSize: loginRoot.compactScreen ? TouchMetrics.helperText : 15
                         font.family: "Montserrat"
                         color: "#475569"
                         horizontalAlignment: Text.AlignHCenter
@@ -137,7 +128,7 @@ Rectangle {
 
                             Text {
                                 text: "Username"
-                                font.pixelSize: 11
+                                font.pixelSize: TouchMetrics.bodyText
                                 font.family: "Montserrat"
                                 font.bold: true
                                 color: "#475569"
@@ -146,9 +137,10 @@ Rectangle {
                             TextField {
                                 id: txtUsername
                                 Layout.fillWidth: true
-                                implicitHeight: loginRoot.compactScreen ? 40 : 44
+                                implicitHeight: loginRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
                                 placeholderText: "Enter your username"
-                                font.pixelSize: 13
+                                inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferLowercase
+                                font.pixelSize: TouchMetrics.bodyText
                                 font.family: "Montserrat"
                                 color: "#0f172a"
                                 padding: 12
@@ -171,7 +163,7 @@ Rectangle {
 
                             Text {
                                 text: "Password"
-                                font.pixelSize: 11
+                                font.pixelSize: TouchMetrics.bodyText
                                 font.family: "Montserrat"
                                 font.bold: true
                                 color: "#475569"
@@ -180,10 +172,11 @@ Rectangle {
                             TextField {
                                 id: txtPassword
                                 Layout.fillWidth: true
-                                implicitHeight: loginRoot.compactScreen ? 40 : 44
+                                implicitHeight: loginRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
                                 placeholderText: "Enter your password"
                                 echoMode: TextInput.Password
-                                font.pixelSize: 13
+                                inputMethodHints: Qt.ImhHiddenText | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
+                                font.pixelSize: TouchMetrics.bodyText
                                 font.family: "Montserrat"
                                 color: "#0f172a"
                                 padding: 12
@@ -206,7 +199,7 @@ Rectangle {
                             Layout.fillWidth: true
                             text: (typeof loginBridge !== "undefined" && loginBridge) ? loginBridge.errorMessage : ""
                             color: "#EF4444"
-                            font.pixelSize: 11
+                            font.pixelSize: TouchMetrics.helperText
                             font.family: "Montserrat"
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.Wrap
@@ -217,8 +210,9 @@ Rectangle {
                         Button {
                             id: loginButton
                             Layout.alignment: Qt.AlignHCenter
-                            Layout.preferredWidth: loginRoot.compactScreen ? Math.min(parent.width, 220) : parent.width
-                            implicitHeight: loginRoot.compactScreen ? 40 : 44
+                            Layout.fillWidth: !loginRoot.compactScreen
+                            Layout.preferredWidth: loginRoot.compactScreen ? Math.min(loginColumn.width, 220) : -1
+                            implicitHeight: loginRoot.compactScreen ? TouchMetrics.compactButtonHeight : TouchMetrics.buttonHeight
                             scale: loginButton.pressed ? 0.96 : 1.0
 
                             Behavior on scale {
@@ -228,7 +222,7 @@ Rectangle {
                             contentItem: Text {
                                 text: "Log In"
                                 color: "white"
-                                font.pixelSize: loginRoot.compactScreen ? 12 : 13
+                                font.pixelSize: TouchMetrics.buttonText
                                 font.family: "Montserrat"
                                 font.bold: true
                                 horizontalAlignment: Text.AlignHCenter
@@ -249,15 +243,18 @@ Rectangle {
                     Layout.alignment: Qt.AlignHCenter
                     Layout.fillWidth: true
                     text: "Copyright 2026 Municipality of San Lorenzo Ruiz"
-                    font.pixelSize: 10
+                    font.pixelSize: TouchMetrics.helperText
                     font.family: "Montserrat"
                     color: "#64748b"
                     horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.Wrap
                     Layout.topMargin: 4
                 }
-            }
         }
+    }
+
+    KeyboardPanel {
+        id: loginKeyboard
     }
 
     // Shake animation
