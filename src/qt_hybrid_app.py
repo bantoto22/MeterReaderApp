@@ -35,8 +35,10 @@ from PySide6.QtWidgets import (
 try:
     from .database import (
         authenticate_user,
+        get_receipt_print_by_id,
         get_all_zone_names,
         get_latest_receipt_print,
+        list_receipt_print_history,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
@@ -49,8 +51,10 @@ try:
 except ImportError:
     from database import (
         authenticate_user,
+        get_receipt_print_by_id,
         get_all_zone_names,
         get_latest_receipt_print,
+        list_receipt_print_history,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
@@ -73,6 +77,7 @@ except ImportError:
 try:
     from .receipt import (
         build_receipt_text,
+        build_reprint_receipt_text,
         can_use_system_printer,
         print_test_receipt,
         send_to_system_printer,
@@ -80,6 +85,7 @@ try:
 except ImportError:
     from receipt import (
         build_receipt_text,
+        build_reprint_receipt_text,
         can_use_system_printer,
         print_test_receipt,
         send_to_system_printer,
@@ -138,6 +144,8 @@ class AppBridge(QObject):
     operationBusyMessageChanged = Signal()
     alertRequested = Signal(str, str)
     receiptPreviewRequested = Signal(str, str)
+    printPreviewRequested = Signal(str, str, str)
+    printHistoryRequested = Signal()
     canReprintChanged = Signal()
     
     # Meter Entry properties
@@ -182,6 +190,10 @@ class AppBridge(QObject):
     wifiStatusResult = Signal(str, str)
     powerOffFailed = Signal(str)
     testPrintFinished = Signal(bool, str)
+    printPreviewBusyChanged = Signal()
+    printHistoryRecordsChanged = Signal()
+    printHistoryDetailChanged = Signal()
+    printExecutionFinished = Signal(object)
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -242,6 +254,10 @@ class AppBridge(QObject):
         self._wifi_busy = False
         self._wifi_scan_silent = False
         self._test_print_busy = False
+        self._print_preview_busy = False
+        self._pending_print_job = None
+        self._print_history_records = []
+        self._print_history_detail = None
 
         self._overall_percentage = 0
         self._overall_fraction = "0/0"
@@ -262,6 +278,7 @@ class AppBridge(QObject):
         self.wifiStatusResult.connect(self._set_wifi_status)
         self.powerOffFailed.connect(self._finish_power_off_failure)
         self.testPrintFinished.connect(self._finish_test_print)
+        self.printExecutionFinished.connect(self._finish_print_execution)
 
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(5_000)
@@ -279,6 +296,7 @@ class AppBridge(QObject):
 
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
+        self.refreshPrintHistory()
         self.update_stats()
         self._init_sync()
         self.refreshWifiStatus()
@@ -572,6 +590,30 @@ class AppBridge(QObject):
     @Property(bool, notify=testPrintBusyChanged)
     def testPrintBusy(self) -> bool:
         return self._test_print_busy
+
+    @Property(bool, notify=printPreviewBusyChanged)
+    def printPreviewBusy(self) -> bool:
+        return self._print_preview_busy
+
+    @Property(list, notify=printHistoryRecordsChanged)
+    def printHistoryRecords(self) -> list:
+        return self._print_history_records
+
+    @Property(str, notify=printHistoryDetailChanged)
+    def printHistoryDetailTitle(self) -> str:
+        if not self._print_history_detail:
+            return ""
+        return f"Receipt #{self._print_history_detail.get('id', '')}"
+
+    @Property(str, notify=printHistoryDetailChanged)
+    def printHistoryDetailText(self) -> str:
+        if not self._print_history_detail:
+            return ""
+        return str(self._print_history_detail.get("receipt_text") or "")
+
+    @Property(bool, notify=printHistoryDetailChanged)
+    def hasPrintHistoryDetail(self) -> bool:
+        return self._print_history_detail is not None
 
     # Circular progress stats properties
     @Property(int, notify=overallPercentageChanged)
@@ -1113,6 +1155,34 @@ class AppBridge(QObject):
     def saveReading(self) -> None:
         self.printReceipt()
 
+    def _set_print_preview_busy(self, busy: bool) -> None:
+        if self._print_preview_busy != busy:
+            self._print_preview_busy = busy
+            self.printPreviewBusyChanged.emit()
+
+    def _open_print_preview(self, title: str, receipt_text: str, action_label: str, job: dict) -> None:
+        self._pending_print_job = dict(job)
+        self.printPreviewRequested.emit(title, receipt_text, action_label)
+
+    def _build_pending_receipt_job(self) -> dict:
+        self._reload_current_consumer_from_db()
+        present = int(self._present_reading)
+        previous = int(self._consumer["previous_reading"])
+        consumption = present - previous
+        exception = self._selected_exception
+        receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name)
+        return {
+            "job_type": "original",
+            "consumer_snapshot": dict(self._consumer),
+            "consumer_id": self._consumer["id"],
+            "previous": previous,
+            "present": present,
+            "consumption": consumption,
+            "exception": exception,
+            "receipt_text": receipt,
+            "reader_name": self._reader_name,
+        }
+
     @Slot()
     def printReceipt(self) -> None:
         if not self._consumer or not self._present_reading:
@@ -1129,82 +1199,10 @@ class AppBridge(QObject):
             if self._paper_status.lower() in {"out", "jam"}:
                 self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
                 return
-
-            self._set_operation_busy(True, "Printing...")
-
-            def finish_print() -> None:
-                try:
-                    consumption = present - previous
-                    exception = self._selected_exception
-                    flagged = consumption > 500 or exception != "None"
-                    reading_id = save_reading(self._consumer["id"], present, consumption, exception, flagged)
-                    self._save_to_sync_layer(self._consumer["id"], present, consumption, exception, flagged)
-                    receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name)
-                    saved_receipt_id = save_receipt_print(
-                        self._consumer["id"],
-                        receipt,
-                        previous,
-                        present,
-                        consumption,
-                        exception,
-                        self._reader_name,
-                        reading_id,
-                        "print",
-                        self._consumer.get("acct_no"),
-                        self._consumer.get("name"),
-                        self._consumer.get("meter_no"),
-                        self._consumer.get("zone_name", self._selected_zone),
-                    )
-                    self._last_receipt_entry = {
-                        "id": saved_receipt_id,
-                        "consumer_id": self._consumer["id"],
-                        "reading_id": reading_id,
-                        "acct_no": self._consumer.get("acct_no"),
-                        "consumer_name": self._consumer.get("name"),
-                        "meter_no": self._consumer.get("meter_no"),
-                        "zone_name": self._consumer.get("zone_name", self._selected_zone),
-                        "previous_reading": previous,
-                        "present_reading": present,
-                        "consumption": consumption,
-                        "exception": exception,
-                        "reader_name": self._reader_name,
-                        "receipt_text": receipt,
-                        "print_action": "print",
-                    }
-                    self._last_receipt = receipt
-                    self.canReprintChanged.emit()
-
-                    self._consumer["previous_reading"] = present
-                    self._previous_reading = str(present)
-                    self._present_reading = ""
-                    self._consumption = "-"
-                    self._validation_color = "#10B981"
-                    self._validation_message = "Saved successfully!"
-
-                    self.previousReadingChanged.emit()
-                    self.presentReadingChanged.emit()
-                    self.consumptionChanged.emit()
-                    self.validationColorChanged.emit()
-                    self.validationMessageChanged.emit()
-
-                    self.update_stats()
-                    if self._progress_details_visible:
-                        self._refresh_zone_consumers()
-                    if can_use_system_printer():
-                        try:
-                            send_to_system_printer(receipt)
-                        except Exception as exc:
-                            self.alertRequested.emit("Printer Error", f"Unable to print to the GP58 over USB.\n\n{exc}")
-                    self.receiptPreviewRequested.emit("Receipt Preview", receipt)
-                except Exception as e:
-                    self.alertRequested.emit("Save Failed", str(e))
-                finally:
-                    self._set_operation_busy(False, "")
-
-            QTimer.singleShot(600, finish_print)
+            job = self._build_pending_receipt_job()
+            self._open_print_preview("Print Preview", job["receipt_text"], "Proceed to Print", job)
         except Exception as e:
             self.alertRequested.emit("Save Failed", str(e))
-            self._set_operation_busy(False, "")
 
     @Slot(int)
     def setBatteryLevel(self, level: int) -> None:
@@ -1228,30 +1226,17 @@ class AppBridge(QObject):
         if self._paper_status.lower() in {"out", "jam"}:
             self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
             return
-        if can_use_system_printer():
-            try:
-                send_to_system_printer(self._last_receipt_entry["receipt_text"])
-            except Exception as exc:
-                self.alertRequested.emit("Printer Error", f"Unable to print to the GP58 over USB.\n\n{exc}")
-        saved_id = save_receipt_print(
-            self._last_receipt_entry["consumer_id"],
+        original_printed_at = str(self._last_receipt_entry.get("printed_at") or "")
+        preview_text = build_reprint_receipt_text(
             self._last_receipt_entry["receipt_text"],
-            int(self._last_receipt_entry["previous_reading"]),
-            int(self._last_receipt_entry["present_reading"]),
-            int(self._last_receipt_entry["consumption"]),
-            self._last_receipt_entry.get("exception") or "None",
-            self._last_receipt_entry.get("reader_name") or self._reader_name,
-            self._last_receipt_entry.get("reading_id"),
-            "reprint",
-            self._last_receipt_entry.get("acct_no"),
-            self._last_receipt_entry.get("consumer_name"),
-            self._last_receipt_entry.get("meter_no"),
-            self._last_receipt_entry.get("zone_name"),
+            original_printed_at=original_printed_at,
         )
-        self._last_receipt_entry = {**self._last_receipt_entry, "id": saved_id, "print_action": "reprint"}
-        self._last_receipt = self._last_receipt_entry["receipt_text"]
-        self.canReprintChanged.emit()
-        self.receiptPreviewRequested.emit("Receipt Preview", self._last_receipt)
+        job = {
+            "job_type": "reprint",
+            "source_entry": dict(self._last_receipt_entry),
+            "receipt_text": preview_text,
+        }
+        self._open_print_preview("Reprint Preview", preview_text, "Proceed to Reprint", job)
 
     @Slot()
     def syncNow(self) -> None:
@@ -1301,6 +1286,237 @@ class AppBridge(QObject):
         if detail:
             friendly = f"{friendly}\n\nDetails: {detail}"
         self.alertRequested.emit("Printer Error", friendly)
+
+    @Slot()
+    def cancelPrintPreview(self) -> None:
+        self._pending_print_job = None
+        self._set_print_preview_busy(False)
+
+    @Slot()
+    def proceedPrintPreview(self) -> None:
+        if self._print_preview_busy or not self._pending_print_job:
+            return
+
+        job = dict(self._pending_print_job)
+
+        if job.get("job_type") != "original" and not can_use_system_printer():
+            self.alertRequested.emit(
+                "Printer Error",
+                "Unable to print. Please check that the thermal printer is connected, powered on, and ready.",
+            )
+            return
+
+        self._set_print_preview_busy(True)
+        self._set_operation_busy(True, "Printing...")
+
+        def _task() -> None:
+            try:
+                receipt_text = job["receipt_text"]
+
+                if job.get("job_type") == "original":
+                    consumer = dict(job["consumer_snapshot"])
+                    present = int(job["present"])
+                    previous = int(job["previous"])
+                    consumption = int(job["consumption"])
+                    exception = str(job["exception"])
+                    flagged = consumption > 500 or exception != "None"
+                    reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged)
+                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged)
+                    saved_receipt_id = save_receipt_print(
+                        job["consumer_id"],
+                        receipt_text,
+                        previous,
+                        present,
+                        consumption,
+                        exception,
+                        job.get("reader_name") or self._reader_name,
+                        reading_id,
+                        "print",
+                        consumer.get("acct_no"),
+                        consumer.get("name"),
+                        consumer.get("meter_no"),
+                        consumer.get("zone_name", self._selected_zone),
+                    )
+                    print_error = None
+                    if can_use_system_printer():
+                        try:
+                            send_to_system_printer(receipt_text)
+                        except Exception as exc:
+                            print_error = str(exc)
+                    else:
+                        print_error = "Printer device is unavailable."
+                    self.printExecutionFinished.emit(
+                        {
+                            "success": True,
+                            "job_type": "original",
+                            "printed": print_error is None,
+                            "print_error": print_error,
+                            "saved_receipt_id": saved_receipt_id,
+                            "reading_id": reading_id,
+                            "consumer_snapshot": consumer,
+                            "previous": previous,
+                            "present": present,
+                            "consumption": consumption,
+                            "exception": exception,
+                            "receipt_text": receipt_text,
+                        }
+                    )
+                    return
+
+                send_to_system_printer(receipt_text)
+                source_entry = dict(job["source_entry"])
+                saved_id = save_receipt_print(
+                    source_entry["consumer_id"],
+                    receipt_text,
+                    int(source_entry["previous_reading"]),
+                    int(source_entry["present_reading"]),
+                    int(source_entry["consumption"]),
+                    source_entry.get("exception") or "None",
+                    self._reader_name,
+                    source_entry.get("reading_id"),
+                    "reprint",
+                    source_entry.get("acct_no"),
+                    source_entry.get("consumer_name"),
+                    source_entry.get("meter_no"),
+                    source_entry.get("zone_name"),
+                )
+                self.printExecutionFinished.emit(
+                    {
+                        "success": True,
+                        "job_type": "reprint",
+                        "saved_receipt_id": saved_id,
+                        "source_entry": source_entry,
+                        "receipt_text": receipt_text,
+                    }
+                )
+            except Exception as exc:
+                self.printExecutionFinished.emit({"success": False, "error": str(exc)})
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_print_execution(self, result: dict) -> None:
+        self._set_print_preview_busy(False)
+        self._set_operation_busy(False, "")
+        if not result.get("success"):
+            self.alertRequested.emit(
+                "Printer Error",
+                "Unable to print. Please check that the thermal printer is connected, powered on, and ready."
+                + (f"\n\nDetails: {result.get('error')}" if result.get("error") else ""),
+            )
+            return
+
+        self._pending_print_job = None
+        if result.get("job_type") == "original":
+            consumer = dict(result["consumer_snapshot"])
+            present = int(result["present"])
+            self._last_receipt_entry = {
+                "id": result["saved_receipt_id"],
+                "consumer_id": consumer["id"],
+                "reading_id": result["reading_id"],
+                "acct_no": consumer.get("acct_no"),
+                "consumer_name": consumer.get("name"),
+                "meter_no": consumer.get("meter_no"),
+                "zone_name": consumer.get("zone_name", self._selected_zone),
+                "previous_reading": int(result["previous"]),
+                "present_reading": present,
+                "consumption": int(result["consumption"]),
+                "exception": result.get("exception") or "None",
+                "reader_name": self._reader_name,
+                "receipt_text": result["receipt_text"],
+                "print_action": "print",
+            }
+            self._last_receipt = result["receipt_text"]
+            self.canReprintChanged.emit()
+            self._consumer["previous_reading"] = present
+            self._previous_reading = str(present)
+            self._present_reading = ""
+            self._consumption = "-"
+            self._validation_color = "#10B981"
+            self._validation_message = "Saved successfully!"
+            self.previousReadingChanged.emit()
+            self.presentReadingChanged.emit()
+            self.consumptionChanged.emit()
+            self.validationColorChanged.emit()
+            self.validationMessageChanged.emit()
+            self.update_stats()
+            if self._progress_details_visible:
+                self._refresh_zone_consumers()
+            self.refreshPrintHistory()
+            if result.get("printed", True):
+                self.alertRequested.emit("Print Complete", "Receipt printed successfully.")
+            else:
+                self.alertRequested.emit(
+                    "Reading Saved",
+                    "Reading saved successfully, but printing failed."
+                    + (f"\n\nDetails: {result.get('print_error')}" if result.get("print_error") else ""),
+                )
+            return
+
+        source_entry = dict(result["source_entry"])
+        self._last_receipt_entry = {**source_entry, "id": result["saved_receipt_id"], "print_action": "reprint", "receipt_text": result["receipt_text"]}
+        self._last_receipt = result["receipt_text"]
+        self.canReprintChanged.emit()
+        self.refreshPrintHistory()
+        self.alertRequested.emit("Reprint Complete", "Receipt reprinted successfully.")
+
+    @Slot()
+    def openPrintHistory(self) -> None:
+        self.refreshPrintHistory()
+        self.printHistoryRequested.emit()
+
+    @Slot(str)
+    def refreshPrintHistory(self, search_text: str = "") -> None:
+        rows = list_receipt_print_history(search_text=search_text, limit=200)
+        self._print_history_records = [
+            {
+                "id": row.get("id"),
+                "receipt_number": f"{int(row.get('id', 0)):06d}" if row.get("id") else "",
+                "receipt_type": "Receipt",
+                "account_number": row.get("acct_no") or "",
+                "consumer_name": row.get("consumer_name") or "",
+                "billing_period": row.get("zone_name") or "",
+                "total_amount": row.get("consumption") or 0,
+                "printed_at": row.get("printed_at") or "",
+                "printed_by": row.get("reader_name") or "",
+                "print_count": row.get("print_count") or 1,
+                "reprint_count": row.get("reprint_count") or 0,
+                "print_action": row.get("print_action") or "print",
+            }
+            for row in rows
+        ]
+        self.printHistoryRecordsChanged.emit()
+
+    @Slot(int)
+    def openPrintHistoryDetail(self, receipt_print_id: int) -> None:
+        self._print_history_detail = get_receipt_print_by_id(receipt_print_id)
+        self.printHistoryDetailChanged.emit()
+
+    @Slot()
+    def closePrintHistoryDetail(self) -> None:
+        self._print_history_detail = None
+        self.printHistoryDetailChanged.emit()
+
+    @Slot()
+    def reprintSelectedHistory(self) -> None:
+        if not self._print_history_detail:
+            return
+        if self._paper_status.lower() in {"out", "jam"}:
+            self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
+            return
+        preview_text = build_reprint_receipt_text(
+            self._print_history_detail["receipt_text"],
+            original_printed_at=str(self._print_history_detail.get("printed_at") or ""),
+        )
+        self._open_print_preview(
+            "Reprint Preview",
+            preview_text,
+            "Proceed to Reprint",
+            {
+                "job_type": "reprint",
+                "source_entry": dict(self._print_history_detail),
+                "receipt_text": preview_text,
+            },
+        )
 
     @Slot()
     def powerOffDevice(self) -> None:

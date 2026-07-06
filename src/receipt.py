@@ -204,6 +204,23 @@ def build_test_receipt_text(now: datetime.datetime | None = None) -> str:
     )
 
 
+def build_reprint_receipt_text(
+    original_receipt_text: str,
+    original_printed_at: str | None = None,
+    reprint_at: datetime.datetime | None = None,
+) -> str:
+    reprint_at = reprint_at or datetime.datetime.now()
+    header_lines = [
+        "DUPLICATE COPY",
+        "",
+    ]
+    if original_printed_at:
+        header_lines.append(f"Original Print Date: {original_printed_at}")
+    header_lines.append(f"Reprint Date: {reprint_at.strftime('%Y-%m-%d %I:%M %p')}")
+    header_lines.extend(["", original_receipt_text.rstrip(), "", "", "", ""])
+    return "\n".join(header_lines)
+
+
 def _build_test_receipt_escpos(now: datetime.datetime | None = None) -> bytes:
     now = now or datetime.datetime.now()
     nl = b"\n"

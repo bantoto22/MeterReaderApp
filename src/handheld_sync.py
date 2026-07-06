@@ -684,7 +684,10 @@ class SupabaseRestClient:
         status, data = self._req(
             "GET",
             "waterrates",
-            query={"select": "classification_id,rate_id,minimum_cubic,minimum_rate,excess_rate_per_cubic"},
+            query={
+                "select": "classification_id,rate_id,minimum_cubic,minimum_rate,excess_rate_per_cubic",
+                "order": "classification_id.asc,rate_id.desc",
+            },
             use_service_key=True,
         )
         if status >= 400 or not isinstance(data, list):
@@ -697,9 +700,11 @@ class SupabaseRestClient:
             if classification_id is None:
                 continue
             try:
-                rates[int(classification_id)] = row
+                key = int(classification_id)
             except (TypeError, ValueError):
                 continue
+            if key not in rates:
+                rates[key] = row
         return rates
 
     def _load_latest_bills_by_consumer(self) -> dict[int, dict]:
@@ -1049,6 +1054,33 @@ class MainPostgresClient:
         except Exception:
             return False
 
+    def load_waterrates_by_classification(self) -> dict[int, dict]:
+        sql = f"""
+        SELECT DISTINCT ON (wr.classification_id)
+            wr.classification_id,
+            wr.rate_id,
+            wr.minimum_cubic,
+            wr.minimum_rate,
+            wr.excess_rate_per_cubic
+        FROM {self._schema}.waterrates wr
+        WHERE wr.classification_id IS NOT NULL
+        ORDER BY wr.classification_id, wr.rate_id DESC
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        rates: dict[int, dict] = {}
+        for row in rows:
+            classification_id = row.get("classification_id") if isinstance(row, dict) else None
+            if classification_id is None:
+                continue
+            try:
+                rates[int(classification_id)] = dict(row)
+            except (TypeError, ValueError):
+                continue
+        return rates
+
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         where = """
         WHERE c.status = 'Active'
@@ -1084,7 +1116,13 @@ class MainPostgresClient:
         FROM {self._schema}.consumer c
         JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
         LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-        LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+        LEFT JOIN LATERAL (
+            SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
+            FROM {self._schema}.waterrates wr
+            WHERE wr.classification_id = c.classification_id
+            ORDER BY wr.rate_id DESC
+            LIMIT 1
+        ) wr ON TRUE
         LEFT JOIN (
             SELECT due_days
             FROM {self._schema}.billing_settings
@@ -1153,7 +1191,13 @@ class MainPostgresClient:
                     FROM {self._schema}.consumer c
                     JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
                     LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-                    LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+                    LEFT JOIN LATERAL (
+                        SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
+                        FROM {self._schema}.waterrates wr
+                        WHERE wr.classification_id = c.classification_id
+                        ORDER BY wr.rate_id DESC
+                        LIMIT 1
+                    ) wr ON TRUE
                     LEFT JOIN (
                         SELECT due_days
                         FROM {self._schema}.billing_settings
@@ -1214,7 +1258,13 @@ class MainPostgresClient:
         FROM {self._schema}.consumer c
         JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
         LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-        LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+        LEFT JOIN LATERAL (
+            SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
+            FROM {self._schema}.waterrates wr
+            WHERE wr.classification_id = c.classification_id
+            ORDER BY wr.rate_id DESC
+            LIMIT 1
+        ) wr ON TRUE
         LEFT JOIN (
             SELECT setting_id, due_days
             FROM {self._schema}.billing_settings
@@ -1478,10 +1528,70 @@ class HandheldSyncDataAccess:
                 errors.append(f"{label}: {exc}")
         return results, errors
 
+    def _overlay_main_pg_rates_for_consumers(self, consumers: list[dict]) -> list[dict]:
+        if not consumers or not self.main_pg:
+            return consumers
+        try:
+            rates_by_classification = self.main_pg.load_waterrates_by_classification()
+        except Exception:
+            return consumers
+
+        overlaid: list[dict] = []
+        for item in consumers:
+            row = dict(item)
+            classification_id = row.get("classification_id")
+            try:
+                rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else None
+            except (TypeError, ValueError):
+                rate_row = None
+            if rate_row:
+                row["minimum_cubic"] = rate_row.get("minimum_cubic")
+                row["minimum_rate"] = rate_row.get("minimum_rate")
+                row["excess_rate_per_cubic"] = rate_row.get("excess_rate_per_cubic")
+            overlaid.append(row)
+        return overlaid
+
+    def _overlay_main_pg_rates_for_reading(self, reading: dict) -> dict:
+        if not self.main_pg:
+            return reading
+        consumer_id = reading.get("consumer_id")
+        if consumer_id in (None, ""):
+            return reading
+        try:
+            context = self.main_pg.get_consumer_context(int(consumer_id))
+        except Exception:
+            return reading
+        merged = dict(reading)
+        for field_name in ("minimum_cubic", "minimum_rate", "excess_rate_per_cubic"):
+            value = context.get(field_name)
+            if value is not None and value != "":
+                merged[field_name] = value
+        return merged
+
+    def _find_existing_reading_with_fallback(self, payload: dict) -> tuple[dict | None, list[str]]:
+        errors: list[str] = []
+        online_targets: list[tuple[str, object]] = []
+
+        if self.main_pg and self.main_pg.is_online():
+            online_targets.append(("MAIN_PG", self.main_pg))
+        if self.remote and self.remote.is_online():
+            online_targets.append(("Supabase", self.remote))
+
+        for label, target in online_targets:
+            try:
+                existing = target.find_existing_reading(payload["consumer_id"], payload["reading_date"])
+                if existing:
+                    return existing, errors
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+
+        return None, errors
+
     def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
         if self.is_online():
             try:
                 data = self.remote.load_assigned_consumers(zone_name)
+                data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data)})
                 return data
@@ -1490,6 +1600,7 @@ class HandheldSyncDataAccess:
         if self.main_pg:
             try:
                 data = self.main_pg.load_assigned_consumers(zone_name)
+                data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
                 return data
@@ -1511,6 +1622,7 @@ class HandheldSyncDataAccess:
 
     def saveMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
+        reading = self._overlay_main_pg_rates_for_reading(reading)
         results, errors = self._sync_reading_to_targets(reading)
         if results:
             if errors:
@@ -1526,6 +1638,7 @@ class HandheldSyncDataAccess:
 
     def updateMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
+        reading = self._overlay_main_pg_rates_for_reading(reading)
         results, errors = self._sync_reading_to_targets(reading)
         if results:
             if errors:
@@ -1598,10 +1711,9 @@ class HandheldSyncDataAccess:
 
         for row in pending:
             queue_id = row["id"]
-            payload = row["payload"]
+            payload = self._overlay_main_pg_rates_for_reading(dict(row["payload"]))
             try:
-                conflict_source = self.remote if self.is_online() else self.main_pg
-                existing = conflict_source.find_existing_reading(payload["consumer_id"], payload["reading_date"]) if conflict_source else None
+                existing, lookup_errors = self._find_existing_reading_with_fallback(payload)
                 if existing and existing.get("updated_at") and payload.get("updated_at"):
                     if str(existing["updated_at"]) > str(payload["updated_at"]):
                         reason = "Server has newer reading for same consumer/date."
@@ -1611,6 +1723,7 @@ class HandheldSyncDataAccess:
                         continue
 
                 results, errors = self._sync_reading_to_targets(payload)
+                errors = [*lookup_errors, *errors]
                 if not results:
                     raise RuntimeError("; ".join(errors) if errors else "No sync target accepted the queue row.")
                 self.local.mark_synced(queue_id)

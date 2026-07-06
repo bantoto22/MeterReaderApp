@@ -403,6 +403,64 @@ def get_latest_receipt_print(consumer_id: int | None = None) -> dict | None:
     return data
 
 
+def list_receipt_print_history(search_text: str = "", limit: int = 200) -> list[dict]:
+    """Return recent receipt print history rows for preview and reprint."""
+    conn = get_connection()
+    normalized_limit = max(1, min(int(limit or 200), 500))
+    sql = """
+        SELECT
+            rp.*,
+            (
+                SELECT COUNT(*)
+                FROM receipt_prints rp_count
+                WHERE rp_count.consumer_id = rp.consumer_id
+                  AND COALESCE(rp_count.reading_id, -1) = COALESCE(rp.reading_id, -1)
+            ) AS print_count,
+            (
+                SELECT COUNT(*)
+                FROM receipt_prints rp_count
+                WHERE rp_count.consumer_id = rp.consumer_id
+                  AND COALESCE(rp_count.reading_id, -1) = COALESCE(rp.reading_id, -1)
+                  AND rp_count.print_action = 'reprint'
+            ) AS reprint_count
+        FROM receipt_prints rp
+    """
+    params: list[object] = []
+    trimmed = (search_text or "").strip()
+    if trimmed:
+        like = f"%{trimmed}%"
+        sql += """
+            WHERE CAST(rp.id AS TEXT) LIKE ?
+               OR COALESCE(rp.acct_no, '') LIKE ?
+               OR COALESCE(rp.consumer_name, '') LIKE ?
+               OR COALESCE(rp.meter_no, '') LIKE ?
+               OR COALESCE(rp.zone_name, '') LIKE ?
+               OR COALESCE(rp.receipt_text, '') LIKE ?
+        """
+        params.extend([like, like, like, like, like, like])
+    sql += " ORDER BY rp.printed_at DESC, rp.id DESC LIMIT ?"
+    params.append(normalized_limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_receipt_print_by_id(receipt_print_id: int) -> dict | None:
+    """Return one saved receipt print row by ID."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT *
+        FROM receipt_prints
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (receipt_print_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def get_zone_stats() -> dict:
     """Return per-zone progress stats: {zone_name: {households, read, flagged}}."""
     conn = get_connection()

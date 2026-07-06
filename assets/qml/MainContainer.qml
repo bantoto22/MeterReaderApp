@@ -32,6 +32,17 @@ Rectangle {
         receiptDialog.open()
     }
 
+    function showPrintPreview(title, receipt, actionLabel) {
+        previewDialog.title = title
+        previewText.text = receipt
+        proceedPreviewButton.text = actionLabel
+        previewDialog.open()
+    }
+
+    function openPrintHistory() {
+        historyDialog.open()
+    }
+
     Rectangle {
         id: statusBar
         anchors.top: parent.top
@@ -206,6 +217,12 @@ Rectangle {
         function onReceiptPreviewRequested(title, receipt) {
             showReceipt(title, receipt)
         }
+        function onPrintPreviewRequested(title, receipt, actionLabel) {
+            showPrintPreview(title, receipt, actionLabel)
+        }
+        function onPrintHistoryRequested() {
+            openPrintHistory()
+        }
     }
 
     Dialog {
@@ -245,6 +262,218 @@ Rectangle {
             }
         }
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+    }
+
+    Dialog {
+        id: previewDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 24, 444)
+        height: Math.min(parent.height - 48, 680)
+        modal: true
+        standardButtons: Dialog.NoButton
+
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                TextArea {
+                    id: previewText
+                    readOnly: true
+                    wrapMode: TextEdit.NoWrap
+                    color: "#111827"
+                    font.family: "Courier New"
+                    font.pixelSize: TouchMetrics.codeText
+                    background: Rectangle { color: "#F8FAFD"; radius: 6 }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Button {
+                    Layout.fillWidth: true
+                    implicitHeight: TouchMetrics.buttonHeight
+                    text: "Cancel"
+                    onClicked: {
+                        if (bridgeObj) bridgeObj.cancelPrintPreview()
+                        previewDialog.close()
+                    }
+                }
+
+                Button {
+                    id: proceedPreviewButton
+                    Layout.fillWidth: true
+                    implicitHeight: TouchMetrics.buttonHeight
+                    enabled: bridgeObj ? !bridgeObj.printPreviewBusy : false
+                    onClicked: {
+                        if (bridgeObj) bridgeObj.proceedPrintPreview()
+                        previewDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: historyDetailDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 24, 444)
+        height: Math.min(parent.height - 48, 680)
+        modal: true
+        standardButtons: Dialog.NoButton
+        title: bridgeObj ? bridgeObj.printHistoryDetailTitle : "Receipt"
+
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                TextArea {
+                    readOnly: true
+                    text: bridgeObj ? bridgeObj.printHistoryDetailText : ""
+                    wrapMode: TextEdit.NoWrap
+                    color: "#111827"
+                    font.family: "Courier New"
+                    font.pixelSize: TouchMetrics.codeText
+                    background: Rectangle { color: "#F8FAFD"; radius: 6 }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Button {
+                    Layout.fillWidth: true
+                    implicitHeight: TouchMetrics.buttonHeight
+                    text: "Back"
+                    onClicked: {
+                        if (bridgeObj) bridgeObj.closePrintHistoryDetail()
+                        historyDetailDialog.close()
+                    }
+                }
+
+                Button {
+                    Layout.fillWidth: true
+                    implicitHeight: TouchMetrics.buttonHeight
+                    text: "Reprint"
+                    onClicked: {
+                        if (bridgeObj) bridgeObj.reprintSelectedHistory()
+                        historyDetailDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: historyDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 20, 452)
+        height: Math.min(parent.height - 36, 700)
+        modal: true
+        standardButtons: Dialog.NoButton
+        title: "Print History"
+
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            TextField {
+                id: historySearch
+                Layout.fillWidth: true
+                implicitHeight: TouchMetrics.inputHeight
+                placeholderText: "Search receipt, account, consumer..."
+                onTextChanged: { if (bridgeObj) bridgeObj.refreshPrintHistory(text) }
+            }
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                ListView {
+                    id: historyList
+                    width: parent.width
+                    model: bridgeObj ? bridgeObj.printHistoryRecords : []
+                    spacing: 8
+
+                    delegate: Rectangle {
+                        width: historyList.width
+                        height: 116
+                        radius: 10
+                        color: "#F8FAFD"
+                        border.color: "#D8E1EC"
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (bridgeObj) bridgeObj.openPrintHistoryDetail(modelData.id)
+                                historyDetailDialog.open()
+                            }
+                        }
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 4
+
+                            Text {
+                                text: "Receipt #" + modelData.receipt_number + " • " + (modelData.print_action === "reprint" ? "Reprint" : "Original")
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.bodyText
+                                font.bold: true
+                                color: "#0F172A"
+                            }
+                            Text {
+                                text: modelData.consumer_name
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.bodyText
+                                color: "#111827"
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                text: "Acct: " + modelData.account_number
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.helperText
+                                color: "#526176"
+                            }
+                            Text {
+                                text: "Printed: " + modelData.printed_at
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.helperText
+                                color: "#526176"
+                            }
+                            Text {
+                                text: "Prints: " + modelData.print_count + " • Reprints: " + modelData.reprint_count + " • By: " + modelData.printed_by
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.helperText
+                                color: "#526176"
+                                wrapMode: Text.Wrap
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button {
+                Layout.fillWidth: true
+                implicitHeight: TouchMetrics.buttonHeight
+                text: "Close"
+                onClicked: historyDialog.close()
+            }
+        }
     }
 
     Rectangle {

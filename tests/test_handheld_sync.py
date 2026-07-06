@@ -69,25 +69,37 @@ class FakeRemoteStore:
         self.online = False
         self.remote_rows = {}
         self.fail_writes = False
+        self.fail_reads = False
+        self.assigned_consumers = []
+        self.context_by_consumer = {}
 
     def is_online(self):
         return self.online
 
     def load_assigned_consumers(self, zone_name=None):
-        return []
+        return list(self.assigned_consumers)
 
     def _key(self, consumer_id, reading_date):
         return f"{consumer_id}:{reading_date}"
 
     def find_existing_reading(self, consumer_id, reading_date):
+        if not self.online:
+            raise RuntimeError("remote offline")
+        if self.fail_reads:
+            raise RuntimeError("remote read error")
         return self.remote_rows.get(self._key(consumer_id, reading_date))
 
     def upsert_meter_reading(self, payload):
+        if not self.online:
+            raise RuntimeError("remote offline")
         if self.fail_writes:
             raise RuntimeError("remote write error")
         key = self._key(payload["consumer_id"], payload["reading_date"])
         self.remote_rows[key] = dict(payload)
         return dict(payload)
+
+    def get_consumer_context(self, consumer_id):
+        return dict(self.context_by_consumer.get(consumer_id, {}))
 
 
 class HandheldSyncTests(unittest.TestCase):
@@ -144,6 +156,87 @@ class HandheldSyncTests(unittest.TestCase):
         result = self.dal.syncPendingReadings()
         self.assertEqual(result["conflicts"], 1)
         self.assertEqual(self.local.queue[0]["status"], "conflict")
+
+    def test_queue_sync_falls_back_to_main_pg_when_supabase_lookup_fails(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            pass
+
+        main_pg = FakeMainPgStore()
+        main_pg.online = False
+        self.remote.online = False
+        self.remote.fail_reads = True
+        self.remote.fail_writes = True
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        self.dal.saveMeterReading({"consumer_id": 5, "present_reading": 99, "reading_date": "2026-05-08"})
+        main_pg.online = True
+        self.remote.online = True
+
+        result = self.dal.syncPendingReadings()
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(len(self.local.list_pending()), 0)
+        self.assertEqual(len(main_pg.remote_rows), 1)
+
+    def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            def load_waterrates_by_classification(self):
+                return {
+                    1: {
+                        "classification_id": 1,
+                        "rate_id": 7,
+                        "minimum_cubic": 10,
+                        "minimum_rate": 150.0,
+                        "excess_rate_per_cubic": 15.0,
+                    }
+                }
+
+        main_pg = FakeMainPgStore()
+        self.remote.online = True
+        self.remote.assigned_consumers = [
+            {
+                "id": 8,
+                "meter_no": "09-23-2233",
+                "acct_no": "04-11-123",
+                "name": "Charles Ivan Ornales De Vera",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "minimum_cubic": 0,
+                "minimum_rate": 50.0,
+                "excess_rate_per_cubic": 10.0,
+            }
+        ]
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        rows = self.dal.loadAssignedConsumers()
+
+        self.assertEqual(rows[0]["minimum_cubic"], 10)
+        self.assertEqual(rows[0]["minimum_rate"], 150.0)
+        self.assertEqual(rows[0]["excess_rate_per_cubic"], 15.0)
+
+    def test_save_reading_overlays_rates_from_main_pg(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            pass
+
+        main_pg = FakeMainPgStore()
+        main_pg.context_by_consumer = {
+            8: {
+                "consumer_id": 8,
+                "minimum_cubic": 10,
+                "minimum_rate": 150.0,
+                "excess_rate_per_cubic": 15.0,
+            }
+        }
+        self.remote.online = True
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        self.dal.saveMeterReading({"consumer_id": 8, "present_reading": 3, "reading_date": "2026-05-08"})
+
+        saved = next(iter(self.remote.remote_rows.values()))
+        self.assertEqual(saved["minimum_cubic"], 10)
+        self.assertEqual(saved["minimum_rate"], 150.0)
+        self.assertEqual(saved["excess_rate_per_cubic"], 15.0)
 
 
 if __name__ == "__main__":

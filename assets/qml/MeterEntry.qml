@@ -502,6 +502,22 @@ Rectangle {
                 onClicked: { if (bridgeObj) bridgeObj.reprintLastReceipt() }
             }
 
+            Button {
+                Layout.fillWidth: true
+                implicitHeight: TouchMetrics.buttonHeight
+                contentItem: Text {
+                    text: "Print History"
+                    color: "#0F766E"
+                    font.family: "Montserrat"
+                    font.pixelSize: TouchMetrics.buttonText
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle { radius: 8; color: "#ECFDF5"; border.color: "#A7F3D0" }
+                onClicked: { if (bridgeObj) bridgeObj.openPrintHistory() }
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 Text { text: "Paper Status (Test):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText }
