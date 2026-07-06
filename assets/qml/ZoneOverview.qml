@@ -395,8 +395,8 @@ Rectangle {
             ScrollablePage {
                 anchors.fill: parent
                 maxContentWidth: 450
-                sidePadding: width <= 420 ? 10 : 15
-                topPadding: 12
+                pageSidePadding: width <= 420 ? 10 : 15
+                pageTopPadding: 12
 
                 ColumnLayout {
                     Layout.fillWidth: true

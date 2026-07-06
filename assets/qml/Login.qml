@@ -22,10 +22,10 @@ Rectangle {
         anchors.fill: parent
         anchors.bottomMargin: loginRoot.keyboardInset
         maxContentWidth: loginRoot.compactScreen ? 320 : 420
-        sidePadding: loginRoot.horizontalPadding
-        topPadding: loginRoot.verticalPadding
-        bottomPadding: loginRoot.verticalPadding + loginRoot.keyboardInset + 18
-        contentSpacing: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 20)
+        pageSidePadding: loginRoot.horizontalPadding
+        pageTopPadding: loginRoot.verticalPadding
+        pageBottomPadding: loginRoot.verticalPadding + loginRoot.keyboardInset + 18
+        pageContentSpacing: loginRoot.compactScreen ? 14 : (loginRoot.narrowScreen ? 16 : 20)
 
         ColumnLayout {
             id: loginColumn
@@ -136,6 +136,7 @@ Rectangle {
 
                             TextField {
                                 id: txtUsername
+                                property string keyboardMode: "alpha"
                                 Layout.fillWidth: true
                                 implicitHeight: loginRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
                                 placeholderText: "Enter your username"
@@ -171,6 +172,7 @@ Rectangle {
 
                             TextField {
                                 id: txtPassword
+                                property string keyboardMode: "password"
                                 Layout.fillWidth: true
                                 implicitHeight: loginRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
                                 placeholderText: "Enter your password"

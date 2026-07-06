@@ -150,6 +150,7 @@ Rectangle {
 
                         TextField {
                             id: txtSearch
+                            property string keyboardMode: "alpha"
                             Layout.fillWidth: true
                             placeholderText: "Type 001, 002..."
                             text: bridgeObj ? bridgeObj.searchQuery : ""
@@ -299,6 +300,7 @@ Rectangle {
 
                     TextField {
                         id: txtPresent
+                        property string keyboardMode: "numeric"
                         Layout.fillWidth: true
                         placeholderText: "Enter current reading..."
                         text: bridgeObj ? bridgeObj.presentReading : ""

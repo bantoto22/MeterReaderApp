@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
-os.environ.setdefault("QT_IM_MODULE", "qtvirtualkeyboard")
 
 if os.name == "nt":
     pyside_spec = importlib.util.find_spec("PySide6")

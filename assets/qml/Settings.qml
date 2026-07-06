@@ -107,9 +107,9 @@ Rectangle {
     ScrollablePage {
         anchors.fill: parent
         maxContentWidth: 460
-        sidePadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
-        topPadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
-        bottomPadding: settingsRoot.compactScreen ? 20 : 36
+        pageSidePadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
+        pageTopPadding: settingsRoot.compactScreen ? TouchMetrics.compactPageMargin : TouchMetrics.pageMargin
+        pageBottomPadding: settingsRoot.compactScreen ? 20 : 36
 
         ColumnLayout {
             Layout.fillWidth: true
@@ -186,6 +186,7 @@ Rectangle {
                                 Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
                                 TextField {
                                     id: txtInterval
+                                    property string keyboardMode: "numeric"
                                     Layout.preferredWidth: 108
                                     implicitHeight: TouchMetrics.inputHeight
                                     text: bridgeObj ? bridgeObj.pullInterval : 60
@@ -433,6 +434,7 @@ Rectangle {
                         spacing: 16
                         TextField {
                             id: txtWifiPassword
+                            property string keyboardMode: "password"
                             Layout.fillWidth: true
                             placeholderText: "Password"
                             echoMode: TextInput.Password
