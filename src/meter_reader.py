@@ -31,12 +31,14 @@ try:
         get_zone_stats,
         get_all_zone_names,
         get_zone_consumers_with_status,
+        get_latest_receipt_print,
         replace_consumers_from_sync,
         authenticate_user,
         get_all_users,
+        save_receipt_print,
         seed_default_users,
     )
-    from .receipt import show_receipt
+    from .receipt import build_receipt_text, can_use_system_printer, send_to_system_printer, show_receipt
     from .handheld_sync import HandheldSyncDataAccess, SyncConfig
 except Exception:
     from database import (
@@ -47,12 +49,14 @@ except Exception:
         get_zone_stats,
         get_all_zone_names,
         get_zone_consumers_with_status,
+        get_latest_receipt_print,
         replace_consumers_from_sync,
         authenticate_user,
         get_all_users,
+        save_receipt_print,
         seed_default_users,
     )
-    from receipt import show_receipt
+    from receipt import build_receipt_text, can_use_system_printer, send_to_system_printer, show_receipt
     try:
         from handheld_sync import HandheldSyncDataAccess, SyncConfig
     except Exception:
@@ -897,7 +901,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._current_user = None
 
         # Last receipt data for reprint workflow
-        self._last_receipt_data = None
+        self._last_receipt_data = self._receipt_entry_to_payload(get_latest_receipt_print())
         self._loading_frame = None
 
         # Direct startup (no splash/loading gate).
@@ -2693,9 +2697,18 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                               f"Reprint receipt for {consumer['name']}?\n\n"
                               f"Meter: {consumer['meter_no']}\n"
                               f"Reading: {data['present']}"):
-            show_receipt(self, consumer, data['previous'], 
-                       data['present'], data['exception'],
-                       self._current_user['name'] if self._current_user else "Field Reader")
+            latest_entry = get_latest_receipt_print(consumer["id"])
+            receipt_text = latest_entry["receipt_text"] if latest_entry else None
+            self._deliver_receipt(
+                consumer,
+                data["previous"],
+                data["present"],
+                data["exception"],
+                self._current_user["name"] if self._current_user else "Field Reader",
+                latest_entry.get("reading_id") if latest_entry else data.get("reading_id"),
+                "reprint",
+                receipt_text,
+            )
     
     def _on_sync(self):
         self._spawn_overlay("Syncing...", "Refreshing from main database", self._do_sync)
@@ -3407,15 +3420,18 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             is_flagged = (consumption > HIGH_CONSUMPTION_THRESHOLD) or (exception != "None")
 
             # Save to database first
-            save_reading(self._current_consumer["id"], present, consumption, exception, is_flagged)
+            reading_id = save_reading(self._current_consumer["id"], present, consumption, exception, is_flagged)
             self._save_to_sync_layer(self._current_consumer["id"], present, consumption, exception, is_flagged)
 
             # Store for reprint
             self._last_receipt_data = {
                 "consumer": dict(self._current_consumer),
+                "reading_id": reading_id,
                 "present": present,
                 "previous": previous,
+                "consumption": consumption,
                 "exception": exception,
+                "reader_name": self._current_user["name"] if self._current_user else "Field Reader",
                 "timestamp": time.time()
             }
             self._current_consumer["previous_reading"] = present
@@ -3440,7 +3456,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         consumption = present - previous
         exception = self.exception_var.get()
         is_flagged = (consumption > HIGH_CONSUMPTION_THRESHOLD) or (exception != "None")
-        save_reading(consumer["id"], present, consumption, exception, is_flagged)
+        reading_id = save_reading(consumer["id"], present, consumption, exception, is_flagged)
         self._save_to_sync_layer(consumer["id"], present, consumption, exception, is_flagged)
         # Update the cached consumer so subsequent validations use the new previous
         self._current_consumer["_original_previous"] = self._current_consumer["previous_reading"]
@@ -3448,9 +3464,12 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         # Store for potential reprint
         self._last_receipt_data = {
             "consumer": dict(consumer),
+            "reading_id": reading_id,
             "present": present,
             "previous": previous,
+            "consumption": consumption,
             "exception": exception,
+            "reader_name": self._current_user["name"] if self._current_user else "Field Reader",
             "timestamp": time.time()
         }
         self.after(0, self._refresh_zone_stats)
@@ -3484,15 +3503,92 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._dismiss_overlay()
         self._spawn_overlay("Printing...", "Please wait", self._simulate_printing)
 
+    def _receipt_entry_to_payload(self, entry):
+        if not entry:
+            return None
+        timestamp = time.time()
+        printed_at = entry.get("printed_at")
+        if printed_at:
+            try:
+                timestamp = datetime.fromisoformat(str(printed_at).replace(" ", "T")).timestamp()
+            except ValueError:
+                pass
+        return {
+            "id": entry.get("id"),
+            "consumer": {
+                "id": entry.get("consumer_id"),
+                "acct_no": entry.get("acct_no"),
+                "name": entry.get("consumer_name"),
+                "meter_no": entry.get("meter_no"),
+                "zone_name": entry.get("zone_name"),
+                "previous_reading": entry.get("present_reading"),
+                "_original_previous": entry.get("previous_reading"),
+            },
+            "reading_id": entry.get("reading_id"),
+            "present": entry.get("present_reading"),
+            "previous": entry.get("previous_reading"),
+            "consumption": entry.get("consumption"),
+            "exception": entry.get("exception") or "None",
+            "reader_name": entry.get("reader_name") or "Field Reader",
+            "receipt_text": entry.get("receipt_text"),
+            "timestamp": timestamp,
+        }
+
+    def _persist_receipt_print(self, consumer, previous, present, exception, reader_name, receipt_text, print_action, reading_id=None):
+        consumption = present - previous
+        saved_id = save_receipt_print(
+            consumer["id"],
+            receipt_text,
+            previous,
+            present,
+            consumption,
+            exception,
+            reader_name,
+            reading_id,
+            print_action,
+            consumer.get("acct_no"),
+            consumer.get("name"),
+            consumer.get("meter_no"),
+            consumer.get("zone_name"),
+        )
+        self._last_receipt_data = {
+            "id": saved_id,
+            "consumer": dict(consumer),
+            "reading_id": reading_id,
+            "present": present,
+            "previous": previous,
+            "consumption": consumption,
+            "exception": exception,
+            "reader_name": reader_name,
+            "receipt_text": receipt_text,
+            "timestamp": time.time(),
+        }
+        return saved_id
+
+    def _deliver_receipt(self, consumer, previous, present, exception, reader_name, reading_id=None, print_action="print", receipt_text=None):
+        receipt_text = receipt_text or build_receipt_text(consumer, previous, present, exception, reader_name)
+        self._persist_receipt_print(consumer, previous, present, exception, reader_name, receipt_text, print_action, reading_id)
+        if can_use_system_printer():
+            try:
+                send_to_system_printer(receipt_text)
+                return True
+            except Exception as exc:
+                messagebox.showwarning(
+                    "Printer Error",
+                    f"Unable to print to the GP58 over USB.\n\n{exc}\n\nShowing receipt preview instead.",
+                )
+        show_receipt(self, consumer, previous, present, exception, reader_name)
+        return False
+
     def _simulate_printing(self):
         consumer = self._current_consumer
         present = int(self.present_var.get())
         previous = consumer["_original_previous"]
         exception = self.exception_var.get()
-        # Get current user name for receipt
         reader_name = self._current_user["name"] if self._current_user else "Field Reader"
+        reading_id = self._last_receipt_data.get("reading_id") if self._last_receipt_data else None
         self.after(0, self._dismiss_overlay)
-        self.after(100, lambda: show_receipt(self, consumer, previous, present, exception, reader_name))
+        self.after(100, lambda: self._deliver_receipt(consumer, previous, present, exception, reader_name, reading_id, "print"))
 
     def _show_reprint_dialog(self):
         """Show dialog to reprint the last saved receipt."""
@@ -3518,8 +3614,19 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             f"Saved: {time_str}")
 
         if result:
+            latest_entry = get_latest_receipt_print(consumer["id"])
+            receipt_text = latest_entry["receipt_text"] if latest_entry else data.get("receipt_text")
             reader_name = self._current_user["name"] if self._current_user else "Field Reader"
-            show_receipt(self, consumer, data["previous"], data["present"], data["exception"], reader_name)
+            self._deliver_receipt(
+                consumer,
+                data["previous"],
+                data["present"],
+                data["exception"],
+                reader_name,
+                latest_entry.get("reading_id") if latest_entry else data.get("reading_id"),
+                "reprint",
+                receipt_text,
+            )
 
     def _spawn_overlay(self, title, subtitle, target_task):
         self.overlay = tk.Toplevel(self)

@@ -155,6 +155,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 data[key] = {} if key == "server_payload" else data[key]
         return data
 
+    def _ensure_columns(self, conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        for name, definition in column_defs.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
+
     def ensure_schema(self) -> None:
         sql = """
         CREATE TABLE IF NOT EXISTS sync_queue_meter_readings (
@@ -196,25 +202,56 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             acct_no TEXT,
             name TEXT NOT NULL,
             zone_name TEXT,
+            classification_id INTEGER,
+            classification_name TEXT,
+            minimum_cubic INTEGER,
+            minimum_rate REAL,
+            excess_rate_per_cubic REAL,
+            due_days INTEGER,
+            penalty_percent REAL,
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """
         with self._connect() as conn:
             conn.executescript(sql)
+            self._ensure_columns(
+                conn,
+                "handheld_consumers_cache",
+                {
+                    "classification_id": "INTEGER",
+                    "classification_name": "TEXT",
+                    "minimum_cubic": "INTEGER",
+                    "minimum_rate": "REAL",
+                    "excess_rate_per_cubic": "REAL",
+                    "due_days": "INTEGER",
+                    "penalty_percent": "REAL",
+                },
+            )
             conn.commit()
 
     def cache_consumers(self, consumers: list[dict]) -> None:
         if not consumers:
             return
         sql = """
-        INSERT INTO handheld_consumers_cache (id, meter_no, acct_no, name, zone_name, previous_reading, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO handheld_consumers_cache (
+            id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
+            minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+            previous_reading, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
             name = excluded.name,
             zone_name = excluded.zone_name,
+            classification_id = excluded.classification_id,
+            classification_name = excluded.classification_name,
+            minimum_cubic = excluded.minimum_cubic,
+            minimum_rate = excluded.minimum_rate,
+            excess_rate_per_cubic = excluded.excess_rate_per_cubic,
+            due_days = excluded.due_days,
+            penalty_percent = excluded.penalty_percent,
             previous_reading = excluded.previous_reading,
             updated_at = CURRENT_TIMESTAMP
         """
@@ -228,6 +265,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                         item.get("acct_no"),
                         item.get("name", ""),
                         item.get("zone_name"),
+                        item.get("classification_id"),
+                        item.get("classification_name"),
+                        item.get("minimum_cubic"),
+                        item.get("minimum_rate"),
+                        item.get("excess_rate_per_cubic"),
+                        item.get("due_days"),
+                        item.get("penalty_percent"),
                         item.get("previous_reading"),
                     ),
                 )
@@ -235,7 +279,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         base = """
-        SELECT id, meter_no, acct_no, name, zone_name, previous_reading
+        SELECT id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
+               minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+               previous_reading
         FROM handheld_consumers_cache
         """
         params: tuple = ()
@@ -394,6 +440,40 @@ class SupabaseRestClient:
         status, _ = self._req("GET", "/rest/v1/", use_service_key=False)
         return 200 <= status < 500 and status != 0
 
+    def _load_latest_billing_settings(self) -> dict:
+        status, data = self._req(
+            "GET",
+            "billing_settings",
+            query={"select": "setting_id,due_days,penalty_percent", "order": "setting_id.desc", "limit": "1"},
+            use_service_key=True,
+        )
+        if status >= 400 or not isinstance(data, list) or not data:
+            return {}
+        row = data[0]
+        return row if isinstance(row, dict) else {}
+
+    def _load_waterrates_by_classification(self) -> dict[int, dict]:
+        status, data = self._req(
+            "GET",
+            "waterrates",
+            query={"select": "classification_id,rate_id,minimum_cubic,minimum_rate,excess_rate_per_cubic"},
+            use_service_key=True,
+        )
+        if status >= 400 or not isinstance(data, list):
+            return {}
+        rates: dict[int, dict] = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            classification_id = row.get("classification_id")
+            if classification_id is None:
+                continue
+            try:
+                rates[int(classification_id)] = row
+            except (TypeError, ValueError):
+                continue
+        return rates
+
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         # Use service key so handheld can fetch assignments even when anon/RLS policy is restrictive.
         # Primary target schema provided by user:
@@ -403,7 +483,7 @@ class SupabaseRestClient:
         # - consumer.first_name/middle_name/last_name
         # - consumer.zone_id -> zone.zone_name
         query = {
-            "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,previous_reading,last_reading,status,zone:zone_id(zone_name)"
+            "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,classification_id,previous_reading,last_reading,status,zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
         }
         if zone_name:
             query["zone.zone_name"] = f"eq.{zone_name}"
@@ -411,7 +491,7 @@ class SupabaseRestClient:
         if status >= 400:
             # Fallback for deployments where previous_reading/last_reading columns do not exist.
             fb_query = {
-                "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,status,zone:zone_id(zone_name)"
+                "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,classification_id,status,zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
             }
             if zone_name:
                 fb_query["zone.zone_name"] = f"eq.{zone_name}"
@@ -420,6 +500,8 @@ class SupabaseRestClient:
             raise RuntimeError(f"Supabase read failed: {data}")
         if not isinstance(data, list):
             return []
+        latest_settings = self._load_latest_billing_settings()
+        rates_by_classification = self._load_waterrates_by_classification()
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
@@ -438,6 +520,15 @@ class SupabaseRestClient:
                 zone_val = zone_obj.get("zone_name")
             else:
                 zone_val = row.get("zone_name") or row.get("zone") or row.get("zone_code")
+            classification_id = row.get("classification_id")
+            classification_obj = row.get("classification")
+            classification_name = None
+            if isinstance(classification_obj, dict):
+                classification_name = classification_obj.get("classification_name")
+            try:
+                rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else None
+            except (TypeError, ValueError):
+                rate_row = None
             prev = (
                 row.get("previous_reading")
                 if row.get("previous_reading") is not None
@@ -450,6 +541,13 @@ class SupabaseRestClient:
                     "acct_no": acct_no,
                     "name": name,
                     "zone_name": zone_val,
+                    "classification_id": classification_id,
+                    "classification_name": classification_name,
+                    "minimum_cubic": (rate_row or {}).get("minimum_cubic"),
+                    "minimum_rate": (rate_row or {}).get("minimum_rate"),
+                    "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
+                    "due_days": latest_settings.get("due_days"),
+                    "penalty_percent": latest_settings.get("penalty_percent"),
                     "previous_reading": prev if prev is not None else 0,
                 }
             )
@@ -615,9 +713,24 @@ class MainPostgresClient:
             c.account_number AS acct_no,
             CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
             z.zone_name AS zone_name,
+            c.classification_id,
+            cls.classification_name,
+            wr.minimum_cubic,
+            wr.minimum_rate,
+            wr.excess_rate_per_cubic,
+            bs.due_days,
+            bs.penalty_percent,
             COALESCE(prev.last_reading, 0)::int AS previous_reading
         FROM {self._schema}.consumer c
         JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+        LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
+        LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+        LEFT JOIN (
+            SELECT due_days, penalty_percent
+            FROM {self._schema}.billing_settings
+            ORDER BY setting_id DESC
+            LIMIT 1
+        ) bs ON TRUE
         JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
         LEFT JOIN (
@@ -651,9 +764,24 @@ class MainPostgresClient:
                         c.account_number AS acct_no,
                         CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
                         z.zone_name AS zone_name,
+                        c.classification_id,
+                        cls.classification_name,
+                        wr.minimum_cubic,
+                        wr.minimum_rate,
+                        wr.excess_rate_per_cubic,
+                        bs.due_days,
+                        bs.penalty_percent,
                         COALESCE(prev.last_reading, 0)::int AS previous_reading
                     FROM {self._schema}.consumer c
                     JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+                    LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
+                    LEFT JOIN {self._schema}.waterrates wr ON wr.classification_id = c.classification_id
+                    LEFT JOIN (
+                        SELECT due_days, penalty_percent
+                        FROM {self._schema}.billing_settings
+                        ORDER BY setting_id DESC
+                        LIMIT 1
+                    ) bs ON TRUE
                     LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
                     LEFT JOIN (
                         SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading

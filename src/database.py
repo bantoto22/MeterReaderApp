@@ -22,6 +22,13 @@ def get_connection():
     return conn
 
 
+def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    for name, definition in column_defs.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
+
+
 # ─── Schema creation ─────────────────────────────────────────────────────────
 def init_db():
     """Create the tables if they don't exist and seed only local user accounts."""
@@ -40,6 +47,13 @@ def init_db():
             acct_no          TEXT    NOT NULL,
             name             TEXT    NOT NULL,
             previous_reading INTEGER NOT NULL DEFAULT 0,
+            classification_id INTEGER,
+            classification_name TEXT,
+            minimum_cubic INTEGER DEFAULT 0,
+            minimum_rate REAL DEFAULT 50.0,
+            excess_rate_per_cubic REAL DEFAULT 7.5,
+            due_days INTEGER DEFAULT 11,
+            penalty_percent REAL DEFAULT 10.0,
             zone_id          INTEGER NOT NULL,
             FOREIGN KEY (zone_id) REFERENCES zones(id)
         );
@@ -62,7 +76,41 @@ def init_db():
             name     TEXT NOT NULL,
             reader_id TEXT UNIQUE NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS receipt_prints (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            consumer_id      INTEGER NOT NULL,
+            reading_id       INTEGER,
+            acct_no          TEXT,
+            consumer_name    TEXT NOT NULL,
+            meter_no         TEXT NOT NULL,
+            zone_name        TEXT,
+            previous_reading INTEGER NOT NULL,
+            present_reading  INTEGER NOT NULL,
+            consumption      INTEGER NOT NULL,
+            exception        TEXT DEFAULT 'None',
+            reader_name      TEXT NOT NULL,
+            receipt_text     TEXT NOT NULL,
+            print_action     TEXT NOT NULL DEFAULT 'print',
+            printed_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (consumer_id) REFERENCES consumers(id),
+            FOREIGN KEY (reading_id) REFERENCES readings(id)
+        );
     """)
+
+    _ensure_columns(
+        conn,
+        "consumers",
+        {
+            "classification_id": "INTEGER",
+            "classification_name": "TEXT",
+            "minimum_cubic": "INTEGER DEFAULT 0",
+            "minimum_rate": "REAL DEFAULT 50.0",
+            "excess_rate_per_cubic": "REAL DEFAULT 7.5",
+            "due_days": "INTEGER DEFAULT 11",
+            "penalty_percent": "REAL DEFAULT 10.0",
+        },
+    )
 
     # ── Seed data (only if tables are empty) ─────────────────────────────
     if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
@@ -174,6 +222,8 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
     conn = get_connection()
     if unread_only:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        c.classification_id, c.classification_name, c.minimum_cubic,
+                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -183,6 +233,8 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
                    )"""
     else:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        c.classification_id, c.classification_name, c.minimum_cubic,
+                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -201,6 +253,8 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     like_pattern = f"%{query}%"
     if unread_only:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        c.classification_id, c.classification_name, c.minimum_cubic,
+                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -213,6 +267,8 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
                  LIMIT ?"""
     else:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
+                        c.classification_id, c.classification_name, c.minimum_cubic,
+                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
@@ -229,7 +285,8 @@ def save_reading(consumer_id: int, present_reading: int, consumption: int,
                  exception: str = "None", is_flagged: bool = False):
     """Insert a new reading record and update the consumer's previous reading."""
     conn = get_connection()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged) "
         "VALUES (?, ?, ?, ?, ?)",
         (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0))
@@ -237,7 +294,91 @@ def save_reading(consumer_id: int, present_reading: int, consumption: int,
         "UPDATE consumers SET previous_reading = ? WHERE id = ?",
         (present_reading, consumer_id))
     conn.commit()
+    reading_id = cur.lastrowid
     conn.close()
+    return reading_id
+
+
+def save_receipt_print(
+    consumer_id: int,
+    receipt_text: str,
+    previous_reading: int,
+    present_reading: int,
+    consumption: int,
+    exception: str = "None",
+    reader_name: str = "Field Reader",
+    reading_id: int | None = None,
+    print_action: str = "print",
+    acct_no: str | None = None,
+    consumer_name: str | None = None,
+    meter_no: str | None = None,
+    zone_name: str | None = None,
+) -> int:
+    """Persist a printed receipt snapshot for later tracing and reprinting."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO receipt_prints (
+            consumer_id, reading_id, acct_no, consumer_name, meter_no, zone_name,
+            previous_reading, present_reading, consumption, exception, reader_name,
+            receipt_text, print_action
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            consumer_id,
+            reading_id,
+            acct_no,
+            consumer_name or "Unknown",
+            meter_no or "N/A",
+            zone_name,
+            previous_reading,
+            present_reading,
+            consumption,
+            exception or "None",
+            reader_name or "Field Reader",
+            receipt_text,
+            print_action or "print",
+        ),
+    )
+    conn.commit()
+    receipt_print_id = cur.lastrowid
+    conn.close()
+    return receipt_print_id
+
+
+def get_latest_receipt_print(consumer_id: int | None = None) -> dict | None:
+    """Return the most recent saved receipt print, optionally for one consumer."""
+    conn = get_connection()
+    sql = """
+        SELECT
+            rp.*,
+            c.id AS resolved_consumer_id,
+            c.meter_no AS resolved_meter_no,
+            c.acct_no AS resolved_acct_no,
+            c.name AS resolved_consumer_name,
+            z.name AS resolved_zone_name
+        FROM receipt_prints rp
+        LEFT JOIN consumers c ON c.id = rp.consumer_id
+        LEFT JOIN zones z ON z.id = c.zone_id
+    """
+    params = ()
+    if consumer_id is not None:
+        sql += " WHERE rp.consumer_id = ?"
+        params = (consumer_id,)
+    sql += " ORDER BY rp.printed_at DESC, rp.id DESC LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    conn.close()
+    if not row:
+        return None
+    data = dict(row)
+    data["consumer_id"] = data.get("consumer_id") or data.get("resolved_consumer_id")
+    data["meter_no"] = data.get("meter_no") or data.get("resolved_meter_no")
+    data["acct_no"] = data.get("acct_no") or data.get("resolved_acct_no")
+    data["consumer_name"] = data.get("consumer_name") or data.get("resolved_consumer_name")
+    data["zone_name"] = data.get("zone_name") or data.get("resolved_zone_name")
+    return data
 
 
 def get_zone_stats() -> dict:
@@ -291,6 +432,13 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             c.acct_no,
             c.name,
             c.previous_reading,
+            c.classification_id,
+            c.classification_name,
+            c.minimum_cubic,
+            c.minimum_rate,
+            c.excess_rate_per_cubic,
+            c.due_days,
+            c.penalty_percent,
             CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
             r.present_reading as reading_value,
             r.consumption,
@@ -345,34 +493,71 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         acct_no = (c.get("acct_no") or "").strip()
         name = (c.get("name") or "Unknown").strip()
         previous_reading = int(c.get("previous_reading") or 0)
+        classification_id = c.get("classification_id")
+        classification_name = (c.get("classification_name") or "").strip() or None
+        minimum_cubic = int(c.get("minimum_cubic") or 0)
+        minimum_rate = float(c.get("minimum_rate") or 50.0)
+        excess_rate_per_cubic = float(c.get("excess_rate_per_cubic") or 7.5)
+        due_days = int(c.get("due_days") or 11)
+        penalty_percent = float(c.get("penalty_percent") or 10.0)
         cid = c.get("id")
 
         if cid is not None:
             cur.execute(
                 """
-                INSERT INTO consumers (id, meter_no, acct_no, name, previous_reading, zone_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO consumers (
+                    id, meter_no, acct_no, name, previous_reading, classification_id,
+                    classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                    due_days, penalty_percent, zone_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
                     name = excluded.name,
                     previous_reading = excluded.previous_reading,
+                    classification_id = excluded.classification_id,
+                    classification_name = excluded.classification_name,
+                    minimum_cubic = excluded.minimum_cubic,
+                    minimum_rate = excluded.minimum_rate,
+                    excess_rate_per_cubic = excluded.excess_rate_per_cubic,
+                    due_days = excluded.due_days,
+                    penalty_percent = excluded.penalty_percent,
                     zone_id = excluded.zone_id
                 """,
-                (int(cid), meter_no, acct_no, name, previous_reading, zone_id),
+                (
+                    int(cid), meter_no, acct_no, name, previous_reading, classification_id,
+                    classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                    due_days, penalty_percent, zone_id,
+                ),
             )
         else:
             cur.execute(
                 """
-                INSERT INTO consumers (meter_no, acct_no, name, previous_reading, zone_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO consumers (
+                    meter_no, acct_no, name, previous_reading, classification_id,
+                    classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                    due_days, penalty_percent, zone_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = excluded.name,
                     previous_reading = excluded.previous_reading,
+                    classification_id = excluded.classification_id,
+                    classification_name = excluded.classification_name,
+                    minimum_cubic = excluded.minimum_cubic,
+                    minimum_rate = excluded.minimum_rate,
+                    excess_rate_per_cubic = excluded.excess_rate_per_cubic,
+                    due_days = excluded.due_days,
+                    penalty_percent = excluded.penalty_percent,
                     zone_id = excluded.zone_id
                 """,
-                (meter_no, acct_no, name, previous_reading, zone_id),
+                (
+                    meter_no, acct_no, name, previous_reading, classification_id,
+                    classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                    due_days, penalty_percent, zone_id,
+                ),
             )
         upserted += 1
 

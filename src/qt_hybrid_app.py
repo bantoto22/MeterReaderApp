@@ -36,9 +36,11 @@ try:
     from .database import (
         authenticate_user,
         get_all_zone_names,
+        get_latest_receipt_print,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        save_receipt_print,
         replace_consumers_from_sync,
         save_reading,
         search_consumer,
@@ -48,9 +50,11 @@ except ImportError:
     from database import (
         authenticate_user,
         get_all_zone_names,
+        get_latest_receipt_print,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        save_receipt_print,
         replace_consumers_from_sync,
         save_reading,
         search_consumer,
@@ -65,6 +69,11 @@ except ImportError:
     except ImportError:
         HandheldSyncDataAccess = None
         SyncConfig = None
+
+try:
+    from .receipt import build_receipt_text, can_use_system_printer, send_to_system_printer
+except ImportError:
+    from receipt import build_receipt_text, can_use_system_printer, send_to_system_printer
 
 
 class LoginBridge(QObject):
@@ -184,7 +193,8 @@ class AppBridge(QObject):
         self._progress_details_visible = False
         self._operation_busy = False
         self._operation_busy_message = ""
-        self._last_receipt = None
+        self._last_receipt_entry = get_latest_receipt_print()
+        self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
         
         self._zones = get_all_zone_names()
         self._selected_zone = self._zones[0] if self._zones else ""
@@ -323,6 +333,9 @@ class AppBridge(QObject):
         self._reader_id = user.get('id', '')
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
+        self._last_receipt_entry = get_latest_receipt_print()
+        self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
+        self.canReprintChanged.emit()
 
     @Slot()
     def showWelcomeToast(self) -> None:
@@ -956,7 +969,48 @@ class AppBridge(QObject):
         present = int(row.get("reading_value") or 0)
         consumption = int(row.get("consumption") or 0)
         previous = present - consumption
-        receipt = self._build_receipt_text(row, previous, present, row.get("exception") or "None")
+        latest_entry = get_latest_receipt_print(consumer_id)
+        if latest_entry:
+            receipt = latest_entry["receipt_text"]
+        else:
+            receipt = build_receipt_text(row, previous, present, row.get("exception") or "None", self._reader_name)
+            latest_entry = {
+                "consumer_id": consumer_id,
+                "reading_id": None,
+                "acct_no": row.get("acct_no"),
+                "consumer_name": row.get("name"),
+                "meter_no": row.get("meter_no"),
+                "zone_name": row.get("zone_name", self._selected_zone),
+                "previous_reading": previous,
+                "present_reading": present,
+                "consumption": consumption,
+                "exception": row.get("exception") or "None",
+                "reader_name": self._reader_name,
+                "receipt_text": receipt,
+            }
+        if can_use_system_printer():
+            try:
+                send_to_system_printer(receipt)
+            except Exception as exc:
+                self.alertRequested.emit("Printer Error", f"Unable to print to the GP58 over USB.\n\n{exc}")
+        saved_id = save_receipt_print(
+            latest_entry["consumer_id"],
+            latest_entry["receipt_text"],
+            int(latest_entry["previous_reading"]),
+            int(latest_entry["present_reading"]),
+            int(latest_entry["consumption"]),
+            latest_entry.get("exception") or "None",
+            latest_entry.get("reader_name") or self._reader_name,
+            latest_entry.get("reading_id"),
+            "reprint",
+            latest_entry.get("acct_no"),
+            latest_entry.get("consumer_name"),
+            latest_entry.get("meter_no"),
+            latest_entry.get("zone_name"),
+        )
+        self._last_receipt_entry = {**latest_entry, "id": saved_id, "print_action": "reprint"}
+        self._last_receipt = latest_entry["receipt_text"]
+        self.canReprintChanged.emit()
         self.receiptPreviewRequested.emit("Receipt Preview", receipt)
 
     @Slot()
@@ -1026,9 +1080,40 @@ class AppBridge(QObject):
                     consumption = present - previous
                     exception = self._selected_exception
                     flagged = consumption > 500 or exception != "None"
-                    save_reading(self._consumer["id"], present, consumption, exception, flagged)
+                    reading_id = save_reading(self._consumer["id"], present, consumption, exception, flagged)
                     self._save_to_sync_layer(self._consumer["id"], present, consumption, exception, flagged)
-                    receipt = self._build_receipt_text(self._consumer, previous, present, exception)
+                    receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name)
+                    saved_receipt_id = save_receipt_print(
+                        self._consumer["id"],
+                        receipt,
+                        previous,
+                        present,
+                        consumption,
+                        exception,
+                        self._reader_name,
+                        reading_id,
+                        "print",
+                        self._consumer.get("acct_no"),
+                        self._consumer.get("name"),
+                        self._consumer.get("meter_no"),
+                        self._consumer.get("zone_name", self._selected_zone),
+                    )
+                    self._last_receipt_entry = {
+                        "id": saved_receipt_id,
+                        "consumer_id": self._consumer["id"],
+                        "reading_id": reading_id,
+                        "acct_no": self._consumer.get("acct_no"),
+                        "consumer_name": self._consumer.get("name"),
+                        "meter_no": self._consumer.get("meter_no"),
+                        "zone_name": self._consumer.get("zone_name", self._selected_zone),
+                        "previous_reading": previous,
+                        "present_reading": present,
+                        "consumption": consumption,
+                        "exception": exception,
+                        "reader_name": self._reader_name,
+                        "receipt_text": receipt,
+                        "print_action": "print",
+                    }
                     self._last_receipt = receipt
                     self.canReprintChanged.emit()
 
@@ -1048,6 +1133,11 @@ class AppBridge(QObject):
                     self.update_stats()
                     if self._progress_details_visible:
                         self._refresh_zone_consumers()
+                    if can_use_system_printer():
+                        try:
+                            send_to_system_printer(receipt)
+                        except Exception as exc:
+                            self.alertRequested.emit("Printer Error", f"Unable to print to the GP58 over USB.\n\n{exc}")
                     self.receiptPreviewRequested.emit("Receipt Preview", receipt)
                 except Exception as e:
                     self.alertRequested.emit("Save Failed", str(e))
@@ -1072,12 +1162,38 @@ class AppBridge(QObject):
 
     @Slot()
     def reprintLastReceipt(self) -> None:
-        if not self._last_receipt:
+        if not self._last_receipt_entry:
+            self._last_receipt_entry = get_latest_receipt_print()
+            self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
+        if not self._last_receipt_entry:
             self.alertRequested.emit("No Receipt", "No saved receipt is available for reprint.")
             return
         if self._paper_status.lower() in {"out", "jam"}:
             self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
             return
+        if can_use_system_printer():
+            try:
+                send_to_system_printer(self._last_receipt_entry["receipt_text"])
+            except Exception as exc:
+                self.alertRequested.emit("Printer Error", f"Unable to print to the GP58 over USB.\n\n{exc}")
+        saved_id = save_receipt_print(
+            self._last_receipt_entry["consumer_id"],
+            self._last_receipt_entry["receipt_text"],
+            int(self._last_receipt_entry["previous_reading"]),
+            int(self._last_receipt_entry["present_reading"]),
+            int(self._last_receipt_entry["consumption"]),
+            self._last_receipt_entry.get("exception") or "None",
+            self._last_receipt_entry.get("reader_name") or self._reader_name,
+            self._last_receipt_entry.get("reading_id"),
+            "reprint",
+            self._last_receipt_entry.get("acct_no"),
+            self._last_receipt_entry.get("consumer_name"),
+            self._last_receipt_entry.get("meter_no"),
+            self._last_receipt_entry.get("zone_name"),
+        )
+        self._last_receipt_entry = {**self._last_receipt_entry, "id": saved_id, "print_action": "reprint"}
+        self._last_receipt = self._last_receipt_entry["receipt_text"]
+        self.canReprintChanged.emit()
         self.receiptPreviewRequested.emit("Receipt Preview", self._last_receipt)
 
     @Slot()
@@ -1177,42 +1293,6 @@ class AppBridge(QObject):
             "Shutdown Cancelled",
             detail,
         )
-
-    def _build_receipt_text(self, consumer: dict, previous: int, present: int, exception: str) -> str:
-        consumption = present - previous
-        current_bill = max(50.0, round(max(consumption, 0) * 7.50, 2))
-        penalty = round(current_bill * 0.10, 2)
-        total = round(current_bill + penalty, 2)
-        due_date = (datetime.now() + timedelta(days=11)).strftime("%Y-%m-%d")
-        lines = [
-            "================================",
-            " SAN LORENZO RUIZ WATERWORKS",
-            "     Water Billing System",
-            "================================",
-            f" Account No : {consumer.get('acct_no', 'N/A')}",
-            f" Name       : {consumer.get('name', 'N/A')}",
-            f" Zone       : {consumer.get('zone_name', self._selected_zone)}",
-            "--------------------------------",
-            f" Meter No   : {consumer.get('meter_no', 'N/A')}",
-            f" Prev Read  : {previous}",
-            f" Curr Read  : {present}",
-            f" Consumption: {consumption} m3",
-        ]
-        if exception and exception != "None":
-            lines.append(f" Exception  : {exception}")
-        lines += [
-            "--------------------------------",
-            f" Current Bill: PHP {current_bill:>8.2f}",
-            f" Penalty     : PHP {penalty:>8.2f}",
-            "================================",
-            f" TOTAL AMOUNT: PHP {total:>8.2f}",
-            f" Due Date    : {due_date}",
-            "--------------------------------",
-            f" Reader: {self._reader_name}",
-            "         Thank you!",
-            "================================",
-        ]
-        return "\n".join(lines)
 
     @Slot()
     def update_stats(self) -> None:
