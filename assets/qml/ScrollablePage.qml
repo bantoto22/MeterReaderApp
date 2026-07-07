@@ -15,7 +15,11 @@ Flickable {
     default property alias pageContent: contentColumn.data
 
     boundsBehavior: Flickable.StopAtBounds
+    boundsMovement: Flickable.StopAtBounds
     flickableDirection: Flickable.VerticalFlick
+    interactive: contentHeight > height
+    synchronousDrag: true
+    pressDelay: 120
     contentWidth: width
     contentHeight: contentContainer.implicitHeight
 

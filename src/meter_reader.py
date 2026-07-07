@@ -3217,12 +3217,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         if not meter_no:
             messagebox.showinfo("Search", "Please enter a meter number.")
             return
-        
-        # If numeric, auto-prepend "MTR-"
-        if meter_no.isdigit():
-            padded_no = meter_no.zfill(3)
-            meter_no = f"MTR-{padded_no}"
-        
+
         unread_only = bool(self._search_unread_only.get())
         consumer = search_consumer(meter_no, unread_only=unread_only)
         if consumer is None:

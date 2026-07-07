@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import "TouchMetrics.js" as TouchMetrics
 
 Item {
@@ -10,7 +11,8 @@ Item {
     anchors.bottom: parent ? parent.bottom : undefined
     z: 1000
 
-    readonly property Item focusedInput: Qt.application.activeWindow ? Qt.application.activeWindow.activeFocusItem : null
+    readonly property var hostWindow: root.Window.window
+    readonly property Item focusedInput: hostWindow && hostWindow.activeFocusItem ? hostWindow.activeFocusItem : null
     readonly property bool active: isEditableTextInput(focusedInput)
     readonly property string keyboardMode: active && focusedInput.keyboardMode ? focusedInput.keyboardMode : "alpha"
     readonly property bool numericMode: keyboardMode === "numeric"
@@ -144,6 +146,7 @@ Item {
         property color baseColor: "#FFFFFF"
         property color textColor: "#0F172A"
         property bool specialKey: false
+        focusPolicy: Qt.NoFocus
         Layout.fillWidth: true
         implicitHeight: TouchMetrics.keyboardButtonHeight
         contentItem: Text {

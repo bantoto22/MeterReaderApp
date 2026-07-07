@@ -11,6 +11,9 @@ Rectangle {
     readonly property bool compactScreen: width <= 420
     readonly property bool wideLayout: width >= 760
     readonly property bool compactActionRow: width < 520
+    readonly property int cardPadding: compactScreen ? 16 : 24
+    readonly property int cardInset: compactScreen ? 32 : 48
+    readonly property int cardSpacing: compactScreen ? 12 : 18
 
     Dialog {
         id: powerDialog
@@ -37,12 +40,12 @@ Rectangle {
         id: control
         property color buttonColor: "#2563EB"
         property color hoverColor: "#1D4ED8"
-        implicitHeight: TouchMetrics.buttonHeight
+        implicitHeight: settingsRoot.compactScreen ? TouchMetrics.compactButtonHeight : TouchMetrics.buttonHeight
         contentItem: Text {
             text: control.text
             color: "white"
             font.family: "Montserrat"
-            font.pixelSize: TouchMetrics.buttonText
+            font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.bodyText : TouchMetrics.buttonText
             font.bold: true
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -56,14 +59,16 @@ Rectangle {
     component CustomSwitch: Switch {
         id: sw
         property string labelText: ""
+        Layout.fillWidth: true
         contentItem: Text {
             text: sw.labelText
             font.family: "Montserrat"
-            font.pixelSize: TouchMetrics.bodyText
+            font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText : TouchMetrics.bodyText
             font.bold: true
             color: "#111827"
             verticalAlignment: Text.AlignVCenter
             leftPadding: sw.indicator.width + 10
+            wrapMode: Text.WordWrap
         }
         indicator: Rectangle {
             implicitWidth: 52
@@ -117,7 +122,7 @@ Rectangle {
 
             Rectangle {
                 Layout.fillWidth: true
-                implicitHeight: syncCardContent.implicitHeight + 48
+                implicitHeight: syncCardContent.implicitHeight + settingsRoot.cardInset
                 radius: 8
                 color: "white"
                 border.color: "#D8E1EC"
@@ -125,40 +130,40 @@ Rectangle {
                 ColumnLayout {
                     id: syncCardContent
                     anchors.fill: parent
-                    anchors.margins: 24
-                    spacing: 18
+                    anchors.margins: settingsRoot.cardPadding
+                    spacing: settingsRoot.cardSpacing
 
                     RowLayout {
                         Layout.fillWidth: true
-                        spacing: 16
+                        spacing: settingsRoot.compactScreen ? 12 : 16
                         Rectangle {
-                            Layout.preferredWidth: 56
-                            Layout.preferredHeight: 56
+                            Layout.preferredWidth: settingsRoot.compactScreen ? 48 : 56
+                            Layout.preferredHeight: settingsRoot.compactScreen ? 48 : 56
                             radius: 8
                             color: "#2563EB"
                             Text { anchors.centerIn: parent; text: "SYNC"; color: "white"; font.family: "Montserrat"; font.pixelSize: 9; font.bold: true }
                         }
                         ColumnLayout {
-                            spacing: 6
-                            Text { text: "Sync Diagnostics"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.sectionTitle; font.bold: true }
-                            Text { text: "Sync: " + (bridgeObj ? bridgeObj.syncStatus : "Offline"); color: bridgeObj ? bridgeObj.syncStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true }
+                            spacing: settingsRoot.compactScreen ? 4 : 6
+                            Text { text: "Sync Diagnostics"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.bodyText + 2 : TouchMetrics.sectionTitle; font.bold: true }
+                            Text { text: "Sync: " + (bridgeObj ? bridgeObj.syncStatus : "Offline"); color: bridgeObj ? bridgeObj.syncStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true }
                         }
                     }
 
                     GridLayout {
                         Layout.fillWidth: true
                         columns: settingsRoot.wideLayout ? 3 : 1
-                        columnSpacing: 34
-                        rowSpacing: 18
+                        columnSpacing: settingsRoot.compactScreen ? 20 : 34
+                        rowSpacing: settingsRoot.compactScreen ? 12 : 18
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 9
-                            Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
-                            Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Last pull mirrored: " + (bridgeObj ? bridgeObj.lastPullMirror : 0) + " records"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
+                            spacing: settingsRoot.compactScreen ? 6 : 9
+                            Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
+                            Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Last pull mirrored: " + (bridgeObj ? bridgeObj.lastPullMirror : 0) + " records"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         }
 
                         Rectangle {
@@ -170,7 +175,7 @@ Rectangle {
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 12
+                            spacing: settingsRoot.compactScreen ? 10 : 12
                             CustomSwitch {
                                 labelText: "Auto Pull from Main DB (online)"
                                 checked: bridgeObj ? bridgeObj.autoPullEnabled : true
@@ -183,19 +188,20 @@ Rectangle {
                             }
                             RowLayout {
                                 Layout.fillWidth: true
-                                Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText }
+                                spacing: settingsRoot.compactScreen ? 8 : 12
+                                Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                 TextField {
                                     id: txtInterval
                                     property string keyboardMode: "numeric"
-                                    Layout.preferredWidth: 108
-                                    implicitHeight: TouchMetrics.inputHeight
+                                    Layout.preferredWidth: settingsRoot.compactScreen ? 84 : 108
+                                    implicitHeight: settingsRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
                                     text: bridgeObj ? bridgeObj.pullInterval : 60
                                     inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
                                     validator: IntValidator { bottom: 15 }
                                     horizontalAlignment: Text.AlignHCenter
                                     color: "#111827"
                                     font.family: "Montserrat"
-                                    font.pixelSize: TouchMetrics.bodyText
+                                    font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
                                     background: Rectangle { radius: 7; color: "#F8FAFD"; border.color: txtInterval.activeFocus ? "#60A5FA" : "#C9D5E3" }
                                     onEditingFinished: { if (bridgeObj && text.length) bridgeObj.pullInterval = parseInt(text) }
                                 }
@@ -208,8 +214,8 @@ Rectangle {
                     GridLayout {
                         Layout.fillWidth: true
                         columns: settingsRoot.compactActionRow ? 2 : 3
-                        columnSpacing: 12
-                        rowSpacing: 12
+                        columnSpacing: settingsRoot.compactScreen ? 10 : 12
+                        rowSpacing: settingsRoot.compactScreen ? 10 : 12
                         ActionButton {
                             text: "Sync Now"
                             Layout.fillWidth: true

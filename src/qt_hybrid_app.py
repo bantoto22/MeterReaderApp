@@ -1043,11 +1043,6 @@ class AppBridge(QObject):
         if not query:
             return
 
-        if query.isdigit():
-            query = f"MTR-{query.zfill(3)}"
-            self._search_query = query
-            self.searchQueryChanged.emit()
-
         consumer = search_consumer(query, unread_only=self._search_unread_only)
         if consumer is None:
             matches = search_consumers_by_zone(query, self._selected_zone, limit=1, unread_only=self._search_unread_only)
@@ -1716,7 +1711,7 @@ class MainContainerPage(QWidget):
 class HybridMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Water Meter Reader - Qt Hybrid")
+        self.setWindowTitle("Water Meter Reader")
         self.resize(480, 800)  # Match the portrait touchscreen viewport more closely.
 
         self.stack = QStackedWidget()
