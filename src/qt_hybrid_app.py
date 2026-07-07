@@ -144,6 +144,18 @@ def _format_reading(value) -> str:
     return text
 
 
+def _normalize_shutdown_error(detail: str) -> str:
+    lowered = (detail or "").lower()
+    if "a password is required" in lowered or "password" in lowered or "interactive authentication required" in lowered:
+        return (
+            "Shutdown requires elevated privileges on this Raspberry Pi.\n\n"
+            "Configure passwordless power-off for the app user, for example:\n"
+            "sudo visudo\n"
+            "Add: pi ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff, /bin/systemctl"
+        )
+    return detail or "Power-off command failed."
+
+
 class LoginBridge(QObject):
     loginSuccess = Signal(dict)
     loginFailed = Signal()
@@ -1605,11 +1617,12 @@ class AppBridge(QObject):
                 return
 
             commands = [
+                ["sudo", "-n", "systemctl", "poweroff"],
+                ["sudo", "-n", "shutdown", "-h", "now"],
+                ["sudo", "-n", "poweroff"],
                 ["systemctl", "poweroff"],
                 ["shutdown", "-h", "now"],
                 ["poweroff"],
-                ["sudo", "-n", "shutdown", "-h", "now"],
-                ["sudo", "-n", "poweroff"],
             ]
 
             last_error = "Power-off command failed."
@@ -1626,13 +1639,13 @@ class AppBridge(QObject):
                         return
                     detail = (result.stderr or result.stdout or "").strip()
                     if detail:
-                        last_error = detail
+                        last_error = _normalize_shutdown_error(detail)
                 except FileNotFoundError:
                     continue
                 except subprocess.TimeoutExpired:
                     return
                 except Exception as exc:
-                    last_error = str(exc) or last_error
+                    last_error = _normalize_shutdown_error(str(exc) or last_error)
 
             self.powerOffFailed.emit(last_error)
 

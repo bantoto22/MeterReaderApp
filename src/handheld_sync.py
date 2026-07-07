@@ -1597,7 +1597,7 @@ class HandheldSyncDataAccess:
         return None, errors
 
     def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
-        if self.is_online():
+        if self.remote and self.remote.is_online():
             try:
                 data = self.remote.load_assigned_consumers(zone_name)
                 data = self._overlay_main_pg_rates_for_consumers(data)
