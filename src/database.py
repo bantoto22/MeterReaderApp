@@ -642,7 +642,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         acct_no = (c.get("acct_no") or "").strip()
         name = (c.get("name") or "Unknown").strip()
         previous_reading = int(c.get("previous_reading") or 0)
-        classification_id = c.get("classification_id")
+        classification_id = _optional_int(c.get("classification_id"))
         classification_name = (c.get("classification_name") or "").strip() or None
         minimum_cubic = _optional_int(c.get("minimum_cubic"))
         minimum_rate = _optional_float(c.get("minimum_rate"))
