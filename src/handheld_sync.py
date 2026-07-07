@@ -1049,6 +1049,7 @@ class MainPostgresClient:
             dbname=self._cfg.main_pg_db,
             user=self._cfg.main_pg_user,
             password=self._cfg.main_pg_password,
+            connect_timeout=5,
         )
 
     def is_online(self) -> bool:
@@ -1102,7 +1103,7 @@ class MainPostgresClient:
         sql = f"""
         SELECT
             c.consumer_id AS id,
-            COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
             c.account_number AS acct_no,
             CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
             z.zone_name AS zone_name,
@@ -1177,7 +1178,7 @@ class MainPostgresClient:
                     fb_sql = f"""
                     SELECT
                         c.consumer_id AS id,
-                        COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
                         c.account_number AS acct_no,
                         CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
                         z.zone_name AS zone_name,
@@ -1241,7 +1242,7 @@ class MainPostgresClient:
         SELECT
             c.consumer_id,
             c.account_number AS acct_no,
-            COALESCE(c.meter_number, m.meter_serial_number) AS meter_no,
+            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
             z.zone_name,
             c.classification_id,
             cls.classification_name,

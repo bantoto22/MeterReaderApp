@@ -621,6 +621,18 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     conn = get_connection()
     cur = conn.cursor()
 
+    def _fallback_meter_no(consumer: dict) -> str:
+        meter_no = str(consumer.get("meter_no") or "").strip()
+        if meter_no:
+            return meter_no
+        acct_no = str(consumer.get("acct_no") or "").strip()
+        if acct_no:
+            return f"ACCT-{acct_no}"
+        cid = consumer.get("id")
+        if cid not in (None, ""):
+            return f"CID-{cid}"
+        return ""
+
     def _optional_int(value):
         value = _sqlite_safe(value)
         if value is None or value == "":
@@ -643,7 +655,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     upserted = 0
     for c in consumers:
         c = {key: _sqlite_safe(value) for key, value in c.items()}
-        meter_no = (c.get("meter_no") or "").strip()
+        meter_no = _fallback_meter_no(c)
         if not meter_no:
             continue
         zone_name = (c.get("zone_name") or "Unassigned").strip()

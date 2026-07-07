@@ -239,6 +239,7 @@ class AppBridge(QObject):
     backupStateChanged = Signal()
     lastSyncChanged = Signal()
     lastPullMirrorChanged = Signal()
+    lastPullCountChanged = Signal()
     autoPullEnabledChanged = Signal()
     autoPushEnabledChanged = Signal()
     pullIntervalChanged = Signal()
@@ -307,6 +308,7 @@ class AppBridge(QObject):
         self._backup_state = "Not configured"
         self._last_sync = "Never"
         self._last_pull_mirror = 0
+        self._last_pull_count = 0
         self._auto_pull_enabled = True
         self._auto_push_enabled = True
         self._pull_interval = 60
@@ -598,6 +600,10 @@ class AppBridge(QObject):
     def lastPullMirror(self) -> int:
         return self._last_pull_mirror
 
+    @Property(int, notify=lastPullCountChanged)
+    def lastPullCount(self) -> int:
+        return self._last_pull_count
+
     @Property(bool, notify=autoPullEnabledChanged)
     def autoPullEnabled(self) -> bool:
         return self._auto_pull_enabled
@@ -818,6 +824,9 @@ class AppBridge(QObject):
             return
 
         self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
+        if "pulled" in result:
+            self._last_pull_count = int(result.get("pulled", self._last_pull_count))
+            self.lastPullCountChanged.emit()
         self._zones = get_all_zone_names()
         self.zonesChanged.emit()
         self._refresh_search_suggestions()
@@ -1307,8 +1316,10 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 result = self._sync_dal.syncPendingReadings()
-                consumers = self._sync_dal.loadAssignedConsumers(None)
-                mirrored = replace_consumers_from_sync(consumers)
+                mirrored = 0
+                if result.get("status") != "offline":
+                    consumers = self._sync_dal.loadAssignedConsumers(None)
+                    mirrored = replace_consumers_from_sync(consumers)
                 self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": mirrored})
             except Exception as exc:
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})

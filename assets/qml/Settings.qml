@@ -181,7 +181,18 @@ Rectangle {
                             Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Last pull mirrored: " + (bridgeObj ? bridgeObj.lastPullMirror : 0) + " records"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text {
+                                text: "Last pull: "
+                                      + (bridgeObj ? bridgeObj.lastPullCount : 0)
+                                      + " pulled | "
+                                      + (bridgeObj ? bridgeObj.lastPullMirror : 0)
+                                      + " mirrored"
+                                color: "#526176"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
 
                         Rectangle {
