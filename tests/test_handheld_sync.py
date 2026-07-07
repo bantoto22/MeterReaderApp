@@ -238,6 +238,24 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(saved["minimum_rate"], 150.0)
         self.assertEqual(saved["excess_rate_per_cubic"], 15.0)
 
+    def test_save_reading_skips_supabase_when_offline(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            def save_reading_bundle(self, payload):
+                return {"meterreading": self.upsert_meter_reading(payload)}
+
+        main_pg = FakeMainPgStore()
+        main_pg.online = True
+        self.remote.online = False
+        self.remote.fail_writes = True
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        result = self.dal.saveMeterReading({"consumer_id": 9, "present_reading": 12, "reading_date": "2026-05-08"})
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(list(result["remote"].keys()), ["MAIN_PG"])
+        self.assertEqual(len(main_pg.remote_rows), 1)
+        self.assertEqual(len(self.remote.remote_rows), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

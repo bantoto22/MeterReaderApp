@@ -1510,9 +1510,9 @@ class HandheldSyncDataAccess:
 
     def _available_targets(self) -> list[tuple[str, object]]:
         targets: list[tuple[str, object]] = []
-        if self.remote:
+        if self.remote and self.remote.is_online():
             targets.append(("Supabase", self.remote))
-        if self.main_pg:
+        if self.main_pg and self.main_pg.is_online():
             targets.append(("MAIN_PG", self.main_pg))
         return targets
 
