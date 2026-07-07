@@ -1504,7 +1504,9 @@ class HandheldSyncDataAccess:
         return cls(SQLiteLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
 
     def is_online(self) -> bool:
-        return self.remote.is_online()
+        if self.remote and self.remote.is_online():
+            return True
+        return bool(self.main_pg and self.main_pg.is_online())
 
     def _available_targets(self) -> list[tuple[str, object]]:
         targets: list[tuple[str, object]] = []
