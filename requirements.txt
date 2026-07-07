@@ -1,5 +1,8 @@
-PySide6
 Pillow
 psycopg2-binary
 python-dotenv
 ttkbootstrap
+PySide6; platform_machine == "aarch64" or platform_machine == "x86_64" or platform_machine == "AMD64"
+
+# Raspberry Pi OS armhf:
+# sudo apt install python3-pyqt6 python3-pyqt6.qtqml python3-pyqt6.qtquick

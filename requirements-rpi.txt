@@ -1,0 +1,16 @@
+# Python packages installed with pip on Raspberry Pi OS armhf.
+Pillow
+psycopg2-binary
+python-dotenv
+ttkbootstrap
+
+# Install Qt from apt on Raspberry Pi OS armhf:
+# sudo apt update
+# sudo apt install -y \
+#   python3-pyqt6 \
+#   python3-pyqt6.qtqml \
+#   python3-pyqt6.qtquick \
+#   qml6-module-qtquick \
+#   qml6-module-qtquick-controls \
+#   qml6-module-qtquick-layouts \
+#   qml6-module-qtqml-workerscript

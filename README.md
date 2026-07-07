@@ -28,13 +28,36 @@ python main.py
 ### Qt Hybrid Mode (Widgets + QML overview)
 
 ```bash
-python main.py --qt
+python main.py
 ```
 
-Install dependency first:
+Install dependency first on development PCs:
 
 ```bash
 pip install PySide6
+```
+
+On Raspberry Pi OS Trixie `armhf`, use PyQt6 from `apt` instead of PySide6:
+
+```bash
+sudo apt update
+
+sudo apt install -y \
+python3-pyqt6 \
+python3-pyqt6.qtqml \
+python3-pyqt6.qtquick \
+qml6-module-qtquick \
+qml6-module-qtquick-controls \
+qml6-module-qtquick-layouts \
+qml6-module-qtqml-workerscript
+```
+
+Then run:
+
+```bash
+DISPLAY=:0 \
+XAUTHORITY=/home/pi/.Xauthority \
+python3 main.py
 ```
 
 ## Default Login Credentials

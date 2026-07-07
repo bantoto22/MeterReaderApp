@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import os
-import importlib.util
 import re
 import subprocess
 import threading
@@ -13,24 +12,50 @@ from pathlib import Path
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
-if os.name == "nt":
-    pyside_spec = importlib.util.find_spec("PySide6")
-    if pyside_spec and pyside_spec.origin:
-        os.add_dll_directory(str(Path(pyside_spec.origin).resolve().parent))
-
-from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QFont
-from PySide6.QtQuickWidgets import QQuickWidget
-from PySide6.QtWidgets import (
-    QApplication,
-    QHBoxLayout,
-    QMainWindow,
-    QPushButton,
-    QStackedWidget,
-    QVBoxLayout,
-    QWidget,
-)
+try:
+    from .qt_compat import (
+        CPU_ARCH,
+        QApplication,
+        QFont,
+        QMainWindow,
+        QObject,
+        Property,
+        PYTHON_VERSION,
+        QQuickWidget,
+        QT_BINDING,
+        QT_BINDING_VERSION,
+        QT_VERSION,
+        QStackedWidget,
+        QTimer,
+        Qt,
+        QUrl,
+        QVBoxLayout,
+        QWidget,
+        Signal,
+        Slot,
+    )
+except ImportError:
+    from qt_compat import (
+        CPU_ARCH,
+        QApplication,
+        QFont,
+        QMainWindow,
+        QObject,
+        Property,
+        PYTHON_VERSION,
+        QQuickWidget,
+        QT_BINDING,
+        QT_BINDING_VERSION,
+        QT_VERSION,
+        QStackedWidget,
+        QTimer,
+        Qt,
+        QUrl,
+        QVBoxLayout,
+        QWidget,
+        Signal,
+        Slot,
+    )
 
 try:
     from .database import (
@@ -90,6 +115,16 @@ except ImportError:
         print_test_receipt,
         send_to_system_printer,
     )
+
+QML_MAIN_FILE = Path(__file__).resolve().parent.parent / "assets" / "qml" / "MainContainer.qml"
+QML_LOGIN_FILE = Path(__file__).resolve().parent.parent / "assets" / "qml" / "Login.qml"
+
+print(f"Using Qt binding: {QT_BINDING}")
+print(f"Python version: {PYTHON_VERSION}")
+print(f"CPU architecture: {CPU_ARCH}")
+print(f"Qt binding version: {QT_BINDING_VERSION}")
+print(f"Qt version: {QT_VERSION}")
+print(f"QML main file: {QML_MAIN_FILE}")
 
 
 class LoginBridge(QObject):
@@ -1656,9 +1691,8 @@ class LoginPage(QWidget):
 
         self.quick = QQuickWidget()
         self.quick.rootContext().setContextProperty("loginBridge", self.bridge)
-        qml_path = Path(__file__).resolve().parent.parent / "assets" / "qml" / "Login.qml"
-        self.quick.setSource(QUrl.fromLocalFile(str(qml_path)))
-        self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        self.quick.setSource(QUrl.fromLocalFile(str(QML_LOGIN_FILE)))
+        self.quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
         layout.addWidget(self.quick)
 
 
@@ -1672,9 +1706,8 @@ class MainContainerPage(QWidget):
 
         self.quick = QQuickWidget()
         self.quick.rootContext().setContextProperty("appBridge", self.bridge)
-        qml_path = Path(__file__).resolve().parent.parent / "assets" / "qml" / "MainContainer.qml"
-        self.quick.setSource(QUrl.fromLocalFile(str(qml_path)))
-        self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        self.quick.setSource(QUrl.fromLocalFile(str(QML_MAIN_FILE)))
+        self.quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
         layout.addWidget(self.quick)
 
 
