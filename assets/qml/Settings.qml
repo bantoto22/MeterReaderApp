@@ -19,19 +19,30 @@ Rectangle {
         id: powerDialog
         anchors.centerIn: parent
         width: Math.min(parent.width - 40, 420)
+        height: Math.min(parent.height - 48, settingsRoot.compactScreen ? 300 : 280)
         modal: true
+        padding: settingsRoot.compactScreen ? 14 : 18
         standardButtons: Dialog.Ok | Dialog.Cancel
         title: "Power Off Device"
         onAccepted: {
             if (bridgeObj) bridgeObj.powerOffDevice()
         }
-        contentItem: Text {
-            width: parent.width
-            wrapMode: Text.WordWrap
-            color: "#111827"
-            font.family: "Montserrat"
-            font.pixelSize: 12
-            text: "Power off the device safely?\n\nThe app will sync pending readings first, then send a proper shutdown command to the Raspberry Pi to help prevent Raspberry Pi OS corruption. Only remove external power after the screen and Pi have fully shut down."
+        contentItem: Flickable {
+            clip: true
+            contentWidth: width
+            contentHeight: powerDialogText.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.VerticalFlick
+
+            Text {
+                id: powerDialogText
+                width: powerDialog.availableWidth
+                wrapMode: Text.WordWrap
+                color: "#111827"
+                font.family: "Montserrat"
+                font.pixelSize: 12
+                text: "Power off the device safely?\n\nThe app will sync pending readings first, then send a proper shutdown command to the Raspberry Pi to help prevent Raspberry Pi OS corruption. Only remove external power after the screen and Pi have fully shut down."
+            }
         }
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
@@ -94,9 +105,16 @@ Rectangle {
         width: Math.min(parent.width - 32, 560)
         height: Math.min(parent.height - 60, 520)
         modal: true
+        padding: settingsRoot.compactScreen ? 14 : 18
         standardButtons: Dialog.Close
         contentItem: ScrollView {
+            clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
             TextArea {
+                width: logsDialog.availableWidth
                 text: bridgeObj ? bridgeObj.syncLogs : "No sync activity yet."
                 readOnly: true
                 wrapMode: TextEdit.Wrap
@@ -242,8 +260,8 @@ Rectangle {
                 ColumnLayout {
                     id: printerCardContent
                     anchors.fill: parent
-                    anchors.margins: 24
-                    spacing: 14
+                    anchors.margins: settingsRoot.cardPadding
+                    spacing: settingsRoot.cardSpacing
 
                     Text {
                         text: "Printer Settings"
@@ -291,8 +309,8 @@ Rectangle {
                 ColumnLayout {
                     id: wifiCardContent
                     anchors.fill: parent
-                    anchors.margins: 24
-                    spacing: 14
+                    anchors.margins: settingsRoot.cardPadding
+                    spacing: settingsRoot.cardSpacing
 
                     RowLayout {
                         Layout.fillWidth: true
@@ -305,9 +323,16 @@ Rectangle {
                             Text { anchors.centerIn: parent; text: "WI-FI"; color: "white"; font.family: "Montserrat"; font.pixelSize: 9; font.bold: true }
                         }
                         ColumnLayout {
-                            spacing: 6
-                            Text { text: "Connectivity"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.sectionTitle; font.bold: true }
-                            Text { text: bridgeObj ? bridgeObj.wifiStatus : "Status: Checking..."; color: bridgeObj ? bridgeObj.wifiStatusColor : "#526176"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; elide: Text.ElideRight; Layout.maximumWidth: settingsRoot.width - 140 }
+                            spacing: settingsRoot.compactScreen ? 4 : 6
+                            Text { text: "Connectivity"; color: "#111827"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.bodyText + 2 : TouchMetrics.sectionTitle; font.bold: true }
+                            Text {
+                                text: bridgeObj ? bridgeObj.wifiStatus : "Status: Checking..."
+                                color: bridgeObj ? bridgeObj.wifiStatusColor : "#526176"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
                     }
 
@@ -480,8 +505,8 @@ Rectangle {
                 ColumnLayout {
                     id: powerCardContent
                     anchors.fill: parent
-                    anchors.margins: 24
-                    spacing: 14
+                    anchors.margins: settingsRoot.cardPadding
+                    spacing: settingsRoot.cardSpacing
 
                     Text {
                         text: "Power"

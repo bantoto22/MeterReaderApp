@@ -338,6 +338,38 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     def _sqlite_safe_row(cls, item: dict) -> dict:
         return {key: cls._sqlite_safe(value) for key, value in item.items()}
 
+    @classmethod
+    def _normalize_cached_consumer(cls, item: dict) -> tuple:
+        row = cls._sqlite_safe_row(item)
+        classification_id = row.get("classification_id")
+        if classification_id not in (None, ""):
+            try:
+                classification_id = int(float(classification_id))
+            except (TypeError, ValueError):
+                classification_id = None
+        return (
+            _safe_int(row.get("id"), None),
+            row.get("meter_no"),
+            row.get("acct_no"),
+            row.get("name", ""),
+            row.get("zone_name"),
+            classification_id,
+            row.get("classification_name"),
+            _safe_int(row.get("minimum_cubic"), None),
+            _safe_float(row.get("minimum_rate"), None),
+            _safe_float(row.get("excess_rate_per_cubic"), None),
+            _safe_int(row.get("due_days"), None),
+            _safe_float(row.get("penalty_percent"), None),
+            _safe_float(row.get("amount_due"), None),
+            row.get("due_date"),
+            _safe_float(row.get("penalty"), None),
+            _safe_float(row.get("previous_penalty"), None),
+            _safe_float(row.get("total_after_due_date"), None),
+            row.get("bill_status"),
+            _safe_float(row.get("late_fee"), None),
+            _safe_float(row.get("previous_reading"), 0.0),
+        )
+
     def _ensure_columns(self, conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
         for name, definition in column_defs.items():
@@ -463,38 +495,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         """
         with self._connect() as conn:
             for item in consumers:
-                row = self._sqlite_safe_row(item)
-                classification_id = row.get("classification_id")
-                if classification_id not in (None, ""):
-                    try:
-                        classification_id = int(float(classification_id))
-                    except (TypeError, ValueError):
-                        classification_id = None
-                conn.execute(
-                    sql,
-                    (
-                        row.get("id"),
-                        row.get("meter_no"),
-                        row.get("acct_no"),
-                        row.get("name", ""),
-                        row.get("zone_name"),
-                        classification_id,
-                        row.get("classification_name"),
-                        _safe_int(row.get("minimum_cubic"), None),
-                        _safe_float(row.get("minimum_rate"), None),
-                        _safe_float(row.get("excess_rate_per_cubic"), None),
-                        _safe_int(row.get("due_days"), None),
-                        _safe_float(row.get("penalty_percent"), None),
-                        _safe_float(row.get("amount_due"), None),
-                        row.get("due_date"),
-                        _safe_float(row.get("penalty"), None),
-                        _safe_float(row.get("previous_penalty"), None),
-                        _safe_float(row.get("total_after_due_date"), None),
-                        row.get("bill_status"),
-                        _safe_float(row.get("late_fee"), None),
-                        _safe_int(row.get("previous_reading"), 0),
-                    ),
-                )
+                conn.execute(sql, self._normalize_cached_consumer(item))
             conn.commit()
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:

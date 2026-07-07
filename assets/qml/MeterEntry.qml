@@ -12,7 +12,7 @@ Rectangle {
     readonly property bool compactScreen: width <= 420
     readonly property var currentConsumption: {
         if (!bridgeObj || bridgeObj.consumption === "-") return 0
-        return parseInt(bridgeObj.consumption)
+        return parseFloat(bridgeObj.consumption)
     }
 
     function showPrintAlert(title, message) {
@@ -304,14 +304,18 @@ Rectangle {
                         Layout.fillWidth: true
                         placeholderText: "Enter current reading..."
                         text: bridgeObj ? bridgeObj.presentReading : ""
-                        inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
+                        inputMethodHints: Qt.ImhFormattedNumbersOnly | Qt.ImhNoPredictiveText
                         font.pixelSize: 18
                         font.family: "Montserrat"
                         color: "#0F172A"
                         placeholderTextColor: "#94A3B8"
                         horizontalAlignment: Text.AlignHCenter
                         padding: 12
-                        validator: IntValidator { bottom: 0 }
+                        validator: DoubleValidator {
+                            bottom: 0
+                            decimals: 2
+                            notation: DoubleValidator.StandardNotation
+                        }
                         background: Rectangle {
                             radius: 8
                             border.color: txtPresent.activeFocus ? "#3B82F6" : "#E2E8F0"

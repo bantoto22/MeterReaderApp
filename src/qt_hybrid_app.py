@@ -127,6 +127,23 @@ print(f"Qt version: {QT_VERSION}")
 print(f"QML main file: {QML_MAIN_FILE}")
 
 
+def _to_float(value, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_reading(value) -> str:
+    numeric = _to_float(value, 0.0)
+    text = f"{numeric:.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 class LoginBridge(QObject):
     loginSuccess = Signal(dict)
     loginFailed = Signal()
@@ -769,7 +786,7 @@ class AppBridge(QObject):
         self._consumer = refreshed
         self._account_no = str(refreshed.get("acct_no") or refreshed["id"])
         self._consumer_name = refreshed["name"]
-        self._previous_reading = str(refreshed["previous_reading"])
+        self._previous_reading = _format_reading(refreshed["previous_reading"])
         self.accountNoChanged.emit()
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
@@ -803,7 +820,7 @@ class AppBridge(QObject):
                 f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}\nMirrored: {self._last_pull_mirror}",
             )
 
-    def _save_to_sync_layer(self, consumer_id: int, present: int, consumption: int, exception: str, flagged: bool) -> None:
+    def _save_to_sync_layer(self, consumer_id: int, present: float, consumption: float, exception: str, flagged: bool) -> None:
         if not self._sync_dal or not self._auto_push_enabled:
             return
         consumer = self._consumer or {}
@@ -1059,7 +1076,7 @@ class AppBridge(QObject):
             self._consumer = consumer
             self._account_no = str(consumer.get("acct_no") or consumer["id"])
             self._consumer_name = consumer["name"]
-            self._previous_reading = str(consumer["previous_reading"])
+            self._previous_reading = _format_reading(consumer["previous_reading"])
             self._present_reading = ""
             self._consumption = "-"
 
@@ -1094,8 +1111,8 @@ class AppBridge(QObject):
         if not row or not row.get("is_read"):
             self.alertRequested.emit("No Receipt", "No saved reading is available for this consumer.")
             return
-        present = int(row.get("reading_value") or 0)
-        consumption = int(row.get("consumption") or 0)
+        present = _to_float(row.get("reading_value") or 0)
+        consumption = _to_float(row.get("consumption") or 0)
         previous = present - consumption
         latest_entry = get_latest_receipt_print(consumer_id)
         if latest_entry:
@@ -1124,9 +1141,9 @@ class AppBridge(QObject):
         saved_id = save_receipt_print(
             latest_entry["consumer_id"],
             latest_entry["receipt_text"],
-            int(latest_entry["previous_reading"]),
-            int(latest_entry["present_reading"]),
-            int(latest_entry["consumption"]),
+            _to_float(latest_entry["previous_reading"]),
+            _to_float(latest_entry["present_reading"]),
+            _to_float(latest_entry["consumption"]),
             latest_entry.get("exception") or "None",
             latest_entry.get("reader_name") or self._reader_name,
             latest_entry.get("reading_id"),
@@ -1156,20 +1173,20 @@ class AppBridge(QObject):
             return
 
         try:
-            present = int(self._present_reading)
-            previous = int(self._consumer["previous_reading"])
+            present = _to_float(self._present_reading)
+            previous = _to_float(self._consumer["previous_reading"])
             diff = present - previous
             
             if diff < 0:
-                self._consumption = str(diff)
+                self._consumption = _format_reading(diff)
                 self._validation_color = "#EF4444"
                 self._validation_message = "Invalid: Lower than previous"
             elif diff > 500:
-                self._consumption = str(diff)
+                self._consumption = _format_reading(diff)
                 self._validation_color = "#F59E0B"
                 self._validation_message = "Warning: High Consumption"
             else:
-                self._consumption = str(diff)
+                self._consumption = _format_reading(diff)
                 self._validation_color = "#10B981"
                 self._validation_message = "Valid"
         except Exception:
@@ -1196,8 +1213,8 @@ class AppBridge(QObject):
 
     def _build_pending_receipt_job(self) -> dict:
         self._reload_current_consumer_from_db()
-        present = int(self._present_reading)
-        previous = int(self._consumer["previous_reading"])
+        present = _to_float(self._present_reading)
+        previous = _to_float(self._consumer["previous_reading"])
         consumption = present - previous
         exception = self._selected_exception
         receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name)
@@ -1221,8 +1238,8 @@ class AppBridge(QObject):
 
         try:
             self._reload_current_consumer_from_db()
-            present = int(self._present_reading)
-            previous = int(self._consumer["previous_reading"])
+            present = _to_float(self._present_reading)
+            previous = _to_float(self._consumer["previous_reading"])
             if present < previous:
                 self.alertRequested.emit("Invalid Reading", "Present reading cannot be lower than the previous reading.")
                 return
@@ -1345,9 +1362,9 @@ class AppBridge(QObject):
 
                 if job.get("job_type") == "original":
                     consumer = dict(job["consumer_snapshot"])
-                    present = int(job["present"])
-                    previous = int(job["previous"])
-                    consumption = int(job["consumption"])
+                    present = _to_float(job["present"])
+                    previous = _to_float(job["previous"])
+                    consumption = _to_float(job["consumption"])
                     exception = str(job["exception"])
                     flagged = consumption > 500 or exception != "None"
                     reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged)
@@ -1398,9 +1415,9 @@ class AppBridge(QObject):
                 saved_id = save_receipt_print(
                     source_entry["consumer_id"],
                     receipt_text,
-                    int(source_entry["previous_reading"]),
-                    int(source_entry["present_reading"]),
-                    int(source_entry["consumption"]),
+                    _to_float(source_entry["previous_reading"]),
+                    _to_float(source_entry["present_reading"]),
+                    _to_float(source_entry["consumption"]),
                     source_entry.get("exception") or "None",
                     self._reader_name,
                     source_entry.get("reading_id"),
@@ -1438,7 +1455,7 @@ class AppBridge(QObject):
         self._pending_print_job = None
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
-            present = int(result["present"])
+            present = _to_float(result["present"])
             self._last_receipt_entry = {
                 "id": result["saved_receipt_id"],
                 "consumer_id": consumer["id"],
@@ -1447,9 +1464,9 @@ class AppBridge(QObject):
                 "consumer_name": consumer.get("name"),
                 "meter_no": consumer.get("meter_no"),
                 "zone_name": consumer.get("zone_name", self._selected_zone),
-                "previous_reading": int(result["previous"]),
+                "previous_reading": _to_float(result["previous"]),
                 "present_reading": present,
-                "consumption": int(result["consumption"]),
+                "consumption": _to_float(result["consumption"]),
                 "exception": result.get("exception") or "None",
                 "reader_name": self._reader_name,
                 "receipt_text": result["receipt_text"],
@@ -1458,7 +1475,7 @@ class AppBridge(QObject):
             self._last_receipt = result["receipt_text"]
             self.canReprintChanged.emit()
             self._consumer["previous_reading"] = present
-            self._previous_reading = str(present)
+            self._previous_reading = _format_reading(present)
             self._present_reading = ""
             self._consumption = "-"
             self._validation_color = "#10B981"

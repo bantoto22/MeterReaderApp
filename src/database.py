@@ -3,8 +3,11 @@ database.py – SQLite helper for the Water Meter Reader application.
 Uses Python's built-in sqlite3 module (no extra install needed).
 """
 
-import sqlite3
 import os
+import sqlite3
+from decimal import Decimal
+
+sqlite3.register_adapter(Decimal, float)
 
 DB_NAME = "meter.db"
 
@@ -20,6 +23,12 @@ def get_connection():
     conn.row_factory = sqlite3.Row          # allows dict-like access on rows
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _sqlite_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
 
 
 def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
@@ -355,7 +364,7 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     return [dict(r) for r in rows]
 
 
-def save_reading(consumer_id: int, present_reading: int, consumption: int,
+def save_reading(consumer_id: int, present_reading: float, consumption: float,
                  exception: str = "None", is_flagged: bool = False):
     """Insert a new reading record and update the consumer's previous reading."""
     conn = get_connection()
@@ -376,9 +385,9 @@ def save_reading(consumer_id: int, present_reading: int, consumption: int,
 def save_receipt_print(
     consumer_id: int,
     receipt_text: str,
-    previous_reading: int,
-    present_reading: int,
-    consumption: int,
+    previous_reading: float,
+    present_reading: float,
+    consumption: float,
     exception: str = "None",
     reader_name: str = "Field Reader",
     reading_id: int | None = None,
@@ -613,11 +622,13 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     cur = conn.cursor()
 
     def _optional_int(value):
+        value = _sqlite_safe(value)
         if value is None or value == "":
             return None
         return int(float(value))
 
     def _optional_float(value):
+        value = _sqlite_safe(value)
         if value is None or value == "":
             return None
         return float(value)
@@ -631,6 +642,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
 
     upserted = 0
     for c in consumers:
+        c = {key: _sqlite_safe(value) for key, value in c.items()}
         meter_no = (c.get("meter_no") or "").strip()
         if not meter_no:
             continue

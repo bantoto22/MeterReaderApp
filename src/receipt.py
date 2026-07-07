@@ -13,6 +13,17 @@ import tkinter as tk
 FONT_FAMILY = "Montserrat"
 RAW_PRINTER_DEVICE = "/dev/usb/lp0"
 
+
+def _format_reading(value: float | int | str) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{numeric:.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
 def _require_float(consumer: dict, field_name: str) -> float:
     value = consumer.get(field_name)
     if value is None or value == "":
@@ -90,7 +101,7 @@ def _calculate_penalty(
     return applied_penalty, total_after_due_date, penalty_source, bill_status
 
 
-def _compute_bill(consumption: int, consumer: dict) -> tuple[float, int, float, float]:
+def _compute_bill(consumption: float, consumer: dict) -> tuple[float, int, float, float]:
     minimum_cubic = _require_int(consumer, "minimum_cubic")
     minimum_rate = _require_float(consumer, "minimum_rate")
     excess_rate = _require_float(consumer, "excess_rate_per_cubic")
@@ -104,8 +115,8 @@ def _compute_bill(consumption: int, consumer: dict) -> tuple[float, int, float, 
 
 def build_receipt_text(
     consumer: dict,
-    previous: int,
-    present: int,
+    previous: float,
+    present: float,
     exception: str,
     reader_name: str = "Field Reader",
 ) -> str:
@@ -139,9 +150,9 @@ def build_receipt_text(
         f" Class      : {consumer.get('classification_name', 'N/A')}",
         divider,
         f" Meter No   : {consumer.get('meter_no', 'N/A')}",
-        f" Prev Read  : {previous}",
-        f" Curr Read  : {present}",
-        f" Consumption: {consumption} m3",
+        f" Prev Read  : {_format_reading(previous)}",
+        f" Curr Read  : {_format_reading(present)}",
+        f" Consumption: {_format_reading(consumption)} m3",
         f" Bill Status: {bill_status}",
     ]
 
