@@ -341,6 +341,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     @classmethod
     def _normalize_cached_consumer(cls, item: dict) -> tuple:
         row = cls._sqlite_safe_row(item)
+        meter_no = str(row.get("meter_no") or "").strip()
+        if not meter_no or meter_no.startswith("ACCT-") or meter_no.startswith("CID-"):
+            return ()
         classification_id = row.get("classification_id")
         if classification_id not in (None, ""):
             try:
@@ -349,7 +352,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 classification_id = None
         return (
             _safe_int(row.get("id"), None),
-            row.get("meter_no"),
+            meter_no,
             row.get("acct_no"),
             row.get("name", ""),
             row.get("zone_name"),
@@ -495,7 +498,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         """
         with self._connect() as conn:
             for item in consumers:
-                conn.execute(sql, self._normalize_cached_consumer(item))
+                params = self._normalize_cached_consumer(item)
+                if not params:
+                    continue
+                conn.execute(sql, params)
             conn.commit()
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
@@ -778,6 +784,7 @@ class SupabaseRestClient:
             # Normalize across possible consumer schemas.
             cid = row.get("consumer_id") or row.get("id")
             meter_no = row.get("meter_number") or row.get("meter_no") or row.get("meterid")
+            meter_no = str(meter_no or "").strip() or None
             acct_no = row.get("account_number") or row.get("acct_no") or row.get("account_no")
             first = (row.get("first_name") or "").strip()
             middle = (row.get("middle_name") or "").strip()
@@ -903,7 +910,7 @@ class SupabaseRestClient:
         return {
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
-            "meter_no": consumer_row.get("meter_number") or meter_row.get("meter_serial_number"),
+            "meter_no": (str(consumer_row.get("meter_number") or meter_row.get("meter_serial_number") or "").strip() or None),
             "zone_name": zone_obj.get("zone_name") if isinstance(zone_obj, dict) else None,
             "classification_id": classification_id,
             "classification_name": classification_obj.get("classification_name") if isinstance(classification_obj, dict) else None,
@@ -1103,7 +1110,7 @@ class MainPostgresClient:
         sql = f"""
         SELECT
             c.consumer_id AS id,
-            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
+            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
             c.account_number AS acct_no,
             CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
             z.zone_name AS zone_name,
@@ -1178,7 +1185,7 @@ class MainPostgresClient:
                     fb_sql = f"""
                     SELECT
                         c.consumer_id AS id,
-                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
+                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
                         c.account_number AS acct_no,
                         CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
                         z.zone_name AS zone_name,
@@ -1242,7 +1249,7 @@ class MainPostgresClient:
         SELECT
             c.consumer_id,
             c.account_number AS acct_no,
-            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, ''), c.account_number, ('CID-' || c.consumer_id::text)) AS meter_no,
+            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
             z.zone_name,
             c.classification_id,
             cls.classification_name,

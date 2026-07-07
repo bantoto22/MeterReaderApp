@@ -621,16 +621,14 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     conn = get_connection()
     cur = conn.cursor()
 
-    def _fallback_meter_no(consumer: dict) -> str:
+    def _is_fallback_meter_no(value: str | None) -> bool:
+        text = str(value or "").strip()
+        return text.startswith("ACCT-") or text.startswith("CID-")
+
+    def _real_meter_no(consumer: dict) -> str:
         meter_no = str(consumer.get("meter_no") or "").strip()
-        if meter_no:
+        if meter_no and not _is_fallback_meter_no(meter_no):
             return meter_no
-        acct_no = str(consumer.get("acct_no") or "").strip()
-        if acct_no:
-            return f"ACCT-{acct_no}"
-        cid = consumer.get("id")
-        if cid not in (None, ""):
-            return f"CID-{cid}"
         return ""
 
     def _optional_int(value):
@@ -645,7 +643,13 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
             return None
         return float(value)
 
-    zone_names = sorted({(c.get("zone_name") or "Unassigned").strip() for c in consumers if c.get("meter_no")})
+    zone_names = sorted(
+        {
+            (c.get("zone_name") or "Unassigned").strip()
+            for c in consumers
+            if _real_meter_no(c)
+        }
+    )
     for zone_name in zone_names:
         cur.execute("INSERT OR IGNORE INTO zones (name) VALUES (?)", (zone_name,))
 
@@ -655,7 +659,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     upserted = 0
     for c in consumers:
         c = {key: _sqlite_safe(value) for key, value in c.items()}
-        meter_no = _fallback_meter_no(c)
+        meter_no = _real_meter_no(c)
         if not meter_no:
             continue
         zone_name = (c.get("zone_name") or "Unassigned").strip()
