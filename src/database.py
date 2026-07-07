@@ -232,8 +232,9 @@ def get_all_users() -> list[dict]:
 # ─── Query helpers ────────────────────────────────────────────────────────────
 
 def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
-    """Look up a consumer by meter number. Returns dict or None."""
+    """Look up a consumer by meter/account/name. Returns dict or None."""
     conn = get_connection()
+    normalized = "".join(ch for ch in str(meter_no or "") if ch.isalnum())
     if unread_only:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
@@ -243,10 +244,25 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
-                 WHERE c.meter_no = ?
+                 WHERE (
+                     c.meter_no = ?
+                     OR c.acct_no = ?
+                     OR c.name = ?
+                     OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ?
+                     OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
+                 )
                    AND NOT EXISTS (
                        SELECT 1 FROM readings r WHERE r.consumer_id = c.id
-                   )"""
+                   )
+                 ORDER BY CASE
+                     WHEN c.meter_no = ? THEN 0
+                     WHEN c.acct_no = ? THEN 1
+                     WHEN c.name = ? THEN 2
+                     WHEN REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ? THEN 3
+                     WHEN REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ? THEN 4
+                     ELSE 5
+                 END
+                 LIMIT 1"""
     else:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
@@ -256,8 +272,27 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
                         z.name AS zone_name
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
-                 WHERE c.meter_no = ?"""
-    row = conn.execute(sql, (meter_no,)).fetchone()
+                 WHERE (
+                     c.meter_no = ?
+                     OR c.acct_no = ?
+                     OR c.name = ?
+                     OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ?
+                     OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
+                 )
+                 ORDER BY CASE
+                     WHEN c.meter_no = ? THEN 0
+                     WHEN c.acct_no = ? THEN 1
+                     WHEN c.name = ? THEN 2
+                     WHEN REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ? THEN 3
+                     WHEN REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ? THEN 4
+                     ELSE 5
+                 END
+                 LIMIT 1"""
+    params = (
+        meter_no, meter_no, meter_no, normalized, normalized,
+        meter_no, meter_no, meter_no, normalized, normalized,
+    )
+    row = conn.execute(sql, params).fetchone()
     conn.close()
     if row:
         return dict(row)
@@ -269,6 +304,8 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     """Search consumers by partial meter_no or name, filtered to a specific zone."""
     conn = get_connection()
     like_pattern = f"%{query}%"
+    normalized = "".join(ch for ch in str(query or "") if ch.isalnum())
+    normalized_like = f"%{normalized}%"
     if unread_only:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
@@ -279,7 +316,13 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
-                   AND (c.meter_no LIKE ? OR c.name LIKE ?)
+                   AND (
+                       c.meter_no LIKE ?
+                       OR c.acct_no LIKE ?
+                       OR c.name LIKE ?
+                       OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') LIKE ?
+                       OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
+                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM readings r WHERE r.consumer_id = c.id
                    )
@@ -295,10 +338,19 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
                  FROM consumers c
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
-                   AND (c.meter_no LIKE ? OR c.name LIKE ?)
+                   AND (
+                       c.meter_no LIKE ?
+                       OR c.acct_no LIKE ?
+                       OR c.name LIKE ?
+                       OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') LIKE ?
+                       OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
+                   )
                  ORDER BY c.meter_no
                  LIMIT ?"""
-    rows = conn.execute(sql, (zone_name, like_pattern, like_pattern, limit)).fetchall()
+    rows = conn.execute(
+        sql,
+        (zone_name, like_pattern, like_pattern, like_pattern, normalized_like, normalized_like, limit),
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

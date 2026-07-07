@@ -16,7 +16,7 @@ Item {
     readonly property bool numericMode: keyboardMode === "numeric"
     property bool shifted: false
     property var alphaRows: [
-        ["q","w","e","r","t","y","u","i","o","p"],
+        ["q","w","e","r","t","y","u","i","o","p","-"],
         ["a","s","d","f","g","h","j","k","l"],
         ["z","x","c","v","b","n","m"]
     ]
@@ -24,7 +24,7 @@ Item {
         ["1", "2", "3"],
         ["4", "5", "6"],
         ["7", "8", "9"],
-        [".", "0", "<-"]
+        ["-", ".", "0", "<-"]
     ]
 
     height: visibleHeight
@@ -75,6 +75,9 @@ Item {
         if (!current || !text || text.length === 0)
             return false
         if (numericMode) {
+            if (text === "-") {
+                return current.cursorPosition === 0 && current.text.indexOf("-") === -1
+            }
             if (text === ".") {
                 return current.text.indexOf(".") === -1
             }
@@ -126,8 +129,13 @@ Item {
         var current = currentInput()
         if (!current)
             return
-        if (typeof current.accepted === "function")
-            current.accepted()
+        if (current.hasOwnProperty("accepted")) {
+            try {
+                current.accepted()
+                return
+            } catch (error) {
+            }
+        }
         moveFocus(true)
     }
 
