@@ -80,10 +80,10 @@ def _calculate_penalty(
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
     bill_status = str(consumer.get("bill_status") or "Unpaid").strip()
+    computed_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
     is_overdue = bill_status.lower() != "paid" and reference_date > due_date
 
     if is_overdue:
-        computed_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
         if computed_penalty > existing_penalty:
             applied_penalty = computed_penalty
             penalty_source = "computed overdue penalty"
@@ -94,8 +94,12 @@ def _calculate_penalty(
             applied_penalty = existing_penalty
             penalty_source = "higher value between both"
     else:
-        applied_penalty = existing_penalty
-        penalty_source = "stored database penalty" if existing_penalty > 0 else "computed overdue penalty"
+        if existing_penalty > 0:
+            applied_penalty = existing_penalty
+            penalty_source = "stored database penalty"
+        else:
+            applied_penalty = computed_penalty
+            penalty_source = "projected after-due penalty"
 
     total_after_due_date = round(amount_due + applied_penalty, 2)
     return applied_penalty, total_after_due_date, penalty_source, bill_status

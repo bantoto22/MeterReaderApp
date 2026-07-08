@@ -1,7 +1,8 @@
 import unittest
 from datetime import datetime, timezone
 
-from src.handheld_sync import HandheldSyncDataAccess
+from src.handheld_sync import HandheldSyncDataAccess, _build_bill_payload
+from src.receipt import build_receipt_text
 
 
 class FakeLocalStore:
@@ -313,6 +314,57 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(len(self.local.list_pending("supabase")), 0)
         self.assertEqual(len(self.local.list_pending("main_pg")), 1)
         self.assertEqual(len(main_pg.remote_rows), 0)
+
+    def test_bill_payload_defaults_after_due_penalty_to_ten_percent(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "7f00dbb6-656d-43b4-b4db-2bb206af9d21",
+                "consumer_id": 42,
+                "present_reading": 10,
+                "previous_reading": 0,
+                "consumption": 10,
+                "reading_date": "2026-07-08",
+            },
+            {
+                "minimum_cubic": 10,
+                "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+                "due_days": 15,
+                "late_fee": None,
+            },
+            99,
+        )
+
+        self.assertEqual(payload["amount_due"], 100.0)
+        self.assertEqual(payload["penalty"], 10.0)
+        self.assertEqual(payload["total_after_due_date"], 110.0)
+
+    def test_receipt_shows_projected_after_due_penalty_without_existing_record(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 10,
+                "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+                "due_days": 15,
+                "amount_due": 100,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=0,
+            present=10,
+            exception="None",
+            reader_name="Reader",
+        )
+
+        self.assertIn("Penalty     : PHP    10.00", text)
+        self.assertIn("After Due   : PHP   110.00", text)
 
 
 if __name__ == "__main__":

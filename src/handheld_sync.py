@@ -182,8 +182,10 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     bill_date = datetime.combine(reference_date, datetime.min.time())
     due_date = datetime.combine(reference_date + timedelta(days=due_days), datetime.min.time())
     amount_due = round(current_charge + carried_balance, 2)
+    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
+    current_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
     total_amount = amount_due
-    total_after_due_date = amount_due
+    total_after_due_date = round(amount_due + current_penalty, 2)
     reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())
 
     existing_setting_id = context.get("setting_id")
@@ -207,7 +209,7 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
         "amount_due": amount_due,
         "previous_balance": round(carried_balance, 2),
         "previous_penalty": round(carried_penalty, 2),
-        "penalty": 0.0,
+        "penalty": current_penalty,
         "total_amount": total_amount,
         "total_after_due_date": total_after_due_date,
         "status": "Unpaid",
