@@ -319,7 +319,7 @@ class AppBridge(QObject):
         self._last_pull_count = 0
         self._auto_pull_enabled = True
         self._auto_push_enabled = True
-        self._pull_interval = 60
+        self._pull_interval = max(15, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "20000")) // 1000)
         self._sync_logs = "No sync activity yet."
         self._supabase_logs = "No Supabase activity yet."
         self._sync_dal = None
@@ -652,7 +652,7 @@ class AppBridge(QObject):
 
     @pullInterval.setter
     def pullInterval(self, val: int) -> None:
-        normalized = max(15, int(val or 60))
+        normalized = max(15, int(val or self._pull_interval or 20))
         if self._pull_interval != normalized:
             self._pull_interval = normalized
             self.pullIntervalChanged.emit()
@@ -927,7 +927,11 @@ class AppBridge(QObject):
             self._sync_dal.saveMeterReading(payload)
         except Exception as exc:
             self._sync_logs = f"Sync save failed: {exc}"
+            self._supabase_status = "Sync Failed"
+            self._supabase_logs = f"Supabase push failed: {exc}"
             self.syncLogsChanged.emit()
+            self.supabaseStatusChanged.emit()
+            self.supabaseLogsChanged.emit()
         self._refresh_sync_snapshot()
 
     def _set_wifi_busy(self, busy: bool, status: str | None = None) -> None:

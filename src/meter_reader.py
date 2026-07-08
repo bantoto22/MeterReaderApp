@@ -896,7 +896,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._sync_pending_count = 0
         self._auto_pull_enabled = tk.BooleanVar(value=True)
         self._auto_push_enabled = tk.BooleanVar(value=True)
-        self._auto_pull_interval_sec = tk.IntVar(value=60)
+        self._auto_pull_interval_sec = tk.IntVar(value=max(15, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "20000")) // 1000))
         self._auto_pull_after_id = None
         self._search_unread_only = tk.BooleanVar(value=True)
 
@@ -975,7 +975,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             except Exception:
                 pass
             self._auto_pull_after_id = None
-        interval = max(15, int(self._auto_pull_interval_sec.get() or 60))
+        interval = max(15, int(self._auto_pull_interval_sec.get() or 20))
         self._auto_pull_after_id = self.after(interval * 1000, self._run_auto_pull_tick)
 
     def _run_auto_pull_tick(self):
@@ -2762,9 +2762,9 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
     def _on_sync_config_changed(self):
         try:
-            interval = int(self._auto_pull_interval_sec.get() or 60)
+            interval = int(self._auto_pull_interval_sec.get() or 20)
         except Exception:
-            interval = 60
+            interval = 20
         interval = max(15, interval)
         self._auto_pull_interval_sec.set(interval)
         self._schedule_auto_pull()
