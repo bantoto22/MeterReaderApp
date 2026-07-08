@@ -283,19 +283,33 @@ class LocalSyncStore:
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         raise NotImplementedError
 
-    def enqueue_operation(self, operation: str, payload: dict) -> dict:
+    def enqueue_operation(
+        self,
+        operation: str,
+        payload: dict,
+        *,
+        supabase_status: str = "pending",
+        main_pg_status: str = "pending",
+    ) -> dict:
         raise NotImplementedError
 
-    def list_pending(self) -> list[dict]:
+    def list_pending(self, target: str | None = None) -> list[dict]:
         raise NotImplementedError
 
-    def mark_synced(self, queue_id: int) -> None:
+    def mark_target_synced(self, queue_id: int, target: str) -> None:
         raise NotImplementedError
 
-    def mark_failed(self, queue_id: int, reason: str) -> None:
+    def mark_target_failed(self, queue_id: int, target: str, reason: str) -> None:
         raise NotImplementedError
 
-    def mark_conflict(self, queue_id: int, reason: str, server_payload: dict | None = None) -> None:
+    def mark_conflict(
+        self,
+        queue_id: int,
+        reason: str,
+        server_payload: dict | None = None,
+        *,
+        target: str | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def log_audit(self, queue_id: int | None, status: str, message: str, payload: dict | None = None) -> None:
@@ -306,7 +320,8 @@ class LocalSyncStore:
 
 
 class SQLiteLocalSyncStore(LocalSyncStore):
-    def __init__(self, _cfg: SyncConfig):
+    def __init__(self, cfg: SyncConfig):
+        self._has_main_pg = bool(cfg.main_pg_host and cfg.main_pg_db and cfg.main_pg_user)
         self._db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "meter.db"))
 
     def _connect(self):
@@ -379,6 +394,39 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
 
+    @staticmethod
+    def _combined_status(supabase_status: str, main_pg_status: str) -> str:
+        states = {str(supabase_status or "").lower(), str(main_pg_status or "").lower()}
+        if states & {"pending", "failed"}:
+            return "failed" if "failed" in states else "pending"
+        if "conflict" in states:
+            return "conflict"
+        return "synced"
+
+    def _refresh_queue_status(self, conn: sqlite3.Connection, queue_id: int) -> None:
+        row = conn.execute(
+            """
+            SELECT supabase_status, main_pg_status, supabase_synced_at, main_pg_synced_at
+            FROM sync_queue_meter_readings
+            WHERE id = ?
+            """,
+            (queue_id,),
+        ).fetchone()
+        if not row:
+            return
+        status = self._combined_status(row["supabase_status"], row["main_pg_status"])
+        synced_at = None
+        if status == "synced":
+            synced_at = row["main_pg_synced_at"] or row["supabase_synced_at"] or datetime.now().isoformat()
+        conn.execute(
+            """
+            UPDATE sync_queue_meter_readings
+            SET status = ?, synced_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, synced_at, queue_id),
+        )
+
     def ensure_schema(self) -> None:
         sql = """
         CREATE TABLE IF NOT EXISTS sync_queue_meter_readings (
@@ -390,13 +438,17 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             reading_date TEXT NOT NULL,
             payload TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
+            supabase_status TEXT NOT NULL DEFAULT 'pending',
+            main_pg_status TEXT NOT NULL DEFAULT 'pending',
             retries INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             conflict_reason TEXT,
             server_payload TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            synced_at TEXT
+            synced_at TEXT,
+            supabase_synced_at TEXT,
+            main_pg_synced_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_sync_queue_status_created_at
@@ -440,6 +492,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         """
         with self._connect() as conn:
             conn.executescript(sql)
+            self._ensure_columns(
+                conn,
+                "sync_queue_meter_readings",
+                {
+                    "supabase_status": "TEXT NOT NULL DEFAULT 'pending'",
+                    "main_pg_status": "TEXT NOT NULL DEFAULT 'pending'",
+                    "supabase_synced_at": "TEXT",
+                    "main_pg_synced_at": "TEXT",
+                },
+            )
             self._ensure_columns(
                 conn,
                 "handheld_consumers_cache",
@@ -522,16 +584,24 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             rows = conn.execute(base, params).fetchall()
         return [dict(row) for row in rows]
 
-    def enqueue_operation(self, operation: str, payload: dict) -> dict:
+    def enqueue_operation(
+        self,
+        operation: str,
+        payload: dict,
+        *,
+        supabase_status: str = "pending",
+        main_pg_status: str = "pending",
+    ) -> dict:
         operation_id = payload.get("operation_id") or str(uuid.uuid4())
         reading_id = payload.get("reading_id") or str(uuid.uuid4())
         payload["operation_id"] = operation_id
         payload["reading_id"] = reading_id
         sql = """
         INSERT INTO sync_queue_meter_readings (
-            operation, operation_id, reading_id, consumer_id, reading_date, payload, status
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            operation, operation_id, reading_id, consumer_id, reading_date, payload, status, supabase_status, main_pg_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
+        overall_status = self._combined_status(supabase_status, main_pg_status)
         with self._connect() as conn:
             cur = conn.execute(
                 sql,
@@ -542,11 +612,14 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     payload["consumer_id"],
                     payload["reading_date"],
                     json.dumps(payload),
+                    overall_status,
+                    supabase_status,
+                    main_pg_status,
                 ),
             )
             row = conn.execute(
                 """
-                SELECT id, operation_id, reading_id, status, created_at
+                SELECT id, operation_id, reading_id, status, supabase_status, main_pg_status, created_at
                 FROM sync_queue_meter_readings
                 WHERE id = ?
                 """,
@@ -555,51 +628,77 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             conn.commit()
         return dict(row) if row else {}
 
-    def list_pending(self) -> list[dict]:
+    def list_pending(self, target: str | None = None) -> list[dict]:
+        target_column = None
+        if target == "supabase":
+            target_column = "supabase_status"
+        elif target == "main_pg":
+            target_column = "main_pg_status"
+
         sql = """
-        SELECT id, operation, operation_id, reading_id, consumer_id, reading_date, payload, status, retries, last_error, created_at
+        SELECT id, operation, operation_id, reading_id, consumer_id, reading_date, payload, status,
+               supabase_status, main_pg_status, retries, last_error, created_at
         FROM sync_queue_meter_readings
-        WHERE status IN ('pending', 'failed')
-        ORDER BY id ASC
         """
+        if target_column:
+            sql += f" WHERE {target_column} IN ('pending', 'failed')"
+        else:
+            sql += " WHERE supabase_status IN ('pending', 'failed') OR main_pg_status IN ('pending', 'failed')"
+        sql += " ORDER BY id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [self._deserialize_row(row) for row in rows]
 
-    def mark_synced(self, queue_id: int) -> None:
+    def mark_target_synced(self, queue_id: int, target: str) -> None:
+        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
+        synced_at_column = "main_pg_synced_at" if target == "main_pg" else "supabase_synced_at"
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE sync_queue_meter_readings
-                SET status='synced', synced_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP, last_error=NULL
+                SET {status_column}='synced', {synced_at_column}=CURRENT_TIMESTAMP, last_error=NULL
                 WHERE id = ?
                 """,
                 (queue_id,),
             )
+            self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
-    def mark_failed(self, queue_id: int, reason: str) -> None:
+    def mark_target_failed(self, queue_id: int, target: str, reason: str) -> None:
+        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
+        scoped_reason = f"{target}: {reason}"[:1000]
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE sync_queue_meter_readings
-                SET status='failed', retries=retries+1, last_error=?, updated_at=CURRENT_TIMESTAMP
+                SET {status_column}='failed', retries=retries+1, last_error=?
                 WHERE id=?
                 """,
-                (reason[:1000], queue_id),
+                (scoped_reason, queue_id),
             )
+            self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
-    def mark_conflict(self, queue_id: int, reason: str, server_payload: dict | None = None) -> None:
+    def mark_conflict(
+        self,
+        queue_id: int,
+        reason: str,
+        server_payload: dict | None = None,
+        *,
+        target: str | None = None,
+    ) -> None:
+        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
+        scoped_reason = f"{target or 'supabase'}: {reason}"[:1000]
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE sync_queue_meter_readings
-                SET status='conflict', conflict_reason=?, server_payload=?, updated_at=CURRENT_TIMESTAMP
+                SET {status_column}='conflict', conflict_reason=?, server_payload=?
                 WHERE id=?
                 """,
-                (reason[:1000], json.dumps(server_payload or {}), queue_id),
+                (scoped_reason, json.dumps(server_payload or {}, default=str), queue_id),
             )
+            self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
     def log_audit(self, queue_id: int | None, status: str, message: str, payload: dict | None = None) -> None:
@@ -609,7 +708,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 INSERT INTO sync_audit_log(queue_id, status, message, payload)
                 VALUES (?, ?, ?, ?)
                 """,
-                (queue_id, status, message[:2000], json.dumps(payload or {})),
+                (queue_id, status, message[:2000], json.dumps(payload or {}, default=str)),
             )
             conn.commit()
 
@@ -747,43 +846,77 @@ class SupabaseRestClient:
                 bills[key] = row
         return bills
 
+    def _consumer_select_variants(self, include_reading_fields: bool = True) -> list[str]:
+        reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
+        base_suffix = (
+            f",first_name,middle_name,last_name,zone_id,classification_id{reading_fields},status,"
+            "zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
+        )
+        return [
+            f"consumer_id,account_number,meter_no{base_suffix}",
+            f"consumer_id,account_number,meter_number{base_suffix}",
+            f"consumer_id,account_number{base_suffix}",
+        ]
+
+    def _fetch_consumer_rows(self, zone_name: str | None = None, consumer_id: int | None = None) -> list[dict]:
+        last_error: object = {"error": "No consumer query variant attempted."}
+        for include_reading_fields in (True, False):
+            for select in self._consumer_select_variants(include_reading_fields=include_reading_fields):
+                query = {"select": select}
+                if zone_name:
+                    query["zone.zone_name"] = f"eq.{zone_name}"
+                if consumer_id is not None:
+                    query["consumer_id"] = f"eq.{consumer_id}"
+                    query["limit"] = "1"
+                status, data = self._req("GET", "consumer", query=query, use_service_key=True)
+                if status < 400 and isinstance(data, list):
+                    return data
+                last_error = data
+        raise RuntimeError(f"Supabase read failed: {last_error}")
+
+    def _load_meters_by_consumer(self) -> dict[int, dict]:
+        status, data = self._req(
+            "GET",
+            "meter",
+            query={"select": "meter_id,meter_serial_number,consumer_id"},
+            use_service_key=True,
+        )
+        if status >= 400 or not isinstance(data, list):
+            return {}
+        meters: dict[int, dict] = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            consumer_id = row.get("consumer_id")
+            try:
+                key = int(consumer_id)
+            except (TypeError, ValueError):
+                continue
+            if key not in meters:
+                meters[key] = row
+        return meters
+
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        # Use service key so handheld can fetch assignments even when anon/RLS policy is restrictive.
-        # Primary target schema provided by user:
-        # - consumer.consumer_id
-        # - consumer.account_number
-        # - consumer.meter_number
-        # - consumer.first_name/middle_name/last_name
-        # - consumer.zone_id -> zone.zone_name
-        query = {
-            "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,classification_id,previous_reading,last_reading,status,zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
-        }
-        if zone_name:
-            query["zone.zone_name"] = f"eq.{zone_name}"
-        status, data = self._req("GET", "consumer", query=query, use_service_key=True)
-        if status >= 400:
-            # Fallback for deployments where previous_reading/last_reading columns do not exist.
-            fb_query = {
-                "select": "consumer_id,account_number,meter_number,first_name,middle_name,last_name,zone_id,classification_id,status,zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
-            }
-            if zone_name:
-                fb_query["zone.zone_name"] = f"eq.{zone_name}"
-            status, data = self._req("GET", "consumer", query=fb_query, use_service_key=True)
-        if status >= 400:
-            raise RuntimeError(f"Supabase read failed: {data}")
+        data = self._fetch_consumer_rows(zone_name=zone_name)
         if not isinstance(data, list):
             return []
         admin_settings = self._load_latest_admin_settings()
         billing_settings = self._load_latest_billing_settings()
         rates_by_classification = self._load_waterrates_by_classification()
         bills_by_consumer = self._load_latest_bills_by_consumer()
+        meters_by_consumer = self._load_meters_by_consumer()
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
                 continue
             # Normalize across possible consumer schemas.
             cid = row.get("consumer_id") or row.get("id")
-            meter_no = row.get("meter_number") or row.get("meter_no") or row.get("meterid")
+            meter_row = {}
+            try:
+                meter_row = meters_by_consumer.get(int(cid), {}) if cid is not None else {}
+            except (TypeError, ValueError):
+                meter_row = {}
+            meter_no = row.get("meter_no") or row.get("meter_number") or row.get("meterid") or meter_row.get("meter_serial_number")
             meter_no = str(meter_no or "").strip() or None
             acct_no = row.get("account_number") or row.get("acct_no") or row.get("account_no")
             first = (row.get("first_name") or "").strip()
@@ -879,13 +1012,8 @@ class SupabaseRestClient:
         return None
 
     def get_consumer_context(self, consumer_id: int) -> dict:
-        query = {
-            "select": "consumer_id,account_number,meter_number,classification_id,previous_reading,last_reading,status,zone:zone_id(zone_name),classification:classification_id(classification_name)",
-            "consumer_id": f"eq.{consumer_id}",
-            "limit": "1",
-        }
-        status, data = self._req("GET", "consumer", query=query, use_service_key=True)
-        if status >= 400 or not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        data = self._fetch_consumer_rows(consumer_id=consumer_id)
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             return {}
         consumer_row = data[0]
         classification_id = consumer_row.get("classification_id")
@@ -910,7 +1038,7 @@ class SupabaseRestClient:
         return {
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
-            "meter_no": (str(consumer_row.get("meter_number") or meter_row.get("meter_serial_number") or "").strip() or None),
+            "meter_no": (str(consumer_row.get("meter_no") or consumer_row.get("meter_number") or meter_row.get("meter_serial_number") or "").strip() or None),
             "zone_name": zone_obj.get("zone_name") if isinstance(zone_obj, dict) else None,
             "classification_id": classification_id,
             "classification_name": classification_obj.get("classification_name") if isinstance(classification_obj, dict) else None,
@@ -1519,22 +1647,32 @@ class HandheldSyncDataAccess:
         return cls(SQLiteLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
 
     def is_online(self) -> bool:
-        if self.remote and self.remote.is_online():
-            return True
+        return bool(self.remote and self.remote.is_online())
+
+    def _main_pg_online(self) -> bool:
         return bool(self.main_pg and self.main_pg.is_online())
 
-    def _available_targets(self) -> list[tuple[str, object]]:
-        targets: list[tuple[str, object]] = []
-        if self.remote and self.remote.is_online():
-            targets.append(("Supabase", self.remote))
-        if self.main_pg and self.main_pg.is_online():
-            targets.append(("MAIN_PG", self.main_pg))
+    def _available_targets(self, *, include_supabase: bool = True, include_main_pg: bool = False) -> list[tuple[str, str, object]]:
+        targets: list[tuple[str, str, object]] = []
+        if include_supabase and self.remote and self.remote.is_online():
+            targets.append(("Supabase", "supabase", self.remote))
+        if include_main_pg and self.main_pg and self.main_pg.is_online():
+            targets.append(("MAIN_PG", "main_pg", self.main_pg))
         return targets
 
-    def _sync_reading_to_targets(self, reading: dict) -> tuple[dict[str, dict], list[str]]:
+    def _sync_reading_to_targets(
+        self,
+        reading: dict,
+        *,
+        include_supabase: bool = True,
+        include_main_pg: bool = False,
+    ) -> tuple[dict[str, dict], list[str]]:
         results: dict[str, dict] = {}
         errors: list[str] = []
-        for label, target in self._available_targets():
+        for label, _target_key, target in self._available_targets(
+            include_supabase=include_supabase,
+            include_main_pg=include_main_pg,
+        ):
             try:
                 bundle_writer = getattr(target, "save_reading_bundle", None)
                 if callable(bundle_writer):
@@ -1585,16 +1723,19 @@ class HandheldSyncDataAccess:
                 merged[field_name] = value
         return merged
 
-    def _find_existing_reading_with_fallback(self, payload: dict) -> tuple[dict | None, list[str]]:
+    def _find_existing_reading_with_fallback(
+        self,
+        payload: dict,
+        *,
+        include_supabase: bool = True,
+        include_main_pg: bool = False,
+    ) -> tuple[dict | None, list[str]]:
         errors: list[str] = []
-        online_targets: list[tuple[str, object]] = []
-
-        if self.main_pg and self.main_pg.is_online():
-            online_targets.append(("MAIN_PG", self.main_pg))
-        if self.remote and self.remote.is_online():
-            online_targets.append(("Supabase", self.remote))
-
-        for label, target in online_targets:
+        online_targets = self._available_targets(
+            include_supabase=include_supabase,
+            include_main_pg=include_main_pg,
+        )
+        for label, _target_key, target in online_targets:
             try:
                 existing = target.find_existing_reading(payload["consumer_id"], payload["reading_date"])
                 if existing:
@@ -1637,35 +1778,47 @@ class HandheldSyncDataAccess:
             reading["reading_date"] = datetime.now(timezone.utc).date().isoformat()
         return reading
 
+    def _queue_for_sync(self, operation: str, reading: dict) -> dict:
+        return self.local.enqueue_operation(
+            operation,
+            reading,
+            supabase_status="pending",
+            main_pg_status="pending" if self.main_pg else "skipped",
+        )
+
     def saveMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
         reading = self._overlay_main_pg_rates_for_reading(reading)
-        results, errors = self._sync_reading_to_targets(reading)
+        queued = self._queue_for_sync("create", reading)
+        results, errors = self._sync_reading_to_targets(reading, include_supabase=True, include_main_pg=False)
         if results:
+            self.local.mark_target_synced(queued["id"], "supabase")
             if errors:
-                self.local.log_audit(None, "success", f"Reading synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+                self.local.log_audit(queued["id"], "success", f"Reading synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
             else:
-                self.local.log_audit(None, "success", "Reading and bill synced", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            return {"status": "synced", "remote": results, "reading": reading, "errors": errors}
+                self.local.log_audit(queued["id"], "success", "Reading synced to Supabase; MAIN_PG waits for manual sync", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            return {"status": "synced", "remote": results, "reading": reading, "errors": errors, "queue": queued}
         if errors:
-            self.local.log_audit(None, "failed", f"Online save failed, queued offline: {'; '.join(errors)}", reading)
-        queued = self.local.enqueue_operation("create", reading)
+            self.local.mark_target_failed(queued["id"], "supabase", "; ".join(errors))
+            self.local.log_audit(queued["id"], "failed", f"Supabase save failed, queued for retry: {'; '.join(errors)}", reading)
         self.local.log_audit(queued["id"], "pending", "Queued offline create operation", reading)
         return {"status": "queued", "queue": queued, "reading": reading}
 
     def updateMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
         reading = self._overlay_main_pg_rates_for_reading(reading)
-        results, errors = self._sync_reading_to_targets(reading)
+        queued = self._queue_for_sync("update", reading)
+        results, errors = self._sync_reading_to_targets(reading, include_supabase=True, include_main_pg=False)
         if results:
+            self.local.mark_target_synced(queued["id"], "supabase")
             if errors:
-                self.local.log_audit(None, "success", f"Reading update synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+                self.local.log_audit(queued["id"], "success", f"Reading update synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
             else:
-                self.local.log_audit(None, "success", "Reading update and bill synced", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            return {"status": "synced", "remote": results, "reading": reading, "errors": errors}
+                self.local.log_audit(queued["id"], "success", "Reading update synced to Supabase; MAIN_PG waits for manual sync", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
+            return {"status": "synced", "remote": results, "reading": reading, "errors": errors, "queue": queued}
         if errors:
-            self.local.log_audit(None, "failed", f"Online update failed, queued offline: {'; '.join(errors)}", reading)
-        queued = self.local.enqueue_operation("update", reading)
+            self.local.mark_target_failed(queued["id"], "supabase", "; ".join(errors))
+            self.local.log_audit(queued["id"], "failed", f"Supabase update failed, queued for retry: {'; '.join(errors)}", reading)
         self.local.log_audit(queued["id"], "pending", "Queued offline update operation", reading)
         return {"status": "queued", "queue": queued, "reading": reading}
 
@@ -1688,25 +1841,53 @@ class HandheldSyncDataAccess:
     def get_sync_snapshot(self) -> dict:
         pending = self.listPendingSyncReadings()
         remote_online = self.is_online()
-        pg_online = self.main_pg.is_online() if self.main_pg else False
-        if remote_online and pg_online:
+        pg_online = self._main_pg_online()
+        if remote_online:
             status = "Online"
-        elif remote_online or pg_online:
+        elif pg_online:
             status = "Partial"
         else:
             status = "Offline"
         has_failed = any(row.get("status") == "failed" for row in pending)
-        has_pending = len(pending) > 0
-        if has_failed:
-            save_target = "Local SQLite Queue (sync retry pending)"
+        supabase_pending = [
+            row for row in pending
+            if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}
+        ]
+        main_pg_pending = [
+            row for row in pending
+            if str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}
+        ]
+        main_pg_conflicts = [
+            row for row in self.local.get_recent_audit(limit=100)
+            if str(row.get("status", "")).lower() == "conflict"
+            and "main_pg" in str(row.get("message", "")).lower()
+        ]
+        if supabase_pending:
+            save_target = "Local SQLite Queue (Supabase retry pending)"
         elif status == "Online":
-            save_target = "Supabase + MAIN_PG"
+            save_target = "Supabase auto-sync on change"
         elif status == "Partial":
-            save_target = "One remote target available"
+            save_target = "MAIN_PG available, Supabase offline"
         else:
             save_target = "Local SQLite Queue (offline)"
-        backup_state = "Backed up to main system" if ((remote_online or pg_online) and not has_pending) else "Not fully backed up"
+        if not self.main_pg:
+            backup_state = "Manual MAIN_PG sync not configured"
+        elif main_pg_conflicts:
+            backup_state = "MAIN_PG conflicts need review"
+        elif main_pg_pending:
+            backup_state = "MAIN_PG manual sync needed"
+        elif pg_online:
+            backup_state = "Backed up to MAIN_PG"
+        else:
+            backup_state = "MAIN_PG unavailable"
         last_sync = self.get_last_successful_sync_time()
+        supabase_last_sync = None
+        for row in self.local.get_recent_audit(limit=100):
+            msg = str(row.get("message", "")).lower()
+            status_text = str(row.get("status", "")).lower()
+            if status_text == "success" and "supabase" in msg:
+                supabase_last_sync = str(row.get("created_at")) if row.get("created_at") else None
+                break
         return {
             "status": status,
             "pending_count": len(pending),
@@ -1714,14 +1895,19 @@ class HandheldSyncDataAccess:
             "save_target": save_target,
             "backup_state": backup_state,
             "last_sync_time": last_sync,
+            "supabase_online": remote_online,
+            "supabase_pending_count": len(supabase_pending),
+            "supabase_last_sync_time": supabase_last_sync,
+            "main_pg_online": pg_online,
+            "main_pg_pending_count": len(main_pg_pending),
         }
 
-    def syncPendingReadings(self) -> dict:
-        if not self.is_online() and not (self.main_pg and self.main_pg.is_online()):
+    def syncPendingReadings(self, include_main_pg: bool = False) -> dict:
+        if not self.is_online() and not (include_main_pg and self._main_pg_online()):
             self.local.log_audit(None, "failed", "Sync skipped, offline")
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
 
-        pending = self.local.list_pending()
+        pending = self.local.list_pending(None if include_main_pg else "supabase")
         synced = 0
         failed = 0
         conflicts = 0
@@ -1730,31 +1916,55 @@ class HandheldSyncDataAccess:
             queue_id = row["id"]
             payload = self._overlay_main_pg_rates_for_reading(dict(row["payload"]))
             try:
-                existing, lookup_errors = self._find_existing_reading_with_fallback(payload)
-                if existing and existing.get("updated_at") and payload.get("updated_at"):
-                    if str(existing["updated_at"]) > str(payload["updated_at"]):
-                        reason = "Server has newer reading for same consumer/date."
-                        self.local.mark_conflict(queue_id, reason, existing)
-                        self.local.log_audit(queue_id, "conflict", reason, {"local": payload, "server": existing})
-                        conflicts += 1
-                        continue
+                row_synced = False
+                requested_targets = []
+                if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}:
+                    requested_targets.append(("Supabase", "supabase", True, False))
+                if include_main_pg and str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}:
+                    requested_targets.append(("MAIN_PG", "main_pg", False, True))
 
-                results, errors = self._sync_reading_to_targets(payload)
-                errors = [*lookup_errors, *errors]
-                if not results:
-                    raise RuntimeError("; ".join(errors) if errors else "No sync target accepted the queue row.")
-                self.local.mark_synced(queue_id)
-                message = "Queue row synced"
-                if errors:
-                    message += f" with partial target failures: {'; '.join(errors)}"
-                self.local.log_audit(queue_id, "success", message, {"payload": payload, "targets": list(results.keys())})
-                synced += 1
+                for label, target_key, wants_supabase, wants_main_pg in requested_targets:
+                    existing, lookup_errors = self._find_existing_reading_with_fallback(
+                        payload,
+                        include_supabase=wants_supabase,
+                        include_main_pg=wants_main_pg,
+                    )
+                    if existing and existing.get("updated_at") and payload.get("updated_at"):
+                        if str(existing["updated_at"]) > str(payload["updated_at"]):
+                            reason = "Server has newer reading for same consumer/date."
+                            self.local.mark_conflict(queue_id, reason, existing, target=target_key)
+                            self.local.log_audit(queue_id, "conflict", f"{label}: {reason}", {"local": payload, "server": existing})
+                            conflicts += 1
+                            continue
+
+                    results, errors = self._sync_reading_to_targets(
+                        payload,
+                        include_supabase=wants_supabase,
+                        include_main_pg=wants_main_pg,
+                    )
+                    errors = [*lookup_errors, *errors]
+                    if not results:
+                        raise RuntimeError("; ".join(errors) if errors else f"{label} did not accept the queue row.")
+                    self.local.mark_target_synced(queue_id, target_key)
+                    message = f"{label} synced"
+                    if errors:
+                        message += f" with partial target failures: {'; '.join(errors)}"
+                    self.local.log_audit(queue_id, "success", message, {"payload": payload, "targets": list(results.keys())})
+                    row_synced = True
+                if row_synced:
+                    synced += 1
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc))
                 self.local.log_audit(queue_id, "conflict", f"Queue row invalid for remote sync: {exc}", payload)
                 conflicts += 1
             except Exception as exc:
-                self.local.mark_failed(queue_id, str(exc))
+                failed_targets = []
+                if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}:
+                    failed_targets.append("supabase")
+                if include_main_pg and str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}:
+                    failed_targets.append("main_pg")
+                for target_key in failed_targets:
+                    self.local.mark_target_failed(queue_id, target_key, str(exc))
                 self.local.log_audit(queue_id, "failed", f"Queue row sync failed: {exc}", payload)
                 failed += 1
 
@@ -1769,7 +1979,7 @@ class HandheldSyncDataAccess:
         def _run():
             while not self._worker_stop.is_set():
                 try:
-                    self.syncPendingReadings()
+                    self.syncPendingReadings(include_main_pg=False)
                 except Exception as exc:
                     self.local.log_audit(None, "failed", f"Background sync worker error: {exc}")
                 time.sleep(max(3, interval_seconds))

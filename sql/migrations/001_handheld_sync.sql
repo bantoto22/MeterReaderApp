@@ -10,13 +10,17 @@ CREATE TABLE IF NOT EXISTS sync_queue_meter_readings (
     reading_date DATE NOT NULL,
     payload JSONB NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    supabase_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    main_pg_status VARCHAR(20) NOT NULL DEFAULT 'pending',
     retries INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     conflict_reason TEXT,
     server_payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    synced_at TIMESTAMPTZ
+    synced_at TIMESTAMPTZ,
+    supabase_synced_at TIMESTAMPTZ,
+    main_pg_synced_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_queue_status_created_at

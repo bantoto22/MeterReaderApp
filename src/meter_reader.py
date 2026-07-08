@@ -2258,7 +2258,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         btn_row.pack(fill="x")
         self._settings_sync_now_btn = RoundedButton(
             btn_row,
-            text="Sync Now",
+            text="Manual Sync",
             command=self._on_manual_sync_now,
             radius=7,
             bg_color=PRIMARY_BLUE,
@@ -2268,7 +2268,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             width=138,
             height=46,
         )
-        self._settings_sync_now_btn.text = "Sync Now"
+        self._settings_sync_now_btn.text = "Manual Sync"
         self._settings_sync_now_btn.pack(side="left")
 
         self._sync_log_btn = RoundedButton(
@@ -2447,7 +2447,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         
         # Interactive Sync Button
         sync_bg = self._draw_rr(c, w - 142, 24, w - 26, 68, 7, fill=WHITE, outline="#BFDBFE", width=1, tags="sync_btn")
-        c.create_text(w - 84, 46, text="Sync Now", font=(FONT_FAMILY, 10, "bold"), fill=PRIMARY_BLUE, anchor="center", tags="sync_btn")
+        c.create_text(w - 84, 46, text="Manual Sync", font=(FONT_FAMILY, 10, "bold"), fill=PRIMARY_BLUE, anchor="center", tags="sync_btn")
         
         c.tag_bind("sync_btn", "<Enter>", lambda e: c.itemconfig(sync_bg, fill="#DBEAFE"))
         c.tag_bind("sync_btn", "<Leave>", lambda e: c.itemconfig(sync_bg, fill=WHITE))
@@ -2728,7 +2728,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _do_sync(self):
         if self._sync_dal:
             try:
-                result = self._sync_dal.syncPendingReadings()
+                result = self._sync_dal.syncPendingReadings(include_main_pg=True)
                 self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
                 self._sync_sync_result = result
             except Exception as exc:
@@ -2801,7 +2801,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _sync_then_power_off_task(self):
         try:
             if self._sync_dal:
-                result = self._sync_dal.syncPendingReadings()
+                result = self._sync_dal.syncPendingReadings(include_main_pg=False)
                 self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
                 self._sync_sync_result = result
 

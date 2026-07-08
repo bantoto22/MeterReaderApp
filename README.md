@@ -78,9 +78,10 @@ python3 main.py
 ## Handheld Sync Flow + Environment Setup
 
 The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
-- Online mode: Supabase read/write.
+- Online mode: Supabase read/write on every reading change.
 - Offline mode: local SQLite cache + `sync_queue_meter_readings`.
-- Reconnect: FIFO queue flush with conflict detection and audit logs.
+- Manual backup: PostgreSQL sync runs only when the operator triggers `Manual Sync`.
+- Reconnect: Supabase queue flush with conflict detection and audit logs.
 
 ### Environment
 

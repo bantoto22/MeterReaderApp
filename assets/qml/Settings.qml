@@ -127,6 +127,35 @@ Rectangle {
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
 
+    Dialog {
+        id: supabaseLogsDialog
+        title: "Supabase Activity"
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 560)
+        height: Math.min(parent.height - 60, 520)
+        modal: true
+        padding: settingsRoot.compactScreen ? 14 : 18
+        standardButtons: Dialog.Close
+        contentItem: ScrollView {
+            clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            TextArea {
+                width: supabaseLogsDialog.availableWidth
+                text: bridgeObj ? bridgeObj.supabaseLogs : "No Supabase activity yet."
+                readOnly: true
+                wrapMode: TextEdit.Wrap
+                color: "#111827"
+                font.family: "Montserrat"
+                font.pixelSize: TouchMetrics.bodyText
+                background: Rectangle { color: "#F8FAFD"; radius: 6 }
+            }
+        }
+        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+    }
+
     ScrollablePage {
         anchors.fill: parent
         maxContentWidth: 460
@@ -178,6 +207,9 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: settingsRoot.compactScreen ? 6 : 9
                             Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
+                            Text { text: "Supabase: " + (bridgeObj ? bridgeObj.supabaseStatus : "Offline"); color: bridgeObj && bridgeObj.supabaseStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Supabase pending: " + (bridgeObj ? bridgeObj.supabasePendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Supabase last sync: " + (bridgeObj ? bridgeObj.supabaseLastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
@@ -246,7 +278,7 @@ Rectangle {
                         columnSpacing: settingsRoot.compactScreen ? 10 : 12
                         rowSpacing: settingsRoot.compactScreen ? 10 : 12
                         ActionButton {
-                            text: "Sync Now"
+                            text: "Manual Sync"
                             Layout.fillWidth: true
                             onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                         }
@@ -256,6 +288,13 @@ Rectangle {
                             hoverColor: "#1F2937"
                             Layout.fillWidth: true
                             onClicked: logsDialog.open()
+                        }
+                        ActionButton {
+                            text: "Supabase Logs"
+                            buttonColor: "#0F766E"
+                            hoverColor: "#115E59"
+                            Layout.fillWidth: true
+                            onClicked: supabaseLogsDialog.open()
                         }
                     }
                 }

@@ -22,7 +22,19 @@ class FakeLocalStore:
             return list(self.cached)
         return [c for c in self.cached if c.get("zone_name") == zone_name]
 
-    def enqueue_operation(self, operation, payload):
+    @staticmethod
+    def _combined_status(supabase_status, main_pg_status):
+        states = {str(supabase_status or "").lower(), str(main_pg_status or "").lower()}
+        if states & {"pending", "failed"}:
+            return "failed" if "failed" in states else "pending"
+        if "conflict" in states:
+            return "conflict"
+        return "synced"
+
+    def _refresh_status(self, row):
+        row["status"] = self._combined_status(row.get("supabase_status"), row.get("main_pg_status"))
+
+    def enqueue_operation(self, operation, payload, *, supabase_status="pending", main_pg_status="pending"):
         row = {
             "id": self._id,
             "operation": operation,
@@ -31,34 +43,46 @@ class FakeLocalStore:
             "consumer_id": payload["consumer_id"],
             "reading_date": payload["reading_date"],
             "payload": dict(payload),
-            "status": "pending",
+            "status": self._combined_status(supabase_status, main_pg_status),
+            "supabase_status": supabase_status,
+            "main_pg_status": main_pg_status,
             "retries": 0,
         }
         self._id += 1
         self.queue.append(row)
         return row
 
-    def list_pending(self):
-        return [q for q in self.queue if q["status"] in ("pending", "failed")]
+    def list_pending(self, target=None):
+        if target == "supabase":
+            return [q for q in self.queue if q["supabase_status"] in ("pending", "failed")]
+        if target == "main_pg":
+            return [q for q in self.queue if q["main_pg_status"] in ("pending", "failed")]
+        return [
+            q for q in self.queue
+            if q["supabase_status"] in ("pending", "failed") or q["main_pg_status"] in ("pending", "failed")
+        ]
 
-    def mark_synced(self, queue_id):
+    def mark_target_synced(self, queue_id, target):
         for q in self.queue:
             if q["id"] == queue_id:
-                q["status"] = "synced"
+                q[f"{target}_status"] = "synced"
+                self._refresh_status(q)
 
-    def mark_failed(self, queue_id, reason):
+    def mark_target_failed(self, queue_id, target, reason):
         for q in self.queue:
             if q["id"] == queue_id:
-                q["status"] = "failed"
+                q[f"{target}_status"] = "failed"
                 q["last_error"] = reason
                 q["retries"] += 1
+                self._refresh_status(q)
 
-    def mark_conflict(self, queue_id, reason, server_payload=None):
+    def mark_conflict(self, queue_id, reason, server_payload=None, *, target=None):
         for q in self.queue:
             if q["id"] == queue_id:
-                q["status"] = "conflict"
+                q[f"{target or 'supabase'}_status"] = "conflict"
                 q["conflict_reason"] = reason
                 q["server_payload"] = server_payload
+                self._refresh_status(q)
 
     def log_audit(self, queue_id, status, message, payload=None):
         self.audit.append({"queue_id": queue_id, "status": status, "message": message, "payload": payload})
@@ -157,27 +181,24 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["conflicts"], 1)
         self.assertEqual(self.local.queue[0]["status"], "conflict")
 
-    def test_queue_sync_falls_back_to_main_pg_when_supabase_lookup_fails(self):
+    def test_manual_sync_sends_pending_rows_to_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             pass
 
         main_pg = FakeMainPgStore()
-        main_pg.online = False
-        self.remote.online = False
-        self.remote.fail_reads = True
-        self.remote.fail_writes = True
+        main_pg.online = True
+        self.remote.online = True
         self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
 
         self.dal.saveMeterReading({"consumer_id": 5, "present_reading": 99, "reading_date": "2026-05-08"})
-        main_pg.online = True
-        self.remote.online = True
 
-        result = self.dal.syncPendingReadings()
+        result = self.dal.syncPendingReadings(include_main_pg=True)
 
         self.assertEqual(result["synced"], 1)
         self.assertEqual(result["failed"], 0)
         self.assertEqual(len(self.local.list_pending()), 0)
         self.assertEqual(len(main_pg.remote_rows), 1)
+        self.assertEqual(len(self.remote.remote_rows), 1)
 
     def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
@@ -238,7 +259,25 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(saved["minimum_rate"], 150.0)
         self.assertEqual(saved["excess_rate_per_cubic"], 15.0)
 
-    def test_save_reading_skips_supabase_when_offline(self):
+    def test_save_reading_skips_main_pg_until_manual_sync(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            def save_reading_bundle(self, payload):
+                return {"meterreading": self.upsert_meter_reading(payload)}
+
+        main_pg = FakeMainPgStore()
+        main_pg.online = True
+        self.remote.online = True
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        result = self.dal.saveMeterReading({"consumer_id": 9, "present_reading": 12, "reading_date": "2026-05-08"})
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(list(result["remote"].keys()), ["Supabase"])
+        self.assertEqual(len(main_pg.remote_rows), 0)
+        self.assertEqual(len(self.remote.remote_rows), 1)
+        self.assertEqual(len(self.local.list_pending("main_pg")), 1)
+
+    def test_offline_supabase_does_not_auto_sync_to_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             def save_reading_bundle(self, payload):
                 return {"meterreading": self.upsert_meter_reading(payload)}
@@ -249,12 +288,31 @@ class HandheldSyncTests(unittest.TestCase):
         self.remote.fail_writes = True
         self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
 
-        result = self.dal.saveMeterReading({"consumer_id": 9, "present_reading": 12, "reading_date": "2026-05-08"})
+        result = self.dal.saveMeterReading({"consumer_id": 10, "present_reading": 15, "reading_date": "2026-05-08"})
 
-        self.assertEqual(result["status"], "synced")
-        self.assertEqual(list(result["remote"].keys()), ["MAIN_PG"])
-        self.assertEqual(len(main_pg.remote_rows), 1)
-        self.assertEqual(len(self.remote.remote_rows), 0)
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(len(main_pg.remote_rows), 0)
+        self.assertEqual(len(self.local.list_pending("supabase")), 1)
+
+    def test_background_sync_leaves_main_pg_pending_until_manual(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            def save_reading_bundle(self, payload):
+                return {"meterreading": self.upsert_meter_reading(payload)}
+
+        main_pg = FakeMainPgStore()
+        main_pg.online = True
+        self.remote.online = False
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        self.dal.saveMeterReading({"consumer_id": 11, "present_reading": 77, "reading_date": "2026-05-08"})
+        self.remote.online = True
+
+        result = self.dal.syncPendingReadings()
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(len(self.local.list_pending("supabase")), 0)
+        self.assertEqual(len(self.local.list_pending("main_pg")), 1)
+        self.assertEqual(len(main_pg.remote_rows), 0)
 
 
 if __name__ == "__main__":
