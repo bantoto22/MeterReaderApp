@@ -160,6 +160,7 @@ class LoginBridge(QObject):
     loginSuccess = Signal(dict)
     loginFailed = Signal()
     errorMessageChanged = Signal()
+    clearInputsRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1774,8 +1775,8 @@ class HybridMainWindow(QMainWindow):
 
     def _on_logout_requested(self) -> None:
         self.main_page.bridge.clear_user()
+        self.login_page.bridge.clearInputsRequested.emit()
         self.stack.setCurrentWidget(self.login_page)
-
 
 def run_qt_hybrid() -> int:
     init_db()

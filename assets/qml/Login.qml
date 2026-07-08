@@ -278,5 +278,9 @@ Rectangle {
         function onLoginFailed() {
             shakeAnim.start()
         }
+        function onClearInputsRequested() {
+            txtUsername.text = ""
+            txtPassword.text = ""
+        }
     }
 }

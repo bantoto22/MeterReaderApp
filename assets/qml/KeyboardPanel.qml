@@ -14,25 +14,41 @@ Item {
     readonly property var hostWindow: root.Window.window
     readonly property Item focusedInput: hostWindow && hostWindow.activeFocusItem ? hostWindow.activeFocusItem : null
     readonly property bool active: isEditableTextInput(focusedInput)
-    readonly property string keyboardMode: active && focusedInput.keyboardMode ? focusedInput.keyboardMode : "alpha"
-    readonly property bool numericMode: keyboardMode === "numeric"
+    readonly property string activeMode: active && focusedInput.keyboardMode ? focusedInput.keyboardMode : "alpha"
+    property string viewMode: activeMode === "numeric" ? "numeric" : "alpha"
     property bool shifted: false
+
+    onActiveModeChanged: {
+        viewMode = activeMode === "numeric" ? "numeric" : "alpha"
+    }
+
     property var alphaRows: [
-        ["q","w","e","r","t","y","u","i","o","p","-"],
+        ["1","2","3","4","5","6","7","8","9","0"],
+        ["q","w","e","r","t","y","u","i","o","p"],
         ["a","s","d","f","g","h","j","k","l"],
-        ["z","x","c","v","b","n","m"]
+        ["⇧","z","x","c","v","b","n","m","⌫"],
+        ["?123",",","Space",".","→"]
     ]
+    
+    property var symbolRows: [
+        ["1","2","3","4","5","6","7","8","9","0"],
+        ["@","#","$","_","&","-","+","(",")","/"],
+        ["=\\<","*","\"","'",":",";","!","?","⌫"],
+        ["ABC",",","Space",".","→"]
+    ]
+    
     property var numericRows: [
         ["1", "2", "3"],
         ["4", "5", "6"],
         ["7", "8", "9"],
-        ["-", ".", "0", "<-"]
+        ["-", ".", "0", "⌫"],
+        ["ABC", "Space", "→"]
     ]
 
     height: visibleHeight
     visible: active
 
-    readonly property int visibleHeight: active ? (toolbar.height + keyboardBody.height) : 0
+    readonly property int visibleHeight: active ? keyboardBody.height : 0
 
     function isEditableTextInput(item) {
         return item
@@ -76,7 +92,7 @@ Item {
         var current = currentInput()
         if (!current || !text || text.length === 0)
             return false
-        if (numericMode) {
+        if (activeMode === "numeric") {
             if (text === "-") {
                 return current.cursorPosition === 0 && current.text.indexOf("-") === -1
             }
@@ -97,11 +113,11 @@ Item {
         var start = current.selectionStart
         var end = current.selectionEnd
         if (start !== undefined && end !== undefined && start !== end) {
-            current.remove(Math.min(start, end), Math.abs(end - start))
+            current.remove(Math.min(start, end), Math.max(start, end))
             current.cursorPosition = Math.min(start, end)
         }
         current.insert(current.cursorPosition, toInsert)
-        if (shifted && !numericMode)
+        if (shifted && viewMode === "alpha")
             shifted = false
     }
 
@@ -112,12 +128,12 @@ Item {
         var start = current.selectionStart
         var end = current.selectionEnd
         if (start !== undefined && end !== undefined && start !== end) {
-            current.remove(Math.min(start, end), Math.abs(end - start))
+            current.remove(Math.min(start, end), Math.max(start, end))
             current.cursorPosition = Math.min(start, end)
             return
         }
         if (current.cursorPosition > 0) {
-            current.remove(current.cursorPosition - 1, 1)
+            current.remove(current.cursorPosition - 1, current.cursorPosition)
         }
     }
 
@@ -147,7 +163,6 @@ Item {
         property color textColor: "#0F172A"
         property bool specialKey: false
         focusPolicy: Qt.NoFocus
-        Layout.fillWidth: true
         implicitHeight: TouchMetrics.keyboardButtonHeight
         contentItem: Text {
             text: control.text
@@ -167,65 +182,11 @@ Item {
     }
 
     Rectangle {
-        id: toolbar
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        height: TouchMetrics.keyboardAccessoryHeight
-        color: "#111827"
-        border.color: "#334155"
-
-        RowLayout {
-            anchors.fill: parent
-            anchors.margins: TouchMetrics.keyboardMargin
-            spacing: TouchMetrics.keyboardSpacing
-
-            KeyboardButton {
-                Layout.preferredWidth: 96
-                text: "Previous"
-                baseColor: "#334155"
-                textColor: "white"
-                specialKey: true
-                onClicked: root.moveFocus(false)
-            }
-
-            KeyboardButton {
-                Layout.preferredWidth: 84
-                text: "Next"
-                baseColor: "#334155"
-                textColor: "white"
-                specialKey: true
-                onClicked: root.moveFocus(true)
-            }
-
-            KeyboardButton {
-                Layout.preferredWidth: 84
-                text: "Clear"
-                baseColor: "#475569"
-                textColor: "white"
-                specialKey: true
-                onClicked: root.clearText()
-            }
-
-            Item { Layout.fillWidth: true }
-
-            KeyboardButton {
-                Layout.preferredWidth: 132
-                text: "Hide Keyboard"
-                baseColor: "#1D4ED8"
-                textColor: "white"
-                specialKey: true
-                onClicked: root.hideKeyboard()
-            }
-        }
-    }
-
-    Rectangle {
         id: keyboardBody
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.top: toolbar.bottom
-        height: root.width <= 420 ? TouchMetrics.compactKeyboardHeight : TouchMetrics.keyboardHeight
+        anchors.top: parent.top
+        height: (root.width <= 420 ? TouchMetrics.compactKeyboardHeight : TouchMetrics.keyboardHeight) + 40
         color: "#DDE7F2"
         border.color: "#CBD5E1"
 
@@ -235,7 +196,11 @@ Item {
             spacing: TouchMetrics.keyboardSpacing
 
             Repeater {
-                model: root.numericMode ? root.numericRows : root.alphaRows
+                model: {
+                    if (root.viewMode === "numeric") return root.numericRows;
+                    if (root.viewMode === "symbols") return root.symbolRows;
+                    return root.alphaRows;
+                }
 
                 delegate: RowLayout {
                     Layout.fillWidth: true
@@ -243,102 +208,107 @@ Item {
                     spacing: TouchMetrics.keyboardSpacing
 
                     property var keys: modelData
+                    property int rowIndex: index
 
+                    // Spacer for middle alpha row to center it properly
                     Item {
-                        visible: !root.numericMode && index === 1
+                        visible: (root.viewMode === "alpha" && rowIndex === 2)
                         Layout.fillWidth: visible
-                    }
-
-                    KeyboardButton {
-                        visible: !root.numericMode && index === 2
-                        Layout.preferredWidth: 78
-                        text: root.shifted ? "SHIFT" : "Shift"
-                        baseColor: root.shifted ? "#2563EB" : "#E2E8F0"
-                        textColor: root.shifted ? "white" : "#0F172A"
-                        specialKey: true
-                        onClicked: root.shifted = !root.shifted
                     }
 
                     Repeater {
                         model: keys
 
                         delegate: KeyboardButton {
-                            Layout.preferredWidth: root.numericMode ? 100 : 40
-                            text: {
-                                if (root.numericMode && modelData === "<-")
-                                    return "Back"
-                                return root.shifted && !root.numericMode ? modelData.toUpperCase() : modelData
+                            // Let regular keys stretch but spacebar and special keys have specific behaviors
+                            Layout.fillWidth: (modelData === "Space" || (modelData !== "Space" && !specialKey))
+                            Layout.preferredWidth: {
+                                if (modelData === "Space") return -1;
+                                if (["⇧", "⌫", "?123", "ABC", "=\\<", "→"].includes(modelData)) return 60;
+                                return 40;
                             }
-                            specialKey: root.numericMode && modelData === "<-"
-                            baseColor: (root.numericMode && modelData === "<-") ? "#E2E8F0" : "#FFFFFF"
+                            
+                            text: {
+                                if (modelData === "Space") return "Space";
+                                if (root.viewMode === "alpha" && root.shifted && modelData.length === 1 && modelData.match(/[a-z]/i)) {
+                                    return modelData.toUpperCase();
+                                }
+                                return modelData;
+                            }
+                            
+                            specialKey: ["⇧", "⌫", "?123", "ABC", "=\\<", "→", "Space"].includes(modelData)
+                            baseColor: {
+                                if (modelData === "⇧" && root.shifted) return "#2563EB";
+                                if (modelData === "→") return "#2563EB";
+                                if (specialKey && modelData !== "Space") return "#E2E8F0";
+                                return "#FFFFFF";
+                            }
+                            textColor: {
+                                if (modelData === "⇧" && root.shifted) return "white";
+                                if (modelData === "→") return "white";
+                                return "#0F172A";
+                            }
+                            
                             onClicked: {
-                                if (root.numericMode && modelData === "<-") {
-                                    root.backspace()
+                                if (modelData === "⇧") {
+                                    root.shifted = !root.shifted;
+                                } else if (modelData === "⌫") {
+                                    root.backspace();
+                                } else if (modelData === "?123") {
+                                    root.viewMode = "symbols";
+                                } else if (modelData === "ABC") {
+                                    root.viewMode = "alpha";
+                                } else if (modelData === "=\\<") {
+                                    // Placeholder for additional symbols
+                                } else if (modelData === "→") {
+                                    root.submitOrNext();
+                                } else if (modelData === "Space") {
+                                    root.insertText(" ");
                                 } else {
-                                    root.insertText(modelData)
+                                    root.insertText(root.shifted && root.viewMode === "alpha" ? modelData.toUpperCase() : modelData);
                                 }
                             }
                         }
                     }
 
-                    KeyboardButton {
-                        visible: !root.numericMode && index === 2
-                        Layout.preferredWidth: 94
-                        text: "Backspace"
-                        baseColor: "#E2E8F0"
-                        specialKey: true
-                        onClicked: root.backspace()
-                    }
-
+                    // Spacer for middle alpha row
                     Item {
-                        visible: !root.numericMode && index === 1
+                        visible: (root.viewMode === "alpha" && rowIndex === 2)
                         Layout.fillWidth: visible
                     }
                 }
             }
 
-            RowLayout {
+            // Bottom accessory bar for hide keyboard button and home indicator
+            Item {
                 Layout.fillWidth: true
-                spacing: TouchMetrics.keyboardSpacing
-
-                KeyboardButton {
-                    Layout.preferredWidth: 88
-                    text: root.numericMode ? "ABC" : "123"
-                    baseColor: "#E2E8F0"
-                    specialKey: true
-                    onClicked: {
-                        var current = root.currentInput()
-                        if (current && current.hasOwnProperty("keyboardMode")) {
-                            current.keyboardMode = root.numericMode ? "alpha" : "numeric"
-                            current.forceActiveFocus()
-                        }
+                Layout.preferredHeight: 32
+                
+                Button {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 48
+                    height: 32
+                    text: "﹀"
+                    focusPolicy: Qt.NoFocus
+                    background: Item {} // Transparent background
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#0F172A"
+                        font.pixelSize: 24
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
                     }
+                    onClicked: root.hideKeyboard()
                 }
-
-                KeyboardButton {
-                    visible: !root.numericMode
-                    Layout.fillWidth: true
-                    text: "Space"
-                    baseColor: "#FFFFFF"
-                    specialKey: true
-                    onClicked: root.insertText(" ")
-                }
-
-                KeyboardButton {
-                    visible: root.numericMode
-                    Layout.fillWidth: true
-                    text: "0"
-                    baseColor: "#FFFFFF"
-                    onClicked: root.insertText("0")
-                }
-
-                KeyboardButton {
-                    Layout.preferredWidth: 92
-                    text: "Enter"
-                    baseColor: "#2563EB"
-                    textColor: "white"
-                    specialKey: true
-                    onClicked: root.submitOrNext()
+                
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 120
+                    height: 4
+                    radius: 2
+                    color: "#94A3B8"
                 }
             }
         }
