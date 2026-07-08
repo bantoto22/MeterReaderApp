@@ -923,16 +923,20 @@ class AppBridge(QObject):
             "reading_date": datetime.now().date().isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        try:
-            self._sync_dal.saveMeterReading(payload)
-        except Exception as exc:
-            self._sync_logs = f"Sync save failed: {exc}"
-            self._supabase_status = "Sync Failed"
-            self._supabase_logs = f"Supabase push failed: {exc}"
-            self.syncLogsChanged.emit()
-            self.supabaseStatusChanged.emit()
-            self.supabaseLogsChanged.emit()
-        self._refresh_sync_snapshot()
+
+        def _task() -> None:
+            try:
+                self._sync_dal.saveMeterReading(payload)
+            except Exception as exc:
+                self._sync_logs = f"Sync save failed: {exc}"
+                self._supabase_status = "Sync Failed"
+                self._supabase_logs = f"Supabase push failed: {exc}"
+                self.syncLogsChanged.emit()
+                self.supabaseStatusChanged.emit()
+                self.supabaseLogsChanged.emit()
+            self._refresh_sync_snapshot()
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def _set_wifi_busy(self, busy: bool, status: str | None = None) -> None:
         self._wifi_busy = busy
@@ -1665,10 +1669,10 @@ class AppBridge(QObject):
                         self.powerOffFailed.emit(f"Shutdown cancelled because sync did not complete cleanly.\n\n{detail}")
                         return
 
-                    pending_after_sync = len(self._sync_dal.listPendingSyncReadings())
+                    pending_after_sync = len(self._sync_dal.listPendingSupabaseReadings())
                     if pending_after_sync > 0:
                         self.powerOffFailed.emit(
-                            f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending after sync."
+                            f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending Supabase sync."
                         )
                         return
 

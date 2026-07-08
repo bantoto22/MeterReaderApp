@@ -476,46 +476,6 @@ Rectangle {
         }
     }
 
-    Rectangle {
-        id: busyOverlay
-        anchors.fill: parent
-        color: "#80000000"
-        visible: bridgeObj && bridgeObj.operationBusy
-        z: 100
-
-        Rectangle {
-            anchors.centerIn: parent
-            width: 220
-            height: 150
-            radius: 18
-            color: "#111827"
-            border.color: "#334155"
-            border.width: 1
-
-            ColumnLayout {
-                anchors.centerIn: parent
-                spacing: 10
-
-                BusyIndicator {
-                    running: bridgeObj && bridgeObj.operationBusy
-                    width: 36
-                    height: 36
-                }
-
-                Text {
-                    text: bridgeObj ? bridgeObj.operationBusyMessage : "Working..."
-                    color: "white"
-                    font.family: "Montserrat"
-                    font.pixelSize: TouchMetrics.bodyText
-                    font.bold: true
-                    horizontalAlignment: Text.AlignHCenter
-                    Layout.preferredWidth: 180
-                    wrapMode: Text.WordWrap
-                }
-            }
-        }
-    }
-
     ColumnLayout {
         anchors.fill: parent
         anchors.topMargin: statusBar.height
@@ -704,5 +664,47 @@ Rectangle {
 
     KeyboardPanel {
         id: appKeyboard
+    }
+
+    Rectangle {
+        id: busyOverlay
+        anchors.fill: parent
+        color: "#80000000"
+        visible: bridgeObj && bridgeObj.operationBusy
+        z: 100
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 220
+            height: 150
+            radius: 18
+            color: "#111827"
+            border.color: "#334155"
+            border.width: 1
+
+            ColumnLayout {
+                anchors.centerIn: parent
+                width: parent.width - 32
+                spacing: 10
+
+                BusyIndicator {
+                    running: bridgeObj && bridgeObj.operationBusy
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                }
+
+                Text {
+                    text: bridgeObj ? bridgeObj.operationBusyMessage : "Working..."
+                    color: "white"
+                    font.family: "Montserrat"
+                    font.pixelSize: TouchMetrics.bodyText
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
     }
 }

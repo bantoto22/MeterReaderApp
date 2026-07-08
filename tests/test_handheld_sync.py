@@ -315,6 +315,22 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(len(self.local.list_pending("main_pg")), 1)
         self.assertEqual(len(main_pg.remote_rows), 0)
 
+    def test_supabase_pending_helper_ignores_manual_main_pg_pending(self):
+        class FakeMainPgStore(FakeRemoteStore):
+            pass
+
+        main_pg = FakeMainPgStore()
+        main_pg.online = False
+        self.remote.online = True
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        self.dal.saveMeterReading({"consumer_id": 12, "present_reading": 88, "reading_date": "2026-05-08"})
+
+        self.assertEqual(len(self.dal.listPendingSupabaseReadings()), 0)
+        self.assertEqual(len(self.dal.listPendingSyncReadings()), 1)
+        self.assertEqual(self.local.queue[0]["supabase_status"], "synced")
+        self.assertEqual(self.local.queue[0]["main_pg_status"], "pending")
+
     def test_bill_payload_defaults_after_due_penalty_to_ten_percent(self):
         payload = _build_bill_payload(
             {

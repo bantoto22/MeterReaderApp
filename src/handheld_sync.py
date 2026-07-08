@@ -1827,6 +1827,9 @@ class HandheldSyncDataAccess:
     def listPendingSyncReadings(self) -> list[dict]:
         return self.local.list_pending()
 
+    def listPendingSupabaseReadings(self) -> list[dict]:
+        return self.local.list_pending("supabase")
+
     def get_recent_audit_entries(self, limit: int = 20) -> list[dict]:
         return self.local.get_recent_audit(limit=limit)
 

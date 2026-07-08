@@ -2772,14 +2772,19 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._refresh_sync_status_ui(mode_text)
 
     def _confirm_power_off(self):
-        pending = int(getattr(self, "_sync_pending_count", 0) or 0)
+        pending = 0
+        if self._sync_dal:
+            try:
+                pending = len(self._sync_dal.listPendingSupabaseReadings())
+            except Exception:
+                pending = int(getattr(self, "_sync_pending_count", 0) or 0)
         warning = (
             "Power off the device safely?\n\n"
             "The app will sync pending readings first, then send a proper shutdown command to the Raspberry Pi to help prevent Raspberry Pi OS corruption.\n"
             "Only remove external power after the screen and Pi have fully shut down."
         )
         if pending > 0:
-            warning += f"\n\nWarning: {pending} reading(s) are still pending sync."
+            warning += f"\n\nWarning: {pending} reading(s) are still pending Supabase sync."
 
         if not messagebox.askyesno("Power Off Device", warning):
             return
@@ -2810,13 +2815,13 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                     self.after(0, lambda msg=detail: self._on_power_off_blocked(msg))
                     return
 
-                pending_after_sync = len(self._sync_dal.listPendingSyncReadings())
+                pending_after_sync = len(self._sync_dal.listPendingSupabaseReadings())
                 self._sync_pending_count = pending_after_sync
                 if pending_after_sync > 0:
                     self.after(
                         0,
                         lambda count=pending_after_sync: self._on_power_off_blocked(
-                            f"{count} reading(s) are still pending after sync. Shutdown was cancelled."
+                            f"{count} reading(s) are still pending Supabase sync. Shutdown was cancelled."
                         ),
                     )
                     return
@@ -3517,13 +3522,17 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "reading_date": datetime.now().date().isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        try:
-            self._sync_dal.saveMeterReading(payload)
-        except Exception as exc:
-            self._sync_state = "Sync Failed"
-            print(f"Sync layer save failed: {exc}")
-        finally:
-            self.after(0, self._refresh_sync_status_ui)
+
+        def _task():
+            try:
+                self._sync_dal.saveMeterReading(payload)
+            except Exception as exc:
+                self._sync_state = "Sync Failed"
+                print(f"Sync layer save failed: {exc}")
+            finally:
+                self.after(0, self._refresh_sync_status_ui)
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def _proceed_to_printing(self):
         self._dismiss_overlay()
@@ -3655,12 +3664,13 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             )
 
     def _spawn_overlay(self, title, subtitle, target_task):
+        self.update_idletasks()
         self.overlay = tk.Toplevel(self)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
         self.overlay.grab_set()
         wx, wy = self.winfo_rootx(), self.winfo_rooty()
-        ww, wh = self.winfo_width(), self.winfo_height()
+        ww, wh = max(1, self.winfo_width()), max(1, self.winfo_height())
         self.overlay.geometry(f"{ww}x{wh}+{wx}+{wy}")
         ov = tk.Canvas(self.overlay, width=ww, height=wh, bg=OVERLAY_DIM, highlightthickness=0)
         ov.pack(fill="both", expand=True)
