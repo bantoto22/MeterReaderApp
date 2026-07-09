@@ -13,6 +13,8 @@ Rectangle {
     readonly property int currentActiveTab: bridgeObj ? bridgeObj.currentTab : 0
     readonly property bool compactScreen: width <= 420
     readonly property int keyboardInset: appKeyboard.visibleHeight
+    property string receiptPreviewBody: ""
+    property string printPreviewBody: ""
 
     function showToast(message) {
         toastText.text = message
@@ -28,13 +30,13 @@ Rectangle {
 
     function showReceipt(title, receipt) {
         receiptDialog.title = title
-        receiptText.text = receipt
+        receiptPreviewBody = receipt
         receiptDialog.open()
     }
 
     function showPrintPreview(title, receipt, actionLabel) {
         previewDialog.title = title
-        previewText.text = receipt
+        printPreviewBody = receipt
         proceedPreviewButton.text = actionLabel
         previewDialog.open()
     }
@@ -245,23 +247,51 @@ Rectangle {
     Dialog {
         id: receiptDialog
         anchors.centerIn: parent
-        width: Math.min(parent.width - 32, 440)
-        height: Math.min(parent.height - 64, 620)
+        width: Math.min(parent.width - 24, 452)
+        height: Math.min(parent.height - 48, 660)
         modal: true
         standardButtons: Dialog.Close
         contentItem: ScrollView {
             clip: true
-            TextArea {
-                id: receiptText
-                readOnly: true
-                wrapMode: TextEdit.NoWrap
-                color: "#111827"
-                font.family: "Courier New"
-                font.pixelSize: TouchMetrics.codeText
-                background: Rectangle { color: "#F8FAFD"; radius: 6 }
+            contentWidth: receiptPaper.width
+
+            Rectangle {
+                id: receiptPaper
+                width: Math.max(receiptDialog.availableWidth - 18, receiptText.implicitWidth + 44)
+                height: receiptText.implicitHeight + 44
+                radius: 18
+                color: "#FFFDF8"
+                border.color: "#E6DCCB"
+                border.width: 1
+
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    radius: 14
+                    color: "transparent"
+                    border.color: "#EFE5D4"
+                    border.width: 1
+                }
+
+                Text {
+                    id: receiptText
+                    x: 22
+                    y: 22
+                    text: mainContainerRoot.receiptPreviewBody
+                    color: "#111827"
+                    font.family: "Courier New"
+                    font.pixelSize: TouchMetrics.codeText
+                    lineHeight: 1.08
+                    wrapMode: Text.NoWrap
+                }
             }
         }
-        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+        background: Rectangle {
+            radius: 22
+            color: "#F5EFE5"
+            border.color: "#D8CAB8"
+            border.width: 1
+        }
     }
 
     Dialog {
@@ -272,7 +302,12 @@ Rectangle {
         modal: true
         standardButtons: Dialog.NoButton
 
-        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+        background: Rectangle {
+            radius: 22
+            color: "#F5EFE5"
+            border.color: "#D8CAB8"
+            border.width: 1
+        }
 
         contentItem: ColumnLayout {
             spacing: 12
@@ -281,14 +316,37 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                TextArea {
-                    id: previewText
-                    readOnly: true
-                    wrapMode: TextEdit.NoWrap
-                    color: "#111827"
-                    font.family: "Courier New"
-                    font.pixelSize: TouchMetrics.codeText
-                    background: Rectangle { color: "#F8FAFD"; radius: 6 }
+                contentWidth: previewPaper.width
+
+                Rectangle {
+                    id: previewPaper
+                    width: Math.max(previewDialog.availableWidth - 18, previewText.implicitWidth + 44)
+                    height: previewText.implicitHeight + 44
+                    radius: 18
+                    color: "#FFFDF8"
+                    border.color: "#E6DCCB"
+                    border.width: 1
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        radius: 14
+                        color: "transparent"
+                        border.color: "#EFE5D4"
+                        border.width: 1
+                    }
+
+                    Text {
+                        id: previewText
+                        x: 22
+                        y: 22
+                        text: mainContainerRoot.printPreviewBody
+                        color: "#111827"
+                        font.family: "Courier New"
+                        font.pixelSize: TouchMetrics.codeText
+                        lineHeight: 1.08
+                        wrapMode: Text.NoWrap
+                    }
                 }
             }
 
@@ -329,7 +387,12 @@ Rectangle {
         standardButtons: Dialog.NoButton
         title: bridgeObj ? bridgeObj.printHistoryDetailTitle : "Receipt"
 
-        background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
+        background: Rectangle {
+            radius: 22
+            color: "#F5EFE5"
+            border.color: "#D8CAB8"
+            border.width: 1
+        }
 
         contentItem: ColumnLayout {
             spacing: 12
@@ -338,14 +401,37 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                TextArea {
-                    readOnly: true
-                    text: bridgeObj ? bridgeObj.printHistoryDetailText : ""
-                    wrapMode: TextEdit.NoWrap
-                    color: "#111827"
-                    font.family: "Courier New"
-                    font.pixelSize: TouchMetrics.codeText
-                    background: Rectangle { color: "#F8FAFD"; radius: 6 }
+                contentWidth: historyDetailPaper.width
+
+                Rectangle {
+                    id: historyDetailPaper
+                    width: Math.max(historyDetailDialog.availableWidth - 18, historyDetailText.implicitWidth + 44)
+                    height: historyDetailText.implicitHeight + 44
+                    radius: 18
+                    color: "#FFFDF8"
+                    border.color: "#E6DCCB"
+                    border.width: 1
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        radius: 14
+                        color: "transparent"
+                        border.color: "#EFE5D4"
+                        border.width: 1
+                    }
+
+                    Text {
+                        id: historyDetailText
+                        x: 22
+                        y: 22
+                        text: bridgeObj ? bridgeObj.printHistoryDetailText : ""
+                        color: "#111827"
+                        font.family: "Courier New"
+                        font.pixelSize: TouchMetrics.codeText
+                        lineHeight: 1.08
+                        wrapMode: Text.NoWrap
+                    }
                 }
             }
 

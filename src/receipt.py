@@ -12,6 +12,7 @@ import tkinter as tk
 
 FONT_FAMILY = "Montserrat"
 RAW_PRINTER_DEVICE = "/dev/usb/lp0"
+RECEIPT_WIDTH = 32
 
 
 def _format_reading(value: float | int | str) -> str:
@@ -23,6 +24,27 @@ def _format_reading(value: float | int | str) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text
+
+
+def _center_text(value: str) -> str:
+    return str(value).center(RECEIPT_WIDTH)
+
+
+def _receipt_line(char: str = "-") -> str:
+    return char * RECEIPT_WIDTH
+
+
+def _field_line(label: str, value) -> str:
+    return f" {label:<11}: {value}"
+
+
+def _money_line(label: str, value: float) -> str:
+    return f" {label:<12}: PHP {value:>8.2f}"
+
+
+def _percent_line(label: str, value: float) -> str:
+    return f" {label:<11}: {value:>8.2f}%"
+
 
 def _require_float(consumer: dict, field_name: str) -> float:
     value = consumer.get(field_name)
@@ -140,48 +162,47 @@ def build_receipt_text(
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
 
-    divider = "--------------------------------"
-    border = "================================"
+    divider = _receipt_line("-")
+    border = _receipt_line("=")
 
     lines = [
         border,
-        " SAN LORENZO RUIZ WATERWORKS",
-        "     Water Billing System",
+        _center_text("SAN LORENZO RUIZ WATERWORKS"),
+        _center_text("Water Billing System"),
         border,
-        f" Account No : {consumer.get('acct_no', 'N/A')}",
-        f" Name       : {consumer.get('name', 'N/A')}",
-        f" Zone       : {consumer.get('zone_name', 'N/A')}",
-        f" Class      : {consumer.get('classification_name', 'N/A')}",
+        _field_line("Account No", consumer.get("acct_no", "N/A")),
+        _field_line("Name", consumer.get("name", "N/A")),
+        _field_line("Zone", consumer.get("zone_name", "N/A")),
+        _field_line("Class", consumer.get("classification_name", "N/A")),
         divider,
-        f" Meter No   : {consumer.get('meter_no', 'N/A')}",
-        f" Prev Read  : {_format_reading(previous)}",
-        f" Curr Read  : {_format_reading(present)}",
-        f" Consumption: {_format_reading(consumption)} m3",
-        f" Bill Status: {bill_status}",
+        _field_line("Meter No", consumer.get("meter_no", "N/A")),
+        _field_line("Prev Read", _format_reading(previous)),
+        _field_line("Curr Read", _format_reading(present)),
+        _field_line("Consumption", f"{_format_reading(consumption)} m3"),
+        _field_line("Bill Status", bill_status),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
-        lines.append(f" Exception  : {exception}")
+        lines.append(_field_line("Exception", exception))
 
     lines += [
         divider,
-        f" Min Cubic  : {minimum_cubic}",
-        f" Min Rate   : PHP {minimum_rate:>8.2f}",
-        f" Excess Rate: PHP {excess_rate:>8.2f}",
-        f" Current Bill: PHP {current_bill:>8.2f}",
-        f" Late Fee   : {late_fee_percent:>8.2f}%",
-        f" Penalty     : PHP {penalty:>8.2f}",
-        f" Penalty Src : {penalty_source}",
+        _field_line("Min Cubic", minimum_cubic),
+        _money_line("Min Rate", minimum_rate),
+        _money_line("Excess Rate", excess_rate),
+        _money_line("Current Bill", current_bill),
+        _percent_line("Late Fee", late_fee_percent),
+        _money_line("Penalty", penalty),
         border,
-        f" TOTAL AMOUNT: PHP {amount_due:>8.2f}",
-        f" After Due   : PHP {after_due:>8.2f}",
-        f" Due Date    : {due_date}",
+        _money_line("TOTAL AMOUNT", amount_due),
+        _money_line("After Due", after_due),
+        _field_line("Due Date", due_date),
+        border,
+        _field_line("Date", date_str),
+        _field_line("Time", time_str),
+        _field_line("Reader", reader_name),
         divider,
-        f" Date  : {date_str}",
-        f" Time  : {time_str}",
-        f" Reader: {reader_name}",
-        divider,
-        "         Thank you!",
+        _center_text("Thank you!"),
         border,
         "",
         "",
