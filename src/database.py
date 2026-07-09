@@ -112,6 +112,22 @@ def init_db():
             FOREIGN KEY (consumer_id) REFERENCES consumers(id),
             FOREIGN KEY (reading_id) REFERENCES readings(id)
         );
+
+        CREATE TABLE IF NOT EXISTS active_assignment_consumers (
+            consumer_id INTEGER PRIMARY KEY,
+            FOREIGN KEY (consumer_id) REFERENCES consumers(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS current_meter_reader (
+            slot INTEGER PRIMARY KEY CHECK (slot = 1),
+            account_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            contact_number TEXT,
+            role_id INTEGER,
+            account_status TEXT,
+            last_login_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     _ensure_columns(
@@ -132,6 +148,13 @@ def init_db():
             "total_after_due_date": "REAL",
             "bill_status": "TEXT",
             "late_fee": "REAL",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "users",
+        {
+            "account_id": "TEXT",
         },
     )
 
@@ -214,7 +237,7 @@ def authenticate_user(username: str, password: str) -> dict | None:
     """Validate user credentials. Returns user dict or None if invalid."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT username, password, name, reader_id FROM users WHERE username = ?",
+        "SELECT username, password, name, reader_id, account_id FROM users WHERE username = ?",
         (username,)
     ).fetchone()
     conn.close()
@@ -223,7 +246,9 @@ def authenticate_user(username: str, password: str) -> dict | None:
         return {
             'username': row['username'],
             'name': row['name'],
-            'id': row['reader_id']
+            'id': row['account_id'] or row['reader_id'],
+            'reader_id': row['reader_id'],
+            'account_id': row['account_id'],
         }
     return None
 
@@ -232,7 +257,7 @@ def get_all_users() -> list[dict]:
     """Return all users for login hint display."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT username, name, reader_id FROM users ORDER BY name"
+        "SELECT username, name, reader_id, account_id FROM users ORDER BY name"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -252,6 +277,7 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
                         c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
+                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE (
                      c.meter_no = ?
@@ -280,6 +306,7 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
                         c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
+                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE (
                      c.meter_no = ?
@@ -319,10 +346,11 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
+                       c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                       c.bill_status, c.late_fee,
+                       z.name AS zone_name
                  FROM consumers c
+                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
                    AND (
@@ -341,10 +369,11 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
+                       c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                       c.bill_status, c.late_fee,
+                       z.name AS zone_name
                  FROM consumers c
+                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
                    AND (
@@ -362,6 +391,60 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def save_current_meter_reader(user: dict) -> None:
+    """Persist the currently logged-in central meter reader identity locally."""
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO current_meter_reader (
+            slot, account_id, username, full_name, contact_number, role_id, account_status, last_login_at
+        )
+        VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(slot) DO UPDATE SET
+            account_id = excluded.account_id,
+            username = excluded.username,
+            full_name = excluded.full_name,
+            contact_number = excluded.contact_number,
+            role_id = excluded.role_id,
+            account_status = excluded.account_status,
+            last_login_at = CURRENT_TIMESTAMP
+        """,
+        (
+            user.get("account_id"),
+            user.get("username"),
+            user.get("full_name") or user.get("name"),
+            user.get("contact_number"),
+            user.get("role_id"),
+            user.get("account_status"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_current_meter_reader() -> dict | None:
+    """Return the locally stored current central meter reader identity."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT account_id, username, full_name, contact_number, role_id, account_status, last_login_at
+        FROM current_meter_reader
+        WHERE slot = 1
+        LIMIT 1
+        """
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def clear_current_meter_reader() -> None:
+    """Clear the locally stored current central meter reader identity."""
+    conn = get_connection()
+    conn.execute("DELETE FROM current_meter_reader WHERE slot = 1")
+    conn.commit()
+    conn.close()
 
 
 def save_reading(
@@ -541,25 +624,43 @@ def get_zone_stats() -> dict:
     conn = get_connection()
 
     stats = {}
-    zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
+    zones = conn.execute(
+        """
+        SELECT DISTINCT z.id, z.name
+        FROM zones z
+        JOIN consumers c ON c.zone_id = z.id
+        JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
+        ORDER BY z.name
+        """
+    ).fetchall()
 
     for z in zones:
         total = conn.execute(
-            "SELECT COUNT(*) FROM consumers WHERE zone_id = ?", (z["id"],)
+            """
+            SELECT COUNT(*)
+            FROM consumers c
+            JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
+            WHERE c.zone_id = ?
+            """,
+            (z["id"],),
         ).fetchone()[0]
 
         read = conn.execute(
             """SELECT COUNT(DISTINCT r.consumer_id)
                FROM readings r
                JOIN consumers c ON r.consumer_id = c.id
-               WHERE c.zone_id = ?""", (z["id"],)
+               JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
+               WHERE c.zone_id = ?""",
+            (z["id"],),
         ).fetchone()[0]
 
         flagged = conn.execute(
             """SELECT COUNT(*)
                FROM readings r
                JOIN consumers c ON r.consumer_id = c.id
-               WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
+               JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
+               WHERE c.zone_id = ? AND r.is_flagged = 1""",
+            (z["id"],),
         ).fetchone()[0]
 
         stats[z["name"]] = {"households": total, "read": read, "flagged": flagged}
@@ -571,7 +672,15 @@ def get_zone_stats() -> dict:
 def get_all_zone_names() -> list[str]:
     """Return a sorted list of zone names."""
     conn = get_connection()
-    rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT z.name
+        FROM zones z
+        JOIN consumers c ON c.zone_id = z.id
+        JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
+        ORDER BY z.name
+        """
+    ).fetchall()
     conn.close()
     return [r["name"] for r in rows]
 
@@ -608,6 +717,7 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             r.exception,
             r.is_flagged
            FROM consumers c
+           JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
            JOIN zones z ON c.zone_id = z.id
            LEFT JOIN (
                SELECT * FROM readings 
@@ -629,9 +739,6 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     Mirror consumer records from sync source (Supabase/cache) into local SQLite.
     Returns number of consumer rows upserted.
     """
-    if not consumers:
-        return 0
-
     conn = get_connection()
     cur = conn.cursor()
 
@@ -671,6 +778,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     zone_id_by_name = {row["name"]: row["id"] for row in zone_rows}
 
     upserted = 0
+    active_consumer_ids: list[int] = []
     for c in consumers:
         c = {key: _sqlite_safe(value) for key, value in c.items()}
         meter_no = _real_meter_no(c)
@@ -701,6 +809,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         cid = c.get("id")
 
         if cid is not None:
+            consumer_id = int(cid)
             cur.execute(
                 """
                 INSERT INTO consumers (
@@ -732,12 +841,13 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     zone_id = excluded.zone_id
                 """,
                 (
-                    int(cid), meter_no, acct_no, name, previous_reading, classification_id,
+                    consumer_id, meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, amount_due, due_date, penalty,
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
+            active_consumer_ids.append(consumer_id)
         else:
             cur.execute(
                 """
@@ -775,7 +885,15 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
+            active_consumer_ids.append(int(cur.lastrowid))
         upserted += 1
+
+    cur.execute("DELETE FROM active_assignment_consumers")
+    if active_consumer_ids:
+        cur.executemany(
+            "INSERT INTO active_assignment_consumers (consumer_id) VALUES (?)",
+            [(consumer_id,) for consumer_id in sorted(set(active_consumer_ids))],
+        )
 
     conn.commit()
     conn.close()

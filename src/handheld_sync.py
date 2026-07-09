@@ -14,9 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import json
 import os
 import sqlite3
+import hmac
 import threading
 import time
 import uuid
@@ -107,6 +109,44 @@ def _parse_datetime(value) -> datetime | None:
 def _reading_date(value) -> date:
     parsed = _parse_date(value)
     return parsed or datetime.now().date()
+
+
+def _current_month_window(reference_date: date | None = None) -> tuple[str, str]:
+    today = reference_date or datetime.now().date()
+    start = today.replace(day=1)
+    if start.month == 12:
+        next_month = start.replace(year=start.year + 1, month=1, day=1)
+    else:
+        next_month = start.replace(month=start.month + 1, day=1)
+    end = next_month - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def _verify_password(candidate_password: str, stored_password: str | None) -> bool:
+    candidate = str(candidate_password or "")
+    stored = str(stored_password or "")
+    if not stored:
+        return False
+    if stored == candidate:
+        return True
+    if stored.startswith("scrypt$"):
+        parts = stored.split("$", 2)
+        if len(parts) != 3:
+            return False
+        _, salt_hex, expected_hex = parts
+        try:
+            derived = hashlib.scrypt(
+                candidate.encode("utf-8"),
+                salt=bytes.fromhex(salt_hex),
+                n=16384,
+                r=8,
+                p=1,
+                dklen=len(bytes.fromhex(expected_hex)),
+            )
+            return hmac.compare_digest(derived.hex(), expected_hex.lower())
+        except Exception:
+            return False
+    return False
 
 
 def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_per_cubic) -> float:
@@ -228,6 +268,7 @@ class SyncConfig:
     supabase_url: str
     supabase_anon_key: str
     supabase_service_role_key: str
+    backend_api_base_url: str
     main_pg_host: str
     main_pg_port: int
     main_pg_db: str
@@ -261,10 +302,16 @@ class SyncConfig:
 
         supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "") or supabase_service_role_key
+        backend_api_base_url = (
+            os.getenv("BACKEND_API_BASE_URL", "").strip()
+            or os.getenv("DEVICE_API_BASE_URL", "").strip()
+            or f"http://localhost:{os.getenv('PORT', '3001').strip() or '3001'}"
+        ).rstrip("/")
         return cls(
             supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
             supabase_anon_key=supabase_anon_key,
             supabase_service_role_key=supabase_service_role_key,
+            backend_api_base_url=backend_api_base_url,
             main_pg_host=os.getenv("MAIN_PG_HOST", ""),
             main_pg_port=int(os.getenv("MAIN_PG_PORT", "5432")),
             main_pg_db=os.getenv("MAIN_PG_DB", ""),
@@ -731,6 +778,7 @@ class SupabaseRestClient:
         self._url = cfg.supabase_url
         self._anon_key = cfg.supabase_anon_key
         self._service_key = cfg.supabase_service_role_key
+        self._backend_api_base_url = cfg.backend_api_base_url.rstrip("/")
         self._schema = cfg.supabase_db_schema or "public"
         self._table_columns_cache: dict[str, set[str]] = {}
 
@@ -753,6 +801,24 @@ class SupabaseRestClient:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
         req = request.Request(url, data=body, method=method, headers=headers)
+        try:
+            with request.urlopen(req, timeout=6) as resp:
+                raw = resp.read().decode("utf-8").strip()
+                return resp.getcode(), json.loads(raw) if raw else {}
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8").strip() if exc.fp else ""
+            try:
+                return exc.code, json.loads(raw) if raw else {"error": raw or str(exc)}
+            except Exception:
+                return exc.code, {"error": raw or str(exc)}
+        except Exception as exc:
+            return 0, {"error": str(exc)}
+
+    def _api_req(self, method: str, path: str, *, query: dict | None = None) -> tuple[int, object]:
+        url = f"{self._backend_api_base_url}{path}"
+        if query:
+            url += "?" + parse.urlencode(query)
+        req = request.Request(url, method=method)
         try:
             with request.urlopen(req, timeout=6) as resp:
                 raw = resp.read().decode("utf-8").strip()
@@ -898,8 +964,100 @@ class SupabaseRestClient:
                 meters[key] = row
         return meters
 
-    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        data = self._fetch_consumer_rows(zone_name=zone_name)
+    def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        query = {
+            "select": "account_id,username,password,role_id,account_status,full_name,contact_number,phone_number",
+            "username": f"eq.{username}",
+            "deleted_at": "is.null",
+            "limit": "1",
+        }
+        status, data = self._req("GET", "accounts", query=query, use_service_key=True)
+        if status >= 400:
+            raise RuntimeError(f"Supabase account lookup failed: {data}")
+        if not isinstance(data, list) or not data:
+            raise ValueError("Invalid username or password.")
+        row = data[0] if isinstance(data[0], dict) else {}
+        if not _verify_password(password, row.get("password")):
+            raise ValueError("Invalid username or password.")
+        if int(row.get("role_id") or 0) != 3 or str(row.get("account_status") or "").strip() != "Active":
+            raise PermissionError("This account is not an active Meter Reader.")
+        contact_number = row.get("contact_number") or row.get("phone_number") or ""
+        return {
+            "id": row.get("account_id"),
+            "account_id": row.get("account_id"),
+            "username": row.get("username"),
+            "name": row.get("full_name") or row.get("username"),
+            "full_name": row.get("full_name") or row.get("username"),
+            "contact_number": str(contact_number or "").strip(),
+            "role_id": row.get("role_id"),
+            "account_status": row.get("account_status"),
+            "reader_id": str(row.get("account_id") or ""),
+        }
+
+    def _load_reading_schedules(
+        self,
+        meter_reader_id: str | int,
+        *,
+        date_from: str,
+        date_to: str,
+        status: str = "Scheduled",
+    ) -> list[dict]:
+        schedule_query = {
+            "meter_reader_id": str(meter_reader_id),
+            "date_from": date_from,
+            "date_to": date_to,
+            "status": status,
+        }
+        http_status, data = self._api_req("GET", "/api/reading-schedules", query=schedule_query)
+        if http_status >= 400 or not isinstance(data, list):
+            raise RuntimeError(f"Reading schedule API failed: {data}")
+        return [row for row in data if isinstance(row, dict)]
+
+    def load_assigned_consumers(
+        self,
+        meter_reader_id: str | int | None,
+        zone_name: str | None = None,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        if meter_reader_id in (None, ""):
+            return []
+        date_from = date_from or _current_month_window()[0]
+        date_to = date_to or _current_month_window()[1]
+        schedules = self._load_reading_schedules(
+            meter_reader_id,
+            date_from=date_from,
+            date_to=date_to,
+            status="Scheduled",
+        )
+        allowed_zone_names = sorted(
+            {
+                str(row.get("Zone_Name") or "").strip()
+                for row in schedules
+                if str(row.get("Zone_Name") or "").strip()
+            }
+        )
+        if zone_name:
+            if zone_name not in allowed_zone_names:
+                return []
+            zone_names = [zone_name]
+        else:
+            zone_names = allowed_zone_names
+        if not zone_names:
+            return []
+
+        data: list[dict] = []
+        seen_consumer_ids: set[object] = set()
+        for allowed_zone_name in zone_names:
+            for row in self._fetch_consumer_rows(zone_name=allowed_zone_name):
+                if not isinstance(row, dict):
+                    continue
+                cid = row.get("consumer_id") or row.get("id")
+                if cid in seen_consumer_ids:
+                    continue
+                seen_consumer_ids.add(cid)
+                data.append(row)
         if not isinstance(data, list):
             return []
         admin_settings = self._load_latest_admin_settings()
@@ -1226,14 +1384,66 @@ class MainPostgresClient:
                 continue
         return rates
 
-    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
+    def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        sql = f"""
+        SELECT
+            account_id,
+            username,
+            password,
+            role_id,
+            account_status,
+            full_name,
+            contact_number,
+            phone_number
+        FROM {self._schema}.accounts
+        WHERE username = %s
+          AND deleted_at IS NULL
+        LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (username,))
+                row = cur.fetchone()
+        if not row:
+            raise ValueError("Invalid username or password.")
+        record = dict(row)
+        if not _verify_password(password, record.get("password")):
+            raise ValueError("Invalid username or password.")
+        if int(record.get("role_id") or 0) != 3 or str(record.get("account_status") or "").strip() != "Active":
+            raise PermissionError("This account is not an active Meter Reader.")
+        contact_number = record.get("contact_number") or record.get("phone_number") or ""
+        return {
+            "id": record.get("account_id"),
+            "account_id": record.get("account_id"),
+            "username": record.get("username"),
+            "name": record.get("full_name") or record.get("username"),
+            "full_name": record.get("full_name") or record.get("username"),
+            "contact_number": str(contact_number or "").strip(),
+            "role_id": record.get("role_id"),
+            "account_status": record.get("account_status"),
+            "reader_id": str(record.get("account_id") or ""),
+        }
+
+    def load_assigned_consumers(
+        self,
+        meter_reader_id: str | int | None,
+        zone_name: str | None = None,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        if meter_reader_id in (None, ""):
+            return []
+        date_from = date_from or _current_month_window()[0]
+        date_to = date_to or _current_month_window()[1]
         where = """
         WHERE c.status = 'Active'
-          AND rs.schedule_date = CURRENT_DATE
-          AND rs.status IN ('Scheduled', 'In Progress')
+          AND rs.meter_reader_id = %s
+          AND rs.schedule_date BETWEEN %s AND %s
+          AND rs.status = 'Scheduled'
           AND today_read.reading_id IS NULL
         """
-        params: list[object] = []
+        params: list[object] = [meter_reader_id, date_from, date_to]
         if zone_name:
             where += " AND z.zone_name = %s"
             params.append(zone_name)
@@ -1304,74 +1514,6 @@ class MainPostgresClient:
             with conn.cursor(cursor_factory=self._dict_cursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-                if not rows:
-                    # Fallback: no active schedule today, so return active consumers
-                    # for operational continuity.
-                    fb_where = "WHERE c.status = 'Active'"
-                    fb_params: list[object] = []
-                    if zone_name:
-                        fb_where += " AND z.zone_name = %s"
-                        fb_params.append(zone_name)
-                    fb_sql = f"""
-                    SELECT
-                        c.consumer_id AS id,
-                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
-                        c.account_number AS acct_no,
-                        CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
-                        z.zone_name AS zone_name,
-                        c.classification_id,
-                        cls.classification_name,
-                        wr.minimum_cubic,
-                        wr.minimum_rate,
-                        wr.excess_rate_per_cubic,
-                        bs.due_days,
-                        lb.amount_due,
-                        lb.due_date,
-                        lb.penalty,
-                        lb.previous_penalty,
-                        lb.total_after_due_date,
-                        lb.status AS bill_status,
-                        adm.late_fee,
-                        COALESCE(prev.last_reading, 0)::int AS previous_reading
-                    FROM {self._schema}.consumer c
-                    JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
-                    LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-                    LEFT JOIN LATERAL (
-                        SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
-                        FROM {self._schema}.waterrates wr
-                        WHERE wr.classification_id = c.classification_id
-                        ORDER BY wr.rate_id DESC
-                        LIMIT 1
-                    ) wr ON TRUE
-                    LEFT JOIN (
-                        SELECT due_days
-                        FROM {self._schema}.billing_settings
-                        ORDER BY setting_id DESC
-                        LIMIT 1
-                    ) bs ON TRUE
-                    LEFT JOIN (
-                        SELECT late_fee
-                        FROM {self._schema}.admin_settings
-                        LIMIT 1
-                    ) adm ON TRUE
-                    LEFT JOIN LATERAL (
-                        SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
-                        FROM {self._schema}.bills b
-                        WHERE b.consumer_id = c.consumer_id
-                        ORDER BY b.bill_id DESC
-                        LIMIT 1
-                    ) lb ON TRUE
-                    LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-                    LEFT JOIN (
-                        SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
-                        FROM {self._schema}.meterreadings mr
-                        GROUP BY mr.consumer_id
-                    ) prev ON prev.consumer_id = c.consumer_id
-                    {fb_where}
-                    ORDER BY c.consumer_id
-                    """
-                    cur.execute(fb_sql, fb_params)
-                    rows = cur.fetchall()
         return [dict(r) for r in rows]
 
     def get_consumer_context(self, consumer_id: int) -> dict:
@@ -1747,10 +1889,24 @@ class HandheldSyncDataAccess:
 
         return None, errors
 
-    def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
+    def loadAssignedConsumers(
+        self,
+        meter_reader_id: str | int | None,
+        zone_name: str | None = None,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        if meter_reader_id in (None, ""):
+            return self.local.load_cached_consumers(zone_name)
         if self.remote and self.remote.is_online():
             try:
-                data = self.remote.load_assigned_consumers(zone_name)
+                data = self.remote.load_assigned_consumers(
+                    meter_reader_id,
+                    zone_name,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data)})
@@ -1759,7 +1915,12 @@ class HandheldSyncDataAccess:
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         if self.main_pg:
             try:
-                data = self.main_pg.load_assigned_consumers(zone_name)
+                data = self.main_pg.load_assigned_consumers(
+                    meter_reader_id,
+                    zone_name,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
@@ -1769,6 +1930,30 @@ class HandheldSyncDataAccess:
         cached = self.local.load_cached_consumers(zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached
+
+    def authenticateMeterReader(self, username: str, password: str) -> dict:
+        auth_errors: list[tuple[str, Exception]] = []
+        for label, client in (("Supabase", self.remote), ("MAIN_PG", self.main_pg)):
+            if not client:
+                continue
+            try:
+                if hasattr(client, "is_online") and not client.is_online():
+                    continue
+                return client.authenticate_meter_reader(username, password)
+            except (ValueError, PermissionError) as exc:
+                auth_errors.append((label, exc))
+            except Exception as exc:
+                auth_errors.append((label, exc))
+
+        for _label, exc in auth_errors:
+            if isinstance(exc, PermissionError):
+                raise exc
+        for _label, exc in auth_errors:
+            if isinstance(exc, ValueError):
+                raise exc
+        if auth_errors:
+            raise RuntimeError("; ".join(f"{label}: {exc}" for label, exc in auth_errors))
+        raise RuntimeError("No central account source is available for meter reader login.")
 
     def _normalize_reading(self, payload: dict) -> dict:
         reading = dict(payload)

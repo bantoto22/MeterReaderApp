@@ -60,13 +60,16 @@ except ImportError:
 try:
     from .database import (
         authenticate_user,
+        clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
+        get_current_meter_reader,
         get_latest_receipt_print,
         list_receipt_print_history,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        save_current_meter_reader,
         save_receipt_print,
         replace_consumers_from_sync,
         save_reading,
@@ -76,13 +79,16 @@ try:
 except ImportError:
     from database import (
         authenticate_user,
+        clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
+        get_current_meter_reader,
         get_latest_receipt_print,
         list_receipt_print_history,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
+        save_current_meter_reader,
         save_receipt_print,
         replace_consumers_from_sync,
         save_reading,
@@ -174,6 +180,7 @@ class LoginBridge(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._error_message = ""
+        self._sync_dal = None
 
     @Property(str, notify=errorMessageChanged)
     def errorMessage(self) -> str:
@@ -189,9 +196,25 @@ class LoginBridge(QObject):
             self.loginFailed.emit()
             return
 
-        user = authenticate_user(username, password)
-        if not user:
+        try:
+            if HandheldSyncDataAccess is None or SyncConfig is None:
+                raise RuntimeError("Sync module is unavailable.")
+            if self._sync_dal is None:
+                self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
+            user = self._sync_dal.authenticateMeterReader(username, password)
+            save_current_meter_reader(user)
+        except PermissionError as exc:
+            self._error_message = str(exc) or "This account is not an active Meter Reader."
+            self.errorMessageChanged.emit()
+            self.loginFailed.emit()
+            return
+        except ValueError:
             self._error_message = "Invalid username or password."
+            self.errorMessageChanged.emit()
+            self.loginFailed.emit()
+            return
+        except Exception as exc:
+            self._error_message = str(exc) or "Unable to verify this account right now."
             self.errorMessageChanged.emit()
             self.loginFailed.emit()
             return
@@ -289,6 +312,7 @@ class AppBridge(QObject):
         self._current_tab = 0
         self._reader_name = "User"
         self._reader_id = ""
+        self._meter_reader_account_id = ""
 
         self._status_time = datetime.now().strftime("%I:%M %p")
         self._battery_level = 85
@@ -449,13 +473,15 @@ class AppBridge(QObject):
         return self._last_receipt is not None
 
     def set_user(self, user: dict) -> None:
-        self._reader_name = user.get('name', 'User')
-        self._reader_id = user.get('id', '')
+        self._reader_name = user.get('full_name') or user.get('name', 'User')
+        self._reader_id = str(user.get('account_id') or user.get('id') or '')
+        self._meter_reader_account_id = str(user.get('account_id') or user.get('id') or "").strip()
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
         self._last_receipt_entry = get_latest_receipt_print()
         self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
         self.canReprintChanged.emit()
+        self._refresh_assigned_consumer_dataset()
 
     @Slot()
     def showWelcomeToast(self) -> None:
@@ -470,10 +496,22 @@ class AppBridge(QObject):
             self.operationBusyMessageChanged.emit()
 
     def clear_user(self) -> None:
+        clear_current_meter_reader()
         self._reader_name = "User"
         self._reader_id = ""
+        self._meter_reader_account_id = ""
+        self._zones = []
+        self._selected_zone = ""
+        self._zone_consumers = []
+        self._search_suggestions = []
+        self._search_query = ""
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
+        self.zonesChanged.emit()
+        self.selectedZoneChanged.emit()
+        self.zoneConsumersChanged.emit()
+        self.searchSuggestionsChanged.emit()
+        self.searchQueryChanged.emit()
 
     def _tick_status_clock(self) -> None:
         self._status_time = datetime.now().strftime("%I:%M %p")
@@ -878,13 +916,39 @@ class AppBridge(QObject):
         if self._auto_pull_enabled:
             self._auto_pull_timer.start(max(15, self._pull_interval) * 1000)
 
+    def _refresh_assigned_consumer_dataset(self) -> None:
+        if not self._meter_reader_account_id:
+            self._zones = get_all_zone_names()
+            self._selected_zone = self._zones[0] if self._zones else ""
+            self.zonesChanged.emit()
+            self.selectedZoneChanged.emit()
+            self._refresh_search_suggestions()
+            self._refresh_zone_consumers()
+            self.update_stats()
+            return
+        if self._sync_dal:
+            try:
+                consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
+                replace_consumers_from_sync(consumers)
+            except Exception as exc:
+                self._sync_logs = f"Assigned schedule refresh failed: {exc}"
+                self.syncLogsChanged.emit()
+        self._zones = get_all_zone_names()
+        if self._selected_zone not in self._zones:
+            self._selected_zone = self._zones[0] if self._zones else ""
+        self.zonesChanged.emit()
+        self.selectedZoneChanged.emit()
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
+        self.update_stats()
+
     def _run_auto_pull(self) -> None:
-        if not self._auto_pull_enabled or not self._sync_dal or self._operation_busy:
+        if not self._auto_pull_enabled or not self._sync_dal or not self._meter_reader_account_id or self._operation_busy:
             return
 
         def _task() -> None:
             try:
-                consumers = self._sync_dal.loadAssignedConsumers(None)
+                consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
                 mirrored = replace_consumers_from_sync(consumers)
                 self.syncTaskFinished.emit({"kind": "pull", "pulled": len(consumers), "mirrored": mirrored})
             except Exception as exc:
@@ -950,7 +1014,10 @@ class AppBridge(QObject):
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self.lastPullCountChanged.emit()
         self._zones = get_all_zone_names()
+        if self._selected_zone not in self._zones:
+            self._selected_zone = self._zones[0] if self._zones else ""
         self.zonesChanged.emit()
+        self.selectedZoneChanged.emit()
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
         self._reload_current_consumer_from_db()
@@ -993,6 +1060,7 @@ class AppBridge(QObject):
             "previous_penalty": consumer.get("previous_penalty"),
             "total_after_due_date": consumer.get("total_after_due_date"),
             "bill_status": consumer.get("bill_status"),
+            "meter_reader_id": self._meter_reader_account_id or None,
             "previous_reading": consumer.get("previous_reading"),
             "present_reading": present,
             "consumption": consumption,
@@ -1481,7 +1549,7 @@ class AppBridge(QObject):
                 result = self._sync_dal.syncPendingReadings(include_main_pg=True)
                 mirrored = 0
                 if result.get("status") != "offline":
-                    consumers = self._sync_dal.loadAssignedConsumers(None)
+                    consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
                     mirrored = replace_consumers_from_sync(consumers)
                 self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": mirrored})
             except Exception as exc:
@@ -1780,7 +1848,7 @@ class AppBridge(QObject):
                         )
                         return
 
-                    consumers = self._sync_dal.loadAssignedConsumers(None)
+                    consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
                     mirrored = replace_consumers_from_sync(consumers)
                     self.syncTaskFinished.emit(
                         {"kind": "sync", "result": result, "mirrored": mirrored, "silent": True, "keep_busy": True}
@@ -1837,6 +1905,18 @@ class AppBridge(QObject):
     def update_stats(self) -> None:
         stats = get_zone_stats()
         if not stats:
+            self._overall_percentage = 0
+            self._overall_fraction = "0/0"
+            self._zone_read_fraction = "0/0"
+            self._zone_completion_percentage = 0
+            self._zone_flagged_count = 0
+            self._zone_remaining_count = 0
+            self.overallPercentageChanged.emit()
+            self.overallFractionChanged.emit()
+            self.zoneReadFractionChanged.emit()
+            self.zoneCompletionPercentageChanged.emit()
+            self.zoneFlaggedCountChanged.emit()
+            self.zoneRemainingCountChanged.emit()
             return
 
         # Overall completion calculations
