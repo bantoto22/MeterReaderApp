@@ -172,7 +172,8 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
         carried_balance = previous_balance
         carried_penalty = stored_previous_penalty
     elif latest_bill_status and latest_bill_status != "paid":
-        carried_balance = previous_balance if previous_balance > 0 else latest_amount_due
+        latest_unpaid_principal = max(0.0, latest_amount_due - stored_previous_penalty)
+        carried_balance = max(previous_balance, latest_unpaid_principal)
         computed_previous_penalty = round(carried_balance * (late_fee_percent / 100.0), 2)
         stored_penalty = stored_previous_penalty if previous_balance > 0 else max(stored_previous_penalty, stored_unpaid_penalty)
         carried_penalty = max(stored_penalty, computed_previous_penalty)
@@ -988,7 +989,8 @@ class SupabaseRestClient:
                 latest_reading_row = latest_readings_by_consumer.get(int(cid), {}) if cid is not None else {}
             except (TypeError, ValueError):
                 latest_reading_row = {}
-            prev = latest_reading_row.get("latest_reading")
+            latest_reading = latest_reading_row.get("latest_reading")
+            prev = latest_reading
             if prev is None:
                 prev = row.get("previous_reading") if row.get("previous_reading") is not None else row.get("last_reading")
             normalized.append(
@@ -1013,6 +1015,10 @@ class SupabaseRestClient:
                     "bill_status": (bill_row or {}).get("status"),
                     "late_fee": admin_settings.get("late_fee"),
                     "previous_reading": prev if prev is not None else 0,
+                    "latest_reading": latest_reading,
+                    "latest_reading_id": latest_reading_row.get("reading_id"),
+                    "latest_reading_date": latest_reading_row.get("reading_date"),
+                    "latest_reading_updated_at": latest_reading_row.get("updated_at"),
                 }
             )
         return normalized

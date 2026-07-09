@@ -742,7 +742,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         late_fee = _optional_float(c.get("late_fee"))
         cid = c.get("id")
 
+        local_consumer_id = None
         if cid is not None:
+            local_consumer_id = int(cid)
             cur.execute(
                 """
                 INSERT INTO consumers (
@@ -819,6 +821,35 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
+            local_row = cur.execute("SELECT id FROM consumers WHERE meter_no = ?", (meter_no,)).fetchone()
+            local_consumer_id = int(local_row["id"]) if local_row else local_consumer_id
+
+        latest_reading = _optional_float(c.get("latest_reading"))
+        latest_reading_date = str(c.get("latest_reading_date") or c.get("latest_reading_updated_at") or "").strip()
+        if local_consumer_id is not None and latest_reading is not None and latest_reading_date:
+            existing_reading = cur.execute(
+                """
+                SELECT id FROM readings
+                WHERE consumer_id = ?
+                  AND date(reading_date) = date(?)
+                  AND present_reading = ?
+                LIMIT 1
+                """,
+                (local_consumer_id, latest_reading_date, int(round(float(latest_reading)))),
+            ).fetchone()
+            if existing_reading is None:
+                prior_reading = latest_local_readings.get(local_consumer_id)
+                if prior_reading is None or float(prior_reading) == float(latest_reading):
+                    prior_reading = previous_reading
+                consumption = max(0, int(round(float(latest_reading) - float(prior_reading or 0))))
+                cur.execute(
+                    """
+                    INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged, reading_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_consumer_id, int(round(float(latest_reading))), consumption, "Synced", 0, latest_reading_date),
+                )
+                latest_local_readings[local_consumer_id] = latest_reading
         upserted += 1
 
     conn.commit()

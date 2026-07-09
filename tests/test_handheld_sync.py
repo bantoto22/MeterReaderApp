@@ -1,8 +1,11 @@
+import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
 
 from src.handheld_sync import HandheldSyncDataAccess, SupabaseRestClient, SyncConfig, _build_bill_payload
 from src.receipt import build_receipt_text
+import src.database as database
 
 
 class FakeLocalStore:
@@ -307,6 +310,41 @@ class HandheldSyncTests(unittest.TestCase):
         rows = FakeSupabaseClient().load_assigned_consumers()
 
         self.assertEqual(rows[0]["previous_reading"], 77)
+
+    def test_replace_consumers_from_sync_marks_pulled_supabase_reading_as_read(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.replace_consumers_from_sync(
+                [
+                    {
+                        "id": 8,
+                        "meter_no": "09-23-2233",
+                        "acct_no": "04-11-123",
+                        "name": "Charles Ivan De Vera",
+                        "zone_name": "Zone 1",
+                        "previous_reading": 77,
+                        "latest_reading": 77,
+                        "latest_reading_date": "2026-07-09",
+                    }
+                ]
+            )
+
+            rows = database.get_zone_consumers_with_status("Zone 1")
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["is_read"], 1)
+            self.assertEqual(rows[0]["reading_value"], 77)
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
     def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             def load_waterrates_by_classification(self):
@@ -489,6 +527,36 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["penalty"], 4.0)
         self.assertEqual(payload["total_after_due_date"], 440.0)
 
+    def test_bill_payload_rolls_unpaid_amount_into_next_previous_balance(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "7f00dbb6-656d-43b4-b4db-2bb206af9d23",
+                "consumer_id": 42,
+                "present_reading": 8,
+                "previous_reading": 5,
+                "consumption": 3,
+                "reading_date": "2026-07-09",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+                "amount_due": 175.2,
+                "previous_balance": 132,
+                "previous_penalty": 13.2,
+            },
+            100,
+        )
+
+        self.assertEqual(payload["amount_due"], 208.2)
+        self.assertEqual(payload["previous_balance"], 162.0)
+        self.assertEqual(payload["previous_penalty"], 16.2)
+        self.assertEqual(payload["penalty"], 3.0)
+        self.assertEqual(payload["total_after_due_date"], 211.2)
+
     def test_receipt_total_uses_current_reading_bill_not_stale_amount_due(self):
         text = build_receipt_text(
             {
@@ -623,6 +691,39 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertLess(text.index(previous_line), text.index(previous_penalty_line))
         self.assertIn("TOTAL AMOUNT: PHP   436.00", text)
         self.assertIn("After Due   : PHP   440.00", text)
+
+    def test_receipt_rolls_unpaid_amount_into_next_previous_balance(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "amount_due": 175.2,
+                "previous_balance": 132,
+                "previous_penalty": 13.2,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=5,
+            present=8,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-09",
+        )
+
+        self.assertIn("Current Bill: PHP    30.00", text)
+        self.assertIn("Previous    : PHP   162.00", text)
+        self.assertIn("Prev Penalty(10%): PHP    16.20", text)
+        self.assertIn("TOTAL AMOUNT: PHP   208.20", text)
+        self.assertIn("After Due   : PHP   211.20", text)
 
     def test_receipt_shows_projected_after_due_penalty_without_existing_record(self):
         text = build_receipt_text(

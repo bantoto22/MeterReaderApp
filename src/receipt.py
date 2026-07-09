@@ -129,7 +129,8 @@ def _carried_previous_bill(consumer: dict) -> tuple[float, float, str]:
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
 
-    carried = previous_balance if previous_balance > 0 else unpaid_amount
+    latest_unpaid_principal = max(0.0, unpaid_amount - previous_penalty)
+    carried = max(previous_balance, latest_unpaid_principal)
     computed_previous_penalty = round(carried * (late_fee_percent / 100.0), 2)
     stored_previous_penalty = previous_penalty if previous_balance > 0 else max(previous_penalty, unpaid_penalty)
     carried_penalty = max(stored_previous_penalty, computed_previous_penalty)
