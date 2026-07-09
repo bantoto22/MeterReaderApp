@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from src.handheld_sync import HandheldSyncDataAccess, _build_bill_payload
+from src.handheld_sync import HandheldSyncDataAccess, SupabaseRestClient, SyncConfig, _build_bill_payload
 from src.receipt import build_receipt_text
 
 
@@ -201,6 +201,112 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(len(main_pg.remote_rows), 1)
         self.assertEqual(len(self.remote.remote_rows), 1)
 
+    def test_supabase_pull_prefers_unpaid_bill_for_previous_balance(self):
+        class FakeSupabaseClient(SupabaseRestClient):
+            def __init__(self):
+                super().__init__(
+                    SyncConfig(
+                        supabase_url="https://example.test",
+                        supabase_anon_key="anon",
+                        supabase_service_role_key="service",
+                        main_pg_host="",
+                        main_pg_port=5432,
+                        main_pg_db="",
+                        main_pg_user="",
+                        main_pg_password="",
+                    )
+                )
+
+            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
+                if table_or_path == "consumer":
+                    return 200, [
+                        {
+                            "consumer_id": 8,
+                            "account_number": "04-11-123",
+                            "meter_no": "09-23-2233",
+                            "first_name": "Charles",
+                            "last_name": "De Vera",
+                            "zone": {"zone_name": "Zone 1"},
+                            "classification_id": 1,
+                            "classification": {"classification_name": "Residential"},
+                        }
+                    ]
+                if table_or_path == "bills":
+                    return 200, [
+                        {
+                            "bill_id": 11,
+                            "consumer_id": 8,
+                            "amount_due": 0,
+                            "previous_balance": 0,
+                            "penalty": 0,
+                            "total_after_due_date": 0,
+                            "status": "Paid",
+                        },
+                        {
+                            "bill_id": 10,
+                            "consumer_id": 8,
+                            "amount_due": 100,
+                            "previous_balance": 25,
+                            "penalty": 10,
+                            "total_after_due_date": 110,
+                            "status": "Unpaid",
+                        },
+                    ]
+                return 200, []
+
+        rows = FakeSupabaseClient().load_assigned_consumers()
+
+        self.assertEqual(rows[0]["bill_status"], "Unpaid")
+        self.assertEqual(rows[0]["amount_due"], 100)
+        self.assertEqual(rows[0]["previous_balance"], 25)
+        self.assertEqual(rows[0]["total_after_due_date"], 110)
+    def test_supabase_pull_uses_latest_meterreading_as_previous_reading(self):
+        class FakeSupabaseClient(SupabaseRestClient):
+            def __init__(self):
+                super().__init__(
+                    SyncConfig(
+                        supabase_url="https://example.test",
+                        supabase_anon_key="anon",
+                        supabase_service_role_key="service",
+                        main_pg_host="",
+                        main_pg_port=5432,
+                        main_pg_db="",
+                        main_pg_user="",
+                        main_pg_password="",
+                    )
+                )
+
+            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
+                if table_or_path == "consumer":
+                    return 200, [
+                        {
+                            "consumer_id": 8,
+                            "account_number": "04-11-123",
+                            "meter_no": "09-23-2233",
+                            "first_name": "Charles",
+                            "middle_name": "Ivan",
+                            "last_name": "De Vera",
+                            "zone": {"zone_name": "Zone 1"},
+                            "classification_id": 1,
+                            "classification": {"classification_name": "Residential"},
+                            "previous_reading": 0,
+                        }
+                    ]
+                if table_or_path == "meterreadings":
+                    return 200, [
+                        {
+                            "consumer_id": 8,
+                            "reading_id": 99,
+                            "reading_date": "2026-07-09",
+                            "updated_at": "2026-07-09T08:00:00",
+                            "current_reading": 77,
+                        }
+                    ]
+                return 200, []
+
+        rows = FakeSupabaseClient().load_assigned_consumers()
+
+        self.assertEqual(rows[0]["previous_reading"], 77)
     def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             def load_waterrates_by_classification(self):
@@ -371,7 +477,7 @@ class HandheldSyncTests(unittest.TestCase):
                 "due_days": 15,
                 "amount_due": 339,
                 "late_fee": None,
-                "bill_status": "Unpaid",
+                "bill_status": "Paid",
             },
             previous=24,
             present=25,
@@ -381,6 +487,7 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
+        self.assertIn("Prev Bill  : Paid", text)
         self.assertIn("TOTAL AMOUNT: PHP    10.00", text)
         self.assertNotIn("TOTAL AMOUNT: PHP   339.00", text)
 
@@ -410,10 +517,41 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
-        self.assertIn("Prev Balance: PHP    50.00", text)
+        self.assertIn("Unpaid Bill : PHP    50.00", text)
         self.assertIn("Prev Bill  : Unpaid", text)
         self.assertIn("TOTAL AMOUNT: PHP    60.00", text)
         self.assertIn("After Due   : PHP    66.00", text)
+
+    def test_receipt_total_includes_unpaid_previous_bill(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "amount_due": 100,
+                "penalty": 10,
+                "total_after_due_date": 110,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=24,
+            present=25,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-06",
+        )
+
+        self.assertIn("Current Bill: PHP    10.00", text)
+        self.assertIn("Unpaid Bill : PHP   110.00", text)
+        self.assertIn("TOTAL AMOUNT: PHP   120.00", text)
 
     def test_receipt_shows_projected_after_due_penalty_without_existing_record(self):
         text = build_receipt_text(
@@ -429,7 +567,6 @@ class HandheldSyncTests(unittest.TestCase):
                 "minimum_rate": 100,
                 "excess_rate_per_cubic": 15,
                 "due_days": 15,
-                "amount_due": 100,
                 "late_fee": None,
                 "bill_status": "Unpaid",
             },

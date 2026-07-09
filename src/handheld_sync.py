@@ -848,10 +848,47 @@ class SupabaseRestClient:
                 key = int(consumer_id)
             except (TypeError, ValueError):
                 continue
-            if key not in bills:
+            selected = bills.get(key)
+            row_status = str(row.get("status") or "").strip().lower()
+            selected_status = str((selected or {}).get("status") or "").strip().lower()
+            if selected is None:
+                bills[key] = row
+            elif selected_status == "paid" and row_status != "paid":
                 bills[key] = row
         return bills
 
+    def _load_latest_meterreadings_by_consumer(self) -> dict[int, dict]:
+        for reading_column in ("current_reading", "present_reading"):
+            status, data = self._req(
+                "GET",
+                "meterreadings",
+                query={
+                    "select": f"consumer_id,reading_id,reading_date,updated_at,{reading_column}",
+                    "order": "consumer_id.asc,reading_date.desc,updated_at.desc,reading_id.desc",
+                },
+                use_service_key=True,
+            )
+            if status >= 400 or not isinstance(data, list):
+                continue
+            latest: dict[int, dict] = {}
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                consumer_id = row.get("consumer_id")
+                try:
+                    key = int(consumer_id)
+                except (TypeError, ValueError):
+                    continue
+                if key in latest:
+                    continue
+                value = row.get(reading_column)
+                if value is None:
+                    continue
+                normalized = dict(row)
+                normalized["latest_reading"] = value
+                latest[key] = normalized
+            return latest
+        return {}
     def _consumer_select_variants(self, include_reading_fields: bool = True) -> list[str]:
         reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
         base_suffix = (
@@ -911,6 +948,7 @@ class SupabaseRestClient:
         rates_by_classification = self._load_waterrates_by_classification()
         bills_by_consumer = self._load_latest_bills_by_consumer()
         meters_by_consumer = self._load_meters_by_consumer()
+        latest_readings_by_consumer = self._load_latest_meterreadings_by_consumer()
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
@@ -948,11 +986,14 @@ class SupabaseRestClient:
                 bill_row = bills_by_consumer.get(int(cid)) if cid is not None else None
             except (TypeError, ValueError):
                 bill_row = None
-            prev = (
-                row.get("previous_reading")
-                if row.get("previous_reading") is not None
-                else row.get("last_reading")
-            )
+            latest_reading_row = {}
+            try:
+                latest_reading_row = latest_readings_by_consumer.get(int(cid), {}) if cid is not None else {}
+            except (TypeError, ValueError):
+                latest_reading_row = {}
+            prev = latest_reading_row.get("latest_reading")
+            if prev is None:
+                prev = row.get("previous_reading") if row.get("previous_reading") is not None else row.get("last_reading")
             normalized.append(
                 {
                     "id": cid,
@@ -1042,6 +1083,7 @@ class SupabaseRestClient:
             rate_row = {}
         zone_obj = consumer_row.get("zone")
         classification_obj = consumer_row.get("classification")
+        latest_reading = self._load_latest_meterreadings_by_consumer().get(int(consumer_id), {}).get("latest_reading")
         return {
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
@@ -1054,7 +1096,7 @@ class SupabaseRestClient:
             "excess_rate_per_cubic": rate_row.get("excess_rate_per_cubic"),
             "due_days": billing_settings.get("due_days"),
             "late_fee": admin_settings.get("late_fee"),
-            "previous_reading": consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading"),
+            "previous_reading": latest_reading if latest_reading is not None else (consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading")),
             "amount_due": latest_bill.get("amount_due"),
             "due_date": latest_bill.get("due_date"),
             "penalty": latest_bill.get("penalty"),

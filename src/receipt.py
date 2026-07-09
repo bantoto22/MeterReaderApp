@@ -136,6 +136,18 @@ def _optional_money(consumer: dict, field_name: str) -> float:
     except (TypeError, ValueError):
         return 0.0
 
+def _carried_previous_bill(consumer: dict) -> tuple[str, float, str]:
+    bill_status = str(consumer.get("bill_status") or "Unpaid").strip() or "Unpaid"
+    previous_balance = _optional_money(consumer, "previous_balance")
+    if bill_status.lower() == "paid":
+        return "Prev Balance", previous_balance, bill_status
+
+    unpaid_amount = _optional_money(consumer, "amount_due")
+    unpaid_penalty = _optional_money(consumer, "penalty")
+    unpaid_total = _optional_money(consumer, "total_after_due_date")
+    carried = max(previous_balance, unpaid_total, unpaid_amount + unpaid_penalty)
+    return "Unpaid Bill", carried, bill_status
+
 def _compute_bill(consumption: float, consumer: dict) -> tuple[float, int, float, float]:
     minimum_cubic = _require_int(consumer, "minimum_cubic")
     minimum_rate = _require_float(consumer, "minimum_rate")
@@ -165,12 +177,13 @@ def build_receipt_text(
     date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
-    previous_balance = _optional_money(consumer, "previous_balance")
-    amount_due = round(current_bill + previous_balance, 2)
+    carry_label, carried_previous_bill, previous_bill_status = _carried_previous_bill(consumer)
+    amount_due = round(current_bill + carried_previous_bill, 2)
     due_date_value = consumer.get("due_date")
     due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
     due_date = due_date_obj.isoformat()
     penalty, after_due, penalty_source, bill_status = _calculate_penalty(consumer, amount_due, due_date_obj, reference_date)
+    bill_status = previous_bill_status
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
 
@@ -203,7 +216,7 @@ def build_receipt_text(
         _money_line("Min Rate", minimum_rate),
         _money_line("Excess Rate", excess_rate),
         _money_line("Current Bill", current_bill),
-        _money_line("Prev Balance", previous_balance),
+        _money_line(carry_label, carried_previous_bill),
         _percent_line("Late Fee", late_fee_percent),
         _money_line("Penalty", penalty),
         border,
