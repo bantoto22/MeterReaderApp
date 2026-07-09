@@ -480,11 +480,11 @@ Rectangle {
                         border.width: 1
                         readonly property int rowCount: bridgeObj ? bridgeObj.zoneConsumers.length : 0
                         readonly property real columnsWidth: Math.max(0, width - 16 - 32)
-                        readonly property real meterColumnWidth: columnsWidth * 0.18
-                        readonly property real nameColumnWidth: columnsWidth * 0.34
-                        readonly property real statusColumnWidth: columnsWidth * 0.16
-                        readonly property real readingColumnWidth: columnsWidth * 0.16
-                        readonly property real actionColumnWidth: columnsWidth * 0.16
+                        readonly property real meterColumnWidth: columnsWidth * 0.16
+                        readonly property real nameColumnWidth: columnsWidth * 0.30
+                        readonly property real statusColumnWidth: columnsWidth * 0.14
+                        readonly property real readingColumnWidth: columnsWidth * 0.14
+                        readonly property real actionColumnWidth: columnsWidth * 0.26
                         implicitHeight: Math.min(560, Math.max(160, 58 + rowCount * TouchMetrics.tableRowHeight))
 
                         ColumnLayout {
@@ -523,34 +523,48 @@ Rectangle {
                                         Text { Layout.preferredWidth: detailsTable.nameColumnWidth; text: modelData.name; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignLeft; leftPadding: 8 }
                                         Text { Layout.preferredWidth: detailsTable.statusColumnWidth; text: modelData.is_read ? "Read" : "Pending"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; font.bold: true; color: modelData.is_read ? "#10B981" : "#64748B"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
                                         Text { Layout.preferredWidth: detailsTable.readingColumnWidth; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
-                                        Button {
-                                            id: btnRowPrint
+                                        RowLayout {
                                             Layout.preferredWidth: detailsTable.actionColumnWidth
                                             Layout.fillHeight: true
-                                            visible: modelData.is_read
-                                            text: "Print"
-                                            scale: pressed ? 0.92 : 1.0
-                                            Behavior on scale { NumberAnimation { duration: 80 } }
-                                            background: Rectangle {
-                                                radius: 8
-                                                color: btnRowPrint.pressed ? "#DBEAFE" : (btnRowPrint.hovered ? "#EFF6FF" : "transparent")
-                                                Behavior on color { ColorAnimation { duration: 120 } }
+                                            spacing: 2
+
+                                            Button {
+                                                id: btnRowPrint
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                visible: modelData.is_read
+                                                text: "Print"
+                                                scale: pressed ? 0.92 : 1.0
+                                                Behavior on scale { NumberAnimation { duration: 80 } }
+                                                background: Rectangle {
+                                                    radius: 8
+                                                    color: btnRowPrint.pressed ? "#DBEAFE" : (btnRowPrint.hovered ? "#EFF6FF" : "transparent")
+                                                    Behavior on color { ColorAnimation { duration: 120 } }
+                                                }
+                                                contentItem: Text { text: "Print"; color: "#1D4ED8"; font.pixelSize: TouchMetrics.helperText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                                onClicked: {
+                                                    pendingReprintConsumerId = modelData.id
+                                                    reprintConfirmDialog.open()
+                                                }
                                             }
-                                            contentItem: Text { text: "Print"; color: "#1D4ED8"; font.pixelSize: TouchMetrics.helperText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                            onClicked: {
-                                                pendingReprintConsumerId = modelData.id
-                                                reprintConfirmDialog.open()
+
+                                            Button {
+                                                id: btnRowNewBill
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                text: modelData.is_read ? "New" : "Read"
+                                                scale: pressed ? 0.92 : 1.0
+                                                Behavior on scale { NumberAnimation { duration: 80 } }
+                                                background: Rectangle {
+                                                    radius: 8
+                                                    color: btnRowNewBill.pressed ? "#DCFCE7" : (btnRowNewBill.hovered ? "#F0FDF4" : "transparent")
+                                                    Behavior on color { ColorAnimation { duration: 120 } }
+                                                }
+                                                contentItem: Text { text: modelData.is_read ? "New" : "Read"; color: "#047857"; font.pixelSize: TouchMetrics.helperText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                                onClicked: {
+                                                    if (bridgeObj) bridgeObj.startNewBillForZoneConsumer(modelData.id)
+                                                }
                                             }
-                                        }
-                                        Text {
-                                            Layout.preferredWidth: detailsTable.actionColumnWidth
-                                            visible: !modelData.is_read
-                                            text: "-"
-                                            color: "#64748B"
-                                            font.family: "Montserrat"
-                                            font.pixelSize: TouchMetrics.helperText
-                                            horizontalAlignment: Text.AlignHCenter
-                                            verticalAlignment: Text.AlignVCenter
                                         }
                                     }
                                 }

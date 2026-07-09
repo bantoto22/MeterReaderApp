@@ -145,20 +145,22 @@ def build_receipt_text(
     present: float,
     exception: str,
     reader_name: str = "Field Reader",
+    reading_date: str | datetime.date | None = None,
 ) -> str:
     _require_billing_profile(consumer)
     consumption = present - previous
     current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
 
     now = datetime.datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
+    reference_date = _parse_date(str(reading_date)) if reading_date not in (None, "") else now.date()
+    date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
     amount_due = float(consumer.get("amount_due") or current_bill)
     due_date_value = consumer.get("due_date")
-    due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (now.date() + datetime.timedelta(days=due_days))
+    due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
     due_date = due_date_obj.isoformat()
-    penalty, after_due, penalty_source, bill_status = _calculate_penalty(consumer, amount_due, due_date_obj, now.date())
+    penalty, after_due, penalty_source, bill_status = _calculate_penalty(consumer, amount_due, due_date_obj, reference_date)
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
 

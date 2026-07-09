@@ -144,6 +144,15 @@ def _format_reading(value) -> str:
     return text
 
 
+def _add_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    last_day = (next_month - timedelta(days=1)).day
+    return value.replace(year=year, month=month, day=min(value.day, last_day))
+
+
 def _normalize_shutdown_error(detail: str) -> str:
     lowered = (detail or "").lower()
     if "a password is required" in lowered or "password" in lowered or "interactive authentication required" in lowered:
@@ -227,6 +236,8 @@ class AppBridge(QObject):
     consumptionChanged = Signal()
     validationColorChanged = Signal()
     validationMessageChanged = Signal()
+    billingMonthOptionsChanged = Signal()
+    selectedBillingMonthChanged = Signal()
     
     # Exception properties
     exceptionsChanged = Signal()
@@ -293,7 +304,7 @@ class AppBridge(QObject):
         self._zones = get_all_zone_names()
         self._selected_zone = self._zones[0] if self._zones else ""
         self._search_query = ""
-        self._search_unread_only = True
+        self._search_unread_only = False
         
         self._account_no = "-"
         self._consumer_name = "-"
@@ -302,6 +313,8 @@ class AppBridge(QObject):
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
+        self._billing_month_offsets = [0, 1]
+        self._selected_billing_month_offset = 0
         
         self._exceptions = ["None", "Stuck Meter", "Leaking", "No Access", "Broken Seal"]
         self._selected_exception = "None"
@@ -564,6 +577,41 @@ class AppBridge(QObject):
     @Property(str, notify=validationMessageChanged)
     def validationMessage(self) -> str:
         return self._validation_message
+
+    @Property(list, notify=billingMonthOptionsChanged)
+    def billingMonthOptions(self) -> list:
+        now = datetime.now()
+        options = []
+        for offset in self._billing_month_offsets:
+            target = _add_months(now, offset)
+            options.append(
+                {
+                    "label": "Current Month" if offset == 0 else "Next Month",
+                    "detail": target.strftime("%B %Y"),
+                    "offset": offset,
+                }
+            )
+        return options
+
+    @Property(int, notify=selectedBillingMonthChanged)
+    def selectedBillingMonthOffset(self) -> int:
+        return self._selected_billing_month_offset
+
+    @selectedBillingMonthOffset.setter
+    def selectedBillingMonthOffset(self, val: int) -> None:
+        try:
+            offset = int(val)
+        except (TypeError, ValueError):
+            offset = 0
+        if offset not in self._billing_month_offsets:
+            offset = 0
+        if self._selected_billing_month_offset != offset:
+            self._selected_billing_month_offset = offset
+            self.selectedBillingMonthChanged.emit()
+
+    @Property(str, notify=selectedBillingMonthChanged)
+    def selectedBillingDate(self) -> str:
+        return self._selected_reading_date().isoformat()
 
     # Exception properties
     @Property(list, notify=exceptionsChanged)
@@ -861,6 +909,28 @@ class AppBridge(QObject):
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
 
+    def _selected_reading_date(self) -> datetime.date:
+        return _add_months(datetime.now(), self._selected_billing_month_offset).date()
+
+    def _load_consumer_for_new_bill(self, consumer: dict) -> None:
+        self._consumer = consumer
+        self._account_no = str(consumer.get("acct_no") or consumer["id"])
+        self._consumer_name = consumer["name"]
+        self._previous_reading = _format_reading(consumer["previous_reading"])
+        self._present_reading = ""
+        self._consumption = "-"
+        self._validation_color = "#94a3b8"
+        self._validation_message = "-"
+        self._current_tab = 0
+        self.accountNoChanged.emit()
+        self.consumerNameChanged.emit()
+        self.previousReadingChanged.emit()
+        self.presentReadingChanged.emit()
+        self.consumptionChanged.emit()
+        self.validationColorChanged.emit()
+        self.validationMessageChanged.emit()
+        self.currentTabChanged.emit()
+
     def _finish_sync_task(self, result: dict) -> None:
         keep_busy = bool(result.get("keep_busy"))
         if not keep_busy:
@@ -893,7 +963,15 @@ class AppBridge(QObject):
                 f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}\nMirrored: {self._last_pull_mirror}",
             )
 
-    def _save_to_sync_layer(self, consumer_id: int, present: float, consumption: float, exception: str, flagged: bool) -> None:
+    def _save_to_sync_layer(
+        self,
+        consumer_id: int,
+        present: float,
+        consumption: float,
+        exception: str,
+        flagged: bool,
+        reading_date: str | None = None,
+    ) -> None:
         if not self._sync_dal or not self._auto_push_enabled:
             return
         consumer = self._consumer or {}
@@ -920,7 +998,7 @@ class AppBridge(QObject):
             "consumption": consumption,
             "exception": exception,
             "is_flagged": bool(flagged),
-            "reading_date": datetime.now().date().isoformat(),
+            "reading_date": reading_date or datetime.now().date().isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1239,6 +1317,29 @@ class AppBridge(QObject):
         self.canReprintChanged.emit()
         self.receiptPreviewRequested.emit("Receipt Preview", receipt)
 
+    @Slot(int)
+    def startNewBillForZoneConsumer(self, consumer_id: int) -> None:
+        rows = get_zone_consumers_with_status(self._selected_zone)
+        row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
+        if not row:
+            self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
+            return
+
+        meter_no = str(row.get("meter_no") or "").strip()
+        consumer = search_consumer(meter_no, unread_only=False) if meter_no else None
+        if consumer is None:
+            self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
+            return
+
+        self._search_query = meter_no
+        self.searchQueryChanged.emit()
+        self._refresh_search_suggestions()
+        target_offset = 1 if row.get("is_read") else 0
+        if self._selected_billing_month_offset != target_offset:
+            self._selected_billing_month_offset = target_offset
+            self.selectedBillingMonthChanged.emit()
+        self._load_consumer_for_new_bill(consumer)
+
     @Slot()
     def logout(self) -> None:
         self.logoutRequested.emit()
@@ -1298,7 +1399,8 @@ class AppBridge(QObject):
         previous = _to_float(self._consumer["previous_reading"])
         consumption = present - previous
         exception = self._selected_exception
-        receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name)
+        reading_date = self._selected_reading_date().isoformat()
+        receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name, reading_date=reading_date)
         return {
             "job_type": "original",
             "consumer_snapshot": dict(self._consumer),
@@ -1307,6 +1409,7 @@ class AppBridge(QObject):
             "present": present,
             "consumption": consumption,
             "exception": exception,
+            "reading_date": reading_date,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }
@@ -1449,9 +1552,10 @@ class AppBridge(QObject):
                     previous = _to_float(job["previous"])
                     consumption = _to_float(job["consumption"])
                     exception = str(job["exception"])
+                    reading_date = str(job.get("reading_date") or datetime.now().date().isoformat())
                     flagged = consumption > 500 or exception != "None"
-                    reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged)
-                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged)
+                    reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
+                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date)
                     saved_receipt_id = save_receipt_print(
                         job["consumer_id"],
                         receipt_text,

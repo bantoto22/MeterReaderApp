@@ -364,15 +364,29 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     return [dict(r) for r in rows]
 
 
-def save_reading(consumer_id: int, present_reading: float, consumption: float,
-                 exception: str = "None", is_flagged: bool = False):
+def save_reading(
+    consumer_id: int,
+    present_reading: float,
+    consumption: float,
+    exception: str = "None",
+    is_flagged: bool = False,
+    reading_date: str | None = None,
+):
     """Insert a new reading record and update the consumer's previous reading."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0))
+    if reading_date:
+        cur.execute(
+            "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged, reading_date) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0, reading_date),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0),
+        )
     conn.execute(
         "UPDATE consumers SET previous_reading = ? WHERE id = ?",
         (present_reading, consumer_id))

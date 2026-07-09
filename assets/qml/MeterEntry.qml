@@ -298,6 +298,76 @@ Rectangle {
                         color: "#0F172A"
                     }
 
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text {
+                            text: "Billing Month"
+                            font.pixelSize: TouchMetrics.bodyText
+                            font.family: "Montserrat"
+                            font.bold: true
+                            color: "#0F172A"
+                        }
+
+                        ComboBox {
+                            id: cmbBillingMonth
+                            Layout.fillWidth: true
+                            textRole: "label"
+                            valueRole: "offset"
+                            model: bridgeObj ? bridgeObj.billingMonthOptions : []
+                            currentIndex: bridgeObj ? Math.max(0, bridgeObj.selectedBillingMonthOffset) : 0
+
+                            background: Rectangle {
+                                implicitHeight: TouchMetrics.inputHeight
+                                radius: 8
+                                border.color: cmbBillingMonth.focus ? "#3B82F6" : "#E2E8F0"
+                                border.width: 1
+                                color: "#F8FAFC"
+                            }
+
+                            contentItem: Text {
+                                text: cmbBillingMonth.currentText + (bridgeObj && bridgeObj.selectedBillingDate ? " - " + bridgeObj.selectedBillingDate : "")
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.bodyText
+                                color: "#0F172A"
+                                verticalAlignment: Text.AlignVCenter
+                                leftPadding: 10
+                                elide: Text.ElideRight
+                            }
+
+                            delegate: ItemDelegate {
+                                id: billingMonthDelegate
+                                width: cmbBillingMonth.width
+                                contentItem: ColumnLayout {
+                                    spacing: 0
+                                    Text {
+                                        text: modelData.label
+                                        font.family: "Montserrat"
+                                        font.pixelSize: TouchMetrics.bodyText
+                                        font.bold: true
+                                        color: billingMonthDelegate.highlighted ? "#FFFFFF" : "#0F172A"
+                                    }
+                                    Text {
+                                        text: modelData.detail
+                                        font.family: "Montserrat"
+                                        font.pixelSize: TouchMetrics.helperText
+                                        color: billingMonthDelegate.highlighted ? "#DBEAFE" : "#64748B"
+                                    }
+                                }
+                                background: Rectangle {
+                                    color: billingMonthDelegate.highlighted ? "#3B82F6" : "transparent"
+                                    radius: 4
+                                }
+                                highlighted: cmbBillingMonth.highlightedIndex === index
+                            }
+
+                            onActivated: {
+                                if (bridgeObj) bridgeObj.selectedBillingMonthOffset = currentValue
+                            }
+                        }
+                    }
+
                     TextField {
                         id: txtPresent
                         property string keyboardMode: "numeric"
