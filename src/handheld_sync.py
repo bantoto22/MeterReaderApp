@@ -1288,11 +1288,13 @@ class MainPostgresClient:
         ) lb ON TRUE
         JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN (
-            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+        LEFT JOIN LATERAL (
+            SELECT mr.current_reading AS last_reading
             FROM {self._schema}.meterreadings mr
-            GROUP BY mr.consumer_id
-        ) prev ON prev.consumer_id = c.consumer_id
+            WHERE mr.consumer_id = c.consumer_id
+            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+            LIMIT 1
+        ) prev ON TRUE
         LEFT JOIN {self._schema}.meterreadings today_read
           ON today_read.consumer_id = c.consumer_id
          AND DATE(today_read.reading_date) = rs.schedule_date
@@ -1362,11 +1364,13 @@ class MainPostgresClient:
                         LIMIT 1
                     ) lb ON TRUE
                     LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-                    LEFT JOIN (
-                        SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+                    LEFT JOIN LATERAL (
+                        SELECT mr.current_reading AS last_reading
                         FROM {self._schema}.meterreadings mr
-                        GROUP BY mr.consumer_id
-                    ) prev ON prev.consumer_id = c.consumer_id
+                        WHERE mr.consumer_id = c.consumer_id
+                        ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+                        LIMIT 1
+                    ) prev ON TRUE
                     {fb_where}
                     ORDER BY c.consumer_id
                     """
@@ -1430,11 +1434,13 @@ class MainPostgresClient:
             LIMIT 1
         ) lb ON TRUE
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN (
-            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+        LEFT JOIN LATERAL (
+            SELECT mr.current_reading AS last_reading
             FROM {self._schema}.meterreadings mr
-            GROUP BY mr.consumer_id
-        ) prev ON prev.consumer_id = c.consumer_id
+            WHERE mr.consumer_id = c.consumer_id
+            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+            LIMIT 1
+        ) prev ON TRUE
         WHERE c.consumer_id = %s
         LIMIT 1
         """

@@ -135,6 +135,22 @@ def init_db():
         },
     )
 
+    cur.execute("""
+        UPDATE consumers
+        SET previous_reading = (
+            SELECT r.present_reading
+            FROM readings r
+            WHERE r.consumer_id = consumers.id
+            ORDER BY r.reading_date DESC, r.id DESC
+            LIMIT 1
+        )
+        WHERE EXISTS (
+            SELECT 1
+            FROM readings r
+            WHERE r.consumer_id = consumers.id
+        )
+    """)
+
     # ── Seed data (only if tables are empty) ─────────────────────────────
     if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
         zones = ["Zone 1", "Zone 2", "Zone 3"]
@@ -669,6 +685,22 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
 
     zone_rows = cur.execute("SELECT id, name FROM zones").fetchall()
     zone_id_by_name = {row["name"]: row["id"] for row in zone_rows}
+    latest_local_readings = {
+        row["consumer_id"]: row["present_reading"]
+        for row in cur.execute(
+            """
+            SELECT r.consumer_id, r.present_reading
+            FROM readings r
+            JOIN (
+                SELECT consumer_id, MAX(id) AS latest_id
+                FROM readings
+                GROUP BY consumer_id
+            ) latest
+              ON latest.consumer_id = r.consumer_id
+             AND latest.latest_id = r.id
+            """
+        ).fetchall()
+    }
 
     upserted = 0
     for c in consumers:
@@ -684,6 +716,12 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         acct_no = (c.get("acct_no") or "").strip()
         name = (c.get("name") or "Unknown").strip()
         previous_reading = int(c.get("previous_reading") or 0)
+        try:
+            local_previous = latest_local_readings.get(int(c.get("id")))
+        except (TypeError, ValueError):
+            local_previous = None
+        if local_previous is not None:
+            previous_reading = max(previous_reading, int(local_previous or 0))
         classification_id = _optional_int(c.get("classification_id"))
         classification_name = (c.get("classification_name") or "").strip() or None
         minimum_cubic = _optional_int(c.get("minimum_cubic"))
