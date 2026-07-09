@@ -159,31 +159,28 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     same_bill = latest_bill_sync_id and current_sync_id and latest_bill_sync_id == current_sync_id
 
     due_days = _safe_int(context.get("due_days"), 15) or 15
-    previous_penalty, previous_total_after_due = _calculate_visible_penalty(
-        context.get("amount_due"),
-        context.get("due_date"),
-        context.get("bill_status"),
-        context.get("penalty"),
-        context.get("late_fee"),
-        reference_date,
-    )
-
+    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
     latest_bill_status = str(context.get("bill_status") or "").strip().lower()
-    latest_bill_total = max(_safe_float(context.get("total_after_due_date")), previous_total_after_due)
+    previous_balance = max(0.0, _safe_float(context.get("previous_balance")))
+    latest_amount_due = max(0.0, _safe_float(context.get("amount_due")))
+    stored_previous_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
+    stored_unpaid_penalty = max(0.0, _safe_float(context.get("penalty")))
+
     carried_balance = 0.0
     carried_penalty = 0.0
     if same_bill:
-        carried_balance = _safe_float(context.get("previous_balance"))
-        carried_penalty = _safe_float(context.get("previous_penalty"))
+        carried_balance = previous_balance
+        carried_penalty = stored_previous_penalty
     elif latest_bill_status and latest_bill_status != "paid":
-        carried_balance = latest_bill_total
-        carried_penalty = previous_penalty
+        carried_balance = previous_balance if previous_balance > 0 else latest_amount_due
+        computed_previous_penalty = round(carried_balance * (late_fee_percent / 100.0), 2)
+        stored_penalty = stored_previous_penalty if previous_balance > 0 else max(stored_previous_penalty, stored_unpaid_penalty)
+        carried_penalty = max(stored_penalty, computed_previous_penalty)
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
     due_date = datetime.combine(reference_date + timedelta(days=due_days), datetime.min.time())
-    amount_due = round(current_charge + carried_balance, 2)
-    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
-    current_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
+    amount_due = round(current_charge + carried_balance + carried_penalty, 2)
+    current_penalty = round(current_charge * (late_fee_percent / 100.0), 2)
     total_amount = amount_due
     total_after_due_date = round(amount_due + current_penalty, 2)
     reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())

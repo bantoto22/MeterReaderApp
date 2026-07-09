@@ -461,6 +461,34 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["penalty"], 10.0)
         self.assertEqual(payload["total_after_due_date"], 110.0)
 
+    def test_bill_payload_applies_previous_penalty_separately_from_current_due_penalty(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "7f00dbb6-656d-43b4-b4db-2bb206af9d22",
+                "consumer_id": 42,
+                "present_reading": 1,
+                "previous_reading": 0,
+                "consumption": 1,
+                "reading_date": "2026-07-08",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 40,
+                "due_days": 15,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+                "previous_balance": 360,
+            },
+            99,
+        )
+
+        self.assertEqual(payload["amount_due"], 436.0)
+        self.assertEqual(payload["previous_balance"], 360.0)
+        self.assertEqual(payload["previous_penalty"], 36.0)
+        self.assertEqual(payload["penalty"], 4.0)
+        self.assertEqual(payload["total_after_due_date"], 440.0)
+
     def test_receipt_total_uses_current_reading_bill_not_stale_amount_due(self):
         text = build_receipt_text(
             {
@@ -517,9 +545,10 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
-        self.assertIn("Unpaid Bill : PHP    50.00", text)
+        self.assertIn("Previous    : PHP    50.00", text)
+        self.assertIn("Prev Penalty(10%): PHP     5.00", text)
         self.assertIn("Prev Bill  : Unpaid", text)
-        self.assertIn("TOTAL AMOUNT: PHP    60.00", text)
+        self.assertIn("TOTAL AMOUNT: PHP    65.00", text)
         self.assertIn("After Due   : PHP    66.00", text)
 
     def test_receipt_total_includes_unpaid_previous_bill(self):
@@ -550,8 +579,50 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
-        self.assertIn("Unpaid Bill : PHP   110.00", text)
+        self.assertIn("Previous    : PHP   100.00", text)
+        self.assertIn("Prev Penalty(10%): PHP    10.00", text)
         self.assertIn("TOTAL AMOUNT: PHP   120.00", text)
+        self.assertIn("After Due   : PHP   121.00", text)
+
+    def test_receipt_applies_previous_penalty_separately_from_current_due_penalty(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 40,
+                "due_days": 15,
+                "previous_balance": 360,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=0,
+            present=1,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-06",
+        )
+
+        current_line = "Current Bill: PHP    40.00"
+        due_penalty_line = "Due Penalty(10%): PHP     4.00"
+        previous_line = "Previous    : PHP   360.00"
+        previous_penalty_line = "Prev Penalty(10%): PHP    36.00"
+
+        self.assertIn(current_line, text)
+        self.assertIn(due_penalty_line, text)
+        self.assertIn(previous_line, text)
+        self.assertIn(previous_penalty_line, text)
+        self.assertLess(text.index(current_line), text.index(due_penalty_line))
+        self.assertLess(text.index(due_penalty_line), text.index(previous_line))
+        self.assertLess(text.index(previous_line), text.index(previous_penalty_line))
+        self.assertIn("TOTAL AMOUNT: PHP   436.00", text)
+        self.assertIn("After Due   : PHP   440.00", text)
 
     def test_receipt_shows_projected_after_due_penalty_without_existing_record(self):
         text = build_receipt_text(
@@ -576,7 +647,7 @@ class HandheldSyncTests(unittest.TestCase):
             reader_name="Reader",
         )
 
-        self.assertIn("Penalty     : PHP    10.00", text)
+        self.assertIn("Due Penalty(10%): PHP    10.00", text)
         self.assertIn("After Due   : PHP   110.00", text)
 
 
