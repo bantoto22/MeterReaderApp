@@ -3509,6 +3509,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "due_days": consumer.get("due_days"),
             "late_fee": consumer.get("late_fee"),
             "amount_due": consumer.get("amount_due"),
+            "previous_balance": consumer.get("previous_balance"),
             "due_date": consumer.get("due_date"),
             "penalty": consumer.get("penalty"),
             "previous_penalty": consumer.get("previous_penalty"),

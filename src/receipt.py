@@ -127,6 +127,15 @@ def _calculate_penalty(
     return applied_penalty, total_after_due_date, penalty_source, bill_status
 
 
+def _optional_money(consumer: dict, field_name: str) -> float:
+    value = consumer.get(field_name)
+    if value in (None, ""):
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
 def _compute_bill(consumption: float, consumer: dict) -> tuple[float, int, float, float]:
     minimum_cubic = _require_int(consumer, "minimum_cubic")
     minimum_rate = _require_float(consumer, "minimum_rate")
@@ -156,7 +165,8 @@ def build_receipt_text(
     date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
-    amount_due = float(consumer.get("amount_due") or current_bill)
+    previous_balance = _optional_money(consumer, "previous_balance")
+    amount_due = round(current_bill + previous_balance, 2)
     due_date_value = consumer.get("due_date")
     due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
     due_date = due_date_obj.isoformat()
@@ -181,7 +191,7 @@ def build_receipt_text(
         _field_line("Prev Read", _format_reading(previous)),
         _field_line("Curr Read", _format_reading(present)),
         _field_line("Consumption", f"{_format_reading(consumption)} m3"),
-        _field_line("Bill Status", bill_status),
+        _field_line("Prev Bill", bill_status),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
@@ -193,6 +203,7 @@ def build_receipt_text(
         _money_line("Min Rate", minimum_rate),
         _money_line("Excess Rate", excess_rate),
         _money_line("Current Bill", current_bill),
+        _money_line("Prev Balance", previous_balance),
         _percent_line("Late Fee", late_fee_percent),
         _money_line("Penalty", penalty),
         border,

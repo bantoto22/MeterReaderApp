@@ -355,6 +355,66 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["penalty"], 10.0)
         self.assertEqual(payload["total_after_due_date"], 110.0)
 
+    def test_receipt_total_uses_current_reading_bill_not_stale_amount_due(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "amount_due": 339,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=24,
+            present=25,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-06",
+        )
+
+        self.assertIn("Current Bill: PHP    10.00", text)
+        self.assertIn("TOTAL AMOUNT: PHP    10.00", text)
+        self.assertNotIn("TOTAL AMOUNT: PHP   339.00", text)
+
+    def test_receipt_total_includes_previous_balance(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "previous_balance": 50,
+                "late_fee": None,
+                "bill_status": "Unpaid",
+            },
+            previous=24,
+            present=25,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-06",
+        )
+
+        self.assertIn("Current Bill: PHP    10.00", text)
+        self.assertIn("Prev Balance: PHP    50.00", text)
+        self.assertIn("Prev Bill  : Unpaid", text)
+        self.assertIn("TOTAL AMOUNT: PHP    60.00", text)
+        self.assertIn("After Due   : PHP    66.00", text)
+
     def test_receipt_shows_projected_after_due_penalty_without_existing_record(self):
         text = build_receipt_text(
             {

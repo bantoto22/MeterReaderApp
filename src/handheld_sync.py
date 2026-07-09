@@ -381,6 +381,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             _safe_int(row.get("due_days"), None),
             _safe_float(row.get("penalty_percent"), None),
             _safe_float(row.get("amount_due"), None),
+            _safe_float(row.get("previous_balance"), None),
             row.get("due_date"),
             _safe_float(row.get("penalty"), None),
             _safe_float(row.get("previous_penalty"), None),
@@ -482,6 +483,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             due_days INTEGER,
             penalty_percent REAL,
             amount_due REAL,
+            previous_balance REAL,
             due_date TEXT,
             penalty REAL,
             previous_penalty REAL,
@@ -516,6 +518,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "due_days": "INTEGER",
                     "penalty_percent": "REAL",
                     "amount_due": "REAL",
+                    "previous_balance": "REAL",
                     "due_date": "TEXT",
                     "penalty": "REAL",
                     "previous_penalty": "REAL",
@@ -533,11 +536,11 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         INSERT INTO handheld_consumers_cache (
             id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
             minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
-            amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+            amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
             bill_status, late_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
@@ -551,6 +554,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             due_days = excluded.due_days,
             penalty_percent = excluded.penalty_percent,
             amount_due = excluded.amount_due,
+            previous_balance = excluded.previous_balance,
             due_date = excluded.due_date,
             penalty = excluded.penalty,
             previous_penalty = excluded.previous_penalty,
@@ -572,7 +576,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         base = """
         SELECT id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
                minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
-               amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+               amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
                bill_status, late_fee,
                previous_reading
         FROM handheld_consumers_cache
@@ -963,6 +967,7 @@ class SupabaseRestClient:
                     "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
                     "due_days": billing_settings.get("due_days"),
                     "amount_due": (bill_row or {}).get("amount_due"),
+                    "previous_balance": (bill_row or {}).get("previous_balance"),
                     "due_date": (bill_row or {}).get("due_date"),
                     "penalty": (bill_row or {}).get("penalty"),
                     "previous_penalty": (bill_row or {}).get("previous_penalty"),
