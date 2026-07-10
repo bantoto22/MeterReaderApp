@@ -14,11 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import hashlib
 import json
 import os
 import sqlite3
-import hmac
 import threading
 import time
 import uuid
@@ -111,44 +109,6 @@ def _reading_date(value) -> date:
     return parsed or datetime.now().date()
 
 
-def _current_month_window(reference_date: date | None = None) -> tuple[str, str]:
-    today = reference_date or datetime.now().date()
-    start = today.replace(day=1)
-    if start.month == 12:
-        next_month = start.replace(year=start.year + 1, month=1, day=1)
-    else:
-        next_month = start.replace(month=start.month + 1, day=1)
-    end = next_month - timedelta(days=1)
-    return start.isoformat(), end.isoformat()
-
-
-def _verify_password(candidate_password: str, stored_password: str | None) -> bool:
-    candidate = str(candidate_password or "")
-    stored = str(stored_password or "")
-    if not stored:
-        return False
-    if stored == candidate:
-        return True
-    if stored.startswith("scrypt$"):
-        parts = stored.split("$", 2)
-        if len(parts) != 3:
-            return False
-        _, salt_hex, expected_hex = parts
-        try:
-            derived = hashlib.scrypt(
-                candidate.encode("utf-8"),
-                salt=bytes.fromhex(salt_hex),
-                n=16384,
-                r=8,
-                p=1,
-                dklen=len(bytes.fromhex(expected_hex)),
-            )
-            return hmac.compare_digest(derived.hex(), expected_hex.lower())
-        except Exception:
-            return False
-    return False
-
-
 def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_per_cubic) -> float:
     safe_consumption = max(consumption, 0)
     minimum_cubic_int = _safe_int(minimum_cubic)
@@ -199,31 +159,29 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     same_bill = latest_bill_sync_id and current_sync_id and latest_bill_sync_id == current_sync_id
 
     due_days = _safe_int(context.get("due_days"), 15) or 15
-    previous_penalty, previous_total_after_due = _calculate_visible_penalty(
-        context.get("amount_due"),
-        context.get("due_date"),
-        context.get("bill_status"),
-        context.get("penalty"),
-        context.get("late_fee"),
-        reference_date,
-    )
-
+    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
     latest_bill_status = str(context.get("bill_status") or "").strip().lower()
-    latest_bill_total = max(_safe_float(context.get("total_after_due_date")), previous_total_after_due)
+    previous_balance = max(0.0, _safe_float(context.get("previous_balance")))
+    latest_amount_due = max(0.0, _safe_float(context.get("amount_due")))
+    stored_previous_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
+    stored_unpaid_penalty = max(0.0, _safe_float(context.get("penalty")))
+
     carried_balance = 0.0
     carried_penalty = 0.0
     if same_bill:
-        carried_balance = _safe_float(context.get("previous_balance"))
-        carried_penalty = _safe_float(context.get("previous_penalty"))
+        carried_balance = previous_balance
+        carried_penalty = stored_previous_penalty
     elif latest_bill_status and latest_bill_status != "paid":
-        carried_balance = latest_bill_total
-        carried_penalty = previous_penalty
+        latest_unpaid_principal = max(0.0, latest_amount_due - stored_previous_penalty)
+        carried_balance = max(previous_balance, latest_unpaid_principal)
+        computed_previous_penalty = round(carried_balance * (late_fee_percent / 100.0), 2)
+        stored_penalty = stored_previous_penalty if previous_balance > 0 else max(stored_previous_penalty, stored_unpaid_penalty)
+        carried_penalty = max(stored_penalty, computed_previous_penalty)
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
     due_date = datetime.combine(reference_date + timedelta(days=due_days), datetime.min.time())
-    amount_due = round(current_charge + carried_balance, 2)
-    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
-    current_penalty = round(amount_due * (late_fee_percent / 100.0), 2)
+    amount_due = round(current_charge + carried_balance + carried_penalty, 2)
+    current_penalty = round(current_charge * (late_fee_percent / 100.0), 2)
     total_amount = amount_due
     total_after_due_date = round(amount_due + current_penalty, 2)
     reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())
@@ -268,7 +226,6 @@ class SyncConfig:
     supabase_url: str
     supabase_anon_key: str
     supabase_service_role_key: str
-    backend_api_base_url: str
     main_pg_host: str
     main_pg_port: int
     main_pg_db: str
@@ -302,16 +259,10 @@ class SyncConfig:
 
         supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "") or supabase_service_role_key
-        backend_api_base_url = (
-            os.getenv("BACKEND_API_BASE_URL", "").strip()
-            or os.getenv("DEVICE_API_BASE_URL", "").strip()
-            or f"http://localhost:{os.getenv('PORT', '3001').strip() or '3001'}"
-        ).rstrip("/")
         return cls(
             supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
             supabase_anon_key=supabase_anon_key,
             supabase_service_role_key=supabase_service_role_key,
-            backend_api_base_url=backend_api_base_url,
             main_pg_host=os.getenv("MAIN_PG_HOST", ""),
             main_pg_port=int(os.getenv("MAIN_PG_PORT", "5432")),
             main_pg_db=os.getenv("MAIN_PG_DB", ""),
@@ -428,6 +379,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             _safe_int(row.get("due_days"), None),
             _safe_float(row.get("penalty_percent"), None),
             _safe_float(row.get("amount_due"), None),
+            _safe_float(row.get("previous_balance"), None),
             row.get("due_date"),
             _safe_float(row.get("penalty"), None),
             _safe_float(row.get("previous_penalty"), None),
@@ -529,6 +481,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             due_days INTEGER,
             penalty_percent REAL,
             amount_due REAL,
+            previous_balance REAL,
             due_date TEXT,
             penalty REAL,
             previous_penalty REAL,
@@ -563,6 +516,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "due_days": "INTEGER",
                     "penalty_percent": "REAL",
                     "amount_due": "REAL",
+                    "previous_balance": "REAL",
                     "due_date": "TEXT",
                     "penalty": "REAL",
                     "previous_penalty": "REAL",
@@ -580,11 +534,11 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         INSERT INTO handheld_consumers_cache (
             id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
             minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
-            amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+            amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
             bill_status, late_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
@@ -598,6 +552,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             due_days = excluded.due_days,
             penalty_percent = excluded.penalty_percent,
             amount_due = excluded.amount_due,
+            previous_balance = excluded.previous_balance,
             due_date = excluded.due_date,
             penalty = excluded.penalty,
             previous_penalty = excluded.previous_penalty,
@@ -619,7 +574,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         base = """
         SELECT id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
                minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
-               amount_due, due_date, penalty, previous_penalty, total_after_due_date,
+               amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
                bill_status, late_fee,
                previous_reading
         FROM handheld_consumers_cache
@@ -778,7 +733,6 @@ class SupabaseRestClient:
         self._url = cfg.supabase_url
         self._anon_key = cfg.supabase_anon_key
         self._service_key = cfg.supabase_service_role_key
-        self._backend_api_base_url = cfg.backend_api_base_url.rstrip("/")
         self._schema = cfg.supabase_db_schema or "public"
         self._table_columns_cache: dict[str, set[str]] = {}
 
@@ -801,24 +755,6 @@ class SupabaseRestClient:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
         req = request.Request(url, data=body, method=method, headers=headers)
-        try:
-            with request.urlopen(req, timeout=6) as resp:
-                raw = resp.read().decode("utf-8").strip()
-                return resp.getcode(), json.loads(raw) if raw else {}
-        except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8").strip() if exc.fp else ""
-            try:
-                return exc.code, json.loads(raw) if raw else {"error": raw or str(exc)}
-            except Exception:
-                return exc.code, {"error": raw or str(exc)}
-        except Exception as exc:
-            return 0, {"error": str(exc)}
-
-    def _api_req(self, method: str, path: str, *, query: dict | None = None) -> tuple[int, object]:
-        url = f"{self._backend_api_base_url}{path}"
-        if query:
-            url += "?" + parse.urlencode(query)
-        req = request.Request(url, method=method)
         try:
             with request.urlopen(req, timeout=6) as resp:
                 raw = resp.read().decode("utf-8").strip()
@@ -910,10 +846,47 @@ class SupabaseRestClient:
                 key = int(consumer_id)
             except (TypeError, ValueError):
                 continue
-            if key not in bills:
+            selected = bills.get(key)
+            row_status = str(row.get("status") or "").strip().lower()
+            selected_status = str((selected or {}).get("status") or "").strip().lower()
+            if selected is None:
+                bills[key] = row
+            elif selected_status == "paid" and row_status != "paid":
                 bills[key] = row
         return bills
 
+    def _load_latest_meterreadings_by_consumer(self) -> dict[int, dict]:
+        for reading_column in ("current_reading", "present_reading"):
+            status, data = self._req(
+                "GET",
+                "meterreadings",
+                query={
+                    "select": f"consumer_id,reading_id,reading_date,updated_at,{reading_column}",
+                    "order": "consumer_id.asc,reading_date.desc,updated_at.desc,reading_id.desc",
+                },
+                use_service_key=True,
+            )
+            if status >= 400 or not isinstance(data, list):
+                continue
+            latest: dict[int, dict] = {}
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                consumer_id = row.get("consumer_id")
+                try:
+                    key = int(consumer_id)
+                except (TypeError, ValueError):
+                    continue
+                if key in latest:
+                    continue
+                value = row.get(reading_column)
+                if value is None:
+                    continue
+                normalized = dict(row)
+                normalized["latest_reading"] = value
+                latest[key] = normalized
+            return latest
+        return {}
     def _consumer_select_variants(self, include_reading_fields: bool = True) -> list[str]:
         reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
         base_suffix = (
@@ -964,100 +937,8 @@ class SupabaseRestClient:
                 meters[key] = row
         return meters
 
-    def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        query = {
-            "select": "account_id,username,password,role_id,account_status,full_name,contact_number,phone_number",
-            "username": f"eq.{username}",
-            "deleted_at": "is.null",
-            "limit": "1",
-        }
-        status, data = self._req("GET", "accounts", query=query, use_service_key=True)
-        if status >= 400:
-            raise RuntimeError(f"Supabase account lookup failed: {data}")
-        if not isinstance(data, list) or not data:
-            raise ValueError("Invalid username or password.")
-        row = data[0] if isinstance(data[0], dict) else {}
-        if not _verify_password(password, row.get("password")):
-            raise ValueError("Invalid username or password.")
-        if int(row.get("role_id") or 0) != 3 or str(row.get("account_status") or "").strip() != "Active":
-            raise PermissionError("This account is not an active Meter Reader.")
-        contact_number = row.get("contact_number") or row.get("phone_number") or ""
-        return {
-            "id": row.get("account_id"),
-            "account_id": row.get("account_id"),
-            "username": row.get("username"),
-            "name": row.get("full_name") or row.get("username"),
-            "full_name": row.get("full_name") or row.get("username"),
-            "contact_number": str(contact_number or "").strip(),
-            "role_id": row.get("role_id"),
-            "account_status": row.get("account_status"),
-            "reader_id": str(row.get("account_id") or ""),
-        }
-
-    def _load_reading_schedules(
-        self,
-        meter_reader_id: str | int,
-        *,
-        date_from: str,
-        date_to: str,
-        status: str = "Scheduled",
-    ) -> list[dict]:
-        schedule_query = {
-            "meter_reader_id": str(meter_reader_id),
-            "date_from": date_from,
-            "date_to": date_to,
-            "status": status,
-        }
-        http_status, data = self._api_req("GET", "/api/reading-schedules", query=schedule_query)
-        if http_status >= 400 or not isinstance(data, list):
-            raise RuntimeError(f"Reading schedule API failed: {data}")
-        return [row for row in data if isinstance(row, dict)]
-
-    def load_assigned_consumers(
-        self,
-        meter_reader_id: str | int | None,
-        zone_name: str | None = None,
-        *,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ) -> list[dict]:
-        if meter_reader_id in (None, ""):
-            return []
-        date_from = date_from or _current_month_window()[0]
-        date_to = date_to or _current_month_window()[1]
-        schedules = self._load_reading_schedules(
-            meter_reader_id,
-            date_from=date_from,
-            date_to=date_to,
-            status="Scheduled",
-        )
-        allowed_zone_names = sorted(
-            {
-                str(row.get("Zone_Name") or "").strip()
-                for row in schedules
-                if str(row.get("Zone_Name") or "").strip()
-            }
-        )
-        if zone_name:
-            if zone_name not in allowed_zone_names:
-                return []
-            zone_names = [zone_name]
-        else:
-            zone_names = allowed_zone_names
-        if not zone_names:
-            return []
-
-        data: list[dict] = []
-        seen_consumer_ids: set[object] = set()
-        for allowed_zone_name in zone_names:
-            for row in self._fetch_consumer_rows(zone_name=allowed_zone_name):
-                if not isinstance(row, dict):
-                    continue
-                cid = row.get("consumer_id") or row.get("id")
-                if cid in seen_consumer_ids:
-                    continue
-                seen_consumer_ids.add(cid)
-                data.append(row)
+    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
+        data = self._fetch_consumer_rows(zone_name=zone_name)
         if not isinstance(data, list):
             return []
         admin_settings = self._load_latest_admin_settings()
@@ -1065,6 +946,7 @@ class SupabaseRestClient:
         rates_by_classification = self._load_waterrates_by_classification()
         bills_by_consumer = self._load_latest_bills_by_consumer()
         meters_by_consumer = self._load_meters_by_consumer()
+        latest_readings_by_consumer = self._load_latest_meterreadings_by_consumer()
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
@@ -1102,11 +984,15 @@ class SupabaseRestClient:
                 bill_row = bills_by_consumer.get(int(cid)) if cid is not None else None
             except (TypeError, ValueError):
                 bill_row = None
-            prev = (
-                row.get("previous_reading")
-                if row.get("previous_reading") is not None
-                else row.get("last_reading")
-            )
+            latest_reading_row = {}
+            try:
+                latest_reading_row = latest_readings_by_consumer.get(int(cid), {}) if cid is not None else {}
+            except (TypeError, ValueError):
+                latest_reading_row = {}
+            latest_reading = latest_reading_row.get("latest_reading")
+            prev = latest_reading
+            if prev is None:
+                prev = row.get("previous_reading") if row.get("previous_reading") is not None else row.get("last_reading")
             normalized.append(
                 {
                     "id": cid,
@@ -1121,6 +1007,7 @@ class SupabaseRestClient:
                     "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
                     "due_days": billing_settings.get("due_days"),
                     "amount_due": (bill_row or {}).get("amount_due"),
+                    "previous_balance": (bill_row or {}).get("previous_balance"),
                     "due_date": (bill_row or {}).get("due_date"),
                     "penalty": (bill_row or {}).get("penalty"),
                     "previous_penalty": (bill_row or {}).get("previous_penalty"),
@@ -1128,6 +1015,10 @@ class SupabaseRestClient:
                     "bill_status": (bill_row or {}).get("status"),
                     "late_fee": admin_settings.get("late_fee"),
                     "previous_reading": prev if prev is not None else 0,
+                    "latest_reading": latest_reading,
+                    "latest_reading_id": latest_reading_row.get("reading_id"),
+                    "latest_reading_date": latest_reading_row.get("reading_date"),
+                    "latest_reading_updated_at": latest_reading_row.get("updated_at"),
                 }
             )
         return normalized
@@ -1195,6 +1086,7 @@ class SupabaseRestClient:
             rate_row = {}
         zone_obj = consumer_row.get("zone")
         classification_obj = consumer_row.get("classification")
+        latest_reading = self._load_latest_meterreadings_by_consumer().get(int(consumer_id), {}).get("latest_reading")
         return {
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
@@ -1207,7 +1099,7 @@ class SupabaseRestClient:
             "excess_rate_per_cubic": rate_row.get("excess_rate_per_cubic"),
             "due_days": billing_settings.get("due_days"),
             "late_fee": admin_settings.get("late_fee"),
-            "previous_reading": consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading"),
+            "previous_reading": latest_reading if latest_reading is not None else (consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading")),
             "amount_due": latest_bill.get("amount_due"),
             "due_date": latest_bill.get("due_date"),
             "penalty": latest_bill.get("penalty"),
@@ -1384,66 +1276,14 @@ class MainPostgresClient:
                 continue
         return rates
 
-    def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        sql = f"""
-        SELECT
-            account_id,
-            username,
-            password,
-            role_id,
-            account_status,
-            full_name,
-            contact_number,
-            phone_number
-        FROM {self._schema}.accounts
-        WHERE username = %s
-          AND deleted_at IS NULL
-        LIMIT 1
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (username,))
-                row = cur.fetchone()
-        if not row:
-            raise ValueError("Invalid username or password.")
-        record = dict(row)
-        if not _verify_password(password, record.get("password")):
-            raise ValueError("Invalid username or password.")
-        if int(record.get("role_id") or 0) != 3 or str(record.get("account_status") or "").strip() != "Active":
-            raise PermissionError("This account is not an active Meter Reader.")
-        contact_number = record.get("contact_number") or record.get("phone_number") or ""
-        return {
-            "id": record.get("account_id"),
-            "account_id": record.get("account_id"),
-            "username": record.get("username"),
-            "name": record.get("full_name") or record.get("username"),
-            "full_name": record.get("full_name") or record.get("username"),
-            "contact_number": str(contact_number or "").strip(),
-            "role_id": record.get("role_id"),
-            "account_status": record.get("account_status"),
-            "reader_id": str(record.get("account_id") or ""),
-        }
-
-    def load_assigned_consumers(
-        self,
-        meter_reader_id: str | int | None,
-        zone_name: str | None = None,
-        *,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ) -> list[dict]:
-        if meter_reader_id in (None, ""):
-            return []
-        date_from = date_from or _current_month_window()[0]
-        date_to = date_to or _current_month_window()[1]
+    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         where = """
         WHERE c.status = 'Active'
-          AND rs.meter_reader_id = %s
-          AND rs.schedule_date BETWEEN %s AND %s
-          AND rs.status = 'Scheduled'
+          AND rs.schedule_date = CURRENT_DATE
+          AND rs.status IN ('Scheduled', 'In Progress')
           AND today_read.reading_id IS NULL
         """
-        params: list[object] = [meter_reader_id, date_from, date_to]
+        params: list[object] = []
         if zone_name:
             where += " AND z.zone_name = %s"
             params.append(zone_name)
@@ -1498,11 +1338,13 @@ class MainPostgresClient:
         ) lb ON TRUE
         JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN (
-            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+        LEFT JOIN LATERAL (
+            SELECT mr.current_reading AS last_reading
             FROM {self._schema}.meterreadings mr
-            GROUP BY mr.consumer_id
-        ) prev ON prev.consumer_id = c.consumer_id
+            WHERE mr.consumer_id = c.consumer_id
+            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+            LIMIT 1
+        ) prev ON TRUE
         LEFT JOIN {self._schema}.meterreadings today_read
           ON today_read.consumer_id = c.consumer_id
          AND DATE(today_read.reading_date) = rs.schedule_date
@@ -1514,6 +1356,76 @@ class MainPostgresClient:
             with conn.cursor(cursor_factory=self._dict_cursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+                if not rows:
+                    # Fallback: no active schedule today, so return active consumers
+                    # for operational continuity.
+                    fb_where = "WHERE c.status = 'Active'"
+                    fb_params: list[object] = []
+                    if zone_name:
+                        fb_where += " AND z.zone_name = %s"
+                        fb_params.append(zone_name)
+                    fb_sql = f"""
+                    SELECT
+                        c.consumer_id AS id,
+                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
+                        c.account_number AS acct_no,
+                        CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
+                        z.zone_name AS zone_name,
+                        c.classification_id,
+                        cls.classification_name,
+                        wr.minimum_cubic,
+                        wr.minimum_rate,
+                        wr.excess_rate_per_cubic,
+                        bs.due_days,
+                        lb.amount_due,
+                        lb.due_date,
+                        lb.penalty,
+                        lb.previous_penalty,
+                        lb.total_after_due_date,
+                        lb.status AS bill_status,
+                        adm.late_fee,
+                        COALESCE(prev.last_reading, 0)::int AS previous_reading
+                    FROM {self._schema}.consumer c
+                    JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
+                    LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
+                    LEFT JOIN LATERAL (
+                        SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
+                        FROM {self._schema}.waterrates wr
+                        WHERE wr.classification_id = c.classification_id
+                        ORDER BY wr.rate_id DESC
+                        LIMIT 1
+                    ) wr ON TRUE
+                    LEFT JOIN (
+                        SELECT due_days
+                        FROM {self._schema}.billing_settings
+                        ORDER BY setting_id DESC
+                        LIMIT 1
+                    ) bs ON TRUE
+                    LEFT JOIN (
+                        SELECT late_fee
+                        FROM {self._schema}.admin_settings
+                        LIMIT 1
+                    ) adm ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
+                        FROM {self._schema}.bills b
+                        WHERE b.consumer_id = c.consumer_id
+                        ORDER BY b.bill_id DESC
+                        LIMIT 1
+                    ) lb ON TRUE
+                    LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
+                    LEFT JOIN LATERAL (
+                        SELECT mr.current_reading AS last_reading
+                        FROM {self._schema}.meterreadings mr
+                        WHERE mr.consumer_id = c.consumer_id
+                        ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+                        LIMIT 1
+                    ) prev ON TRUE
+                    {fb_where}
+                    ORDER BY c.consumer_id
+                    """
+                    cur.execute(fb_sql, fb_params)
+                    rows = cur.fetchall()
         return [dict(r) for r in rows]
 
     def get_consumer_context(self, consumer_id: int) -> dict:
@@ -1572,11 +1484,13 @@ class MainPostgresClient:
             LIMIT 1
         ) lb ON TRUE
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN (
-            SELECT mr.consumer_id, MAX(mr.current_reading) AS last_reading
+        LEFT JOIN LATERAL (
+            SELECT mr.current_reading AS last_reading
             FROM {self._schema}.meterreadings mr
-            GROUP BY mr.consumer_id
-        ) prev ON prev.consumer_id = c.consumer_id
+            WHERE mr.consumer_id = c.consumer_id
+            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
+            LIMIT 1
+        ) prev ON TRUE
         WHERE c.consumer_id = %s
         LIMIT 1
         """
@@ -1889,24 +1803,10 @@ class HandheldSyncDataAccess:
 
         return None, errors
 
-    def loadAssignedConsumers(
-        self,
-        meter_reader_id: str | int | None,
-        zone_name: str | None = None,
-        *,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ) -> list[dict]:
-        if meter_reader_id in (None, ""):
-            return self.local.load_cached_consumers(zone_name)
+    def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
         if self.remote and self.remote.is_online():
             try:
-                data = self.remote.load_assigned_consumers(
-                    meter_reader_id,
-                    zone_name,
-                    date_from=date_from,
-                    date_to=date_to,
-                )
+                data = self.remote.load_assigned_consumers(zone_name)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data)})
@@ -1915,12 +1815,7 @@ class HandheldSyncDataAccess:
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         if self.main_pg:
             try:
-                data = self.main_pg.load_assigned_consumers(
-                    meter_reader_id,
-                    zone_name,
-                    date_from=date_from,
-                    date_to=date_to,
-                )
+                data = self.main_pg.load_assigned_consumers(zone_name)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
@@ -1930,30 +1825,6 @@ class HandheldSyncDataAccess:
         cached = self.local.load_cached_consumers(zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached
-
-    def authenticateMeterReader(self, username: str, password: str) -> dict:
-        auth_errors: list[tuple[str, Exception]] = []
-        for label, client in (("Supabase", self.remote), ("MAIN_PG", self.main_pg)):
-            if not client:
-                continue
-            try:
-                if hasattr(client, "is_online") and not client.is_online():
-                    continue
-                return client.authenticate_meter_reader(username, password)
-            except (ValueError, PermissionError) as exc:
-                auth_errors.append((label, exc))
-            except Exception as exc:
-                auth_errors.append((label, exc))
-
-        for _label, exc in auth_errors:
-            if isinstance(exc, PermissionError):
-                raise exc
-        for _label, exc in auth_errors:
-            if isinstance(exc, ValueError):
-                raise exc
-        if auth_errors:
-            raise RuntimeError("; ".join(f"{label}: {exc}" for label, exc in auth_errors))
-        raise RuntimeError("No central account source is available for meter reader login.")
 
     def _normalize_reading(self, payload: dict) -> dict:
         reading = dict(payload)

@@ -64,6 +64,7 @@ def init_db():
             due_days INTEGER,
             penalty_percent REAL,
             amount_due REAL,
+            previous_balance REAL,
             due_date TEXT,
             penalty REAL,
             previous_penalty REAL,
@@ -112,22 +113,6 @@ def init_db():
             FOREIGN KEY (consumer_id) REFERENCES consumers(id),
             FOREIGN KEY (reading_id) REFERENCES readings(id)
         );
-
-        CREATE TABLE IF NOT EXISTS active_assignment_consumers (
-            consumer_id INTEGER PRIMARY KEY,
-            FOREIGN KEY (consumer_id) REFERENCES consumers(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS current_meter_reader (
-            slot INTEGER PRIMARY KEY CHECK (slot = 1),
-            account_id INTEGER,
-            username TEXT,
-            full_name TEXT,
-            contact_number TEXT,
-            role_id INTEGER,
-            account_status TEXT,
-            last_login_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
     """)
 
     _ensure_columns(
@@ -142,6 +127,7 @@ def init_db():
             "due_days": "INTEGER",
             "penalty_percent": "REAL",
             "amount_due": "REAL",
+            "previous_balance": "REAL",
             "due_date": "TEXT",
             "penalty": "REAL",
             "previous_penalty": "REAL",
@@ -150,13 +136,22 @@ def init_db():
             "late_fee": "REAL",
         },
     )
-    _ensure_columns(
-        conn,
-        "users",
-        {
-            "account_id": "TEXT",
-        },
-    )
+
+    cur.execute("""
+        UPDATE consumers
+        SET previous_reading = (
+            SELECT r.present_reading
+            FROM readings r
+            WHERE r.consumer_id = consumers.id
+            ORDER BY r.reading_date DESC, r.id DESC
+            LIMIT 1
+        )
+        WHERE EXISTS (
+            SELECT 1
+            FROM readings r
+            WHERE r.consumer_id = consumers.id
+        )
+    """)
 
     # ── Seed data (only if tables are empty) ─────────────────────────────
     if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
@@ -237,7 +232,7 @@ def authenticate_user(username: str, password: str) -> dict | None:
     """Validate user credentials. Returns user dict or None if invalid."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT username, password, name, reader_id, account_id FROM users WHERE username = ?",
+        "SELECT username, password, name, reader_id FROM users WHERE username = ?",
         (username,)
     ).fetchone()
     conn.close()
@@ -246,9 +241,7 @@ def authenticate_user(username: str, password: str) -> dict | None:
         return {
             'username': row['username'],
             'name': row['name'],
-            'id': row['account_id'] or row['reader_id'],
-            'reader_id': row['reader_id'],
-            'account_id': row['account_id'],
+            'id': row['reader_id']
         }
     return None
 
@@ -257,7 +250,7 @@ def get_all_users() -> list[dict]:
     """Return all users for login hint display."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT username, name, reader_id, account_id FROM users ORDER BY name"
+        "SELECT username, name, reader_id FROM users ORDER BY name"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -273,11 +266,10 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
                         c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
-                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE (
                      c.meter_no = ?
@@ -302,11 +294,10 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
                         c.bill_status, c.late_fee,
                         z.name AS zone_name
                  FROM consumers c
-                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE (
                      c.meter_no = ?
@@ -346,11 +337,10 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                       c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                       c.bill_status, c.late_fee,
-                       z.name AS zone_name
+                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
+                        z.name AS zone_name
                  FROM consumers c
-                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
                    AND (
@@ -369,11 +359,10 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
         sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.previous_reading,
                         c.classification_id, c.classification_name, c.minimum_cubic,
                         c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                       c.amount_due, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                       c.bill_status, c.late_fee,
-                       z.name AS zone_name
+                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                        c.bill_status, c.late_fee,
+                        z.name AS zone_name
                  FROM consumers c
-                 JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
                  JOIN zones z ON c.zone_id = z.id
                  WHERE z.name = ?
                    AND (
@@ -391,60 +380,6 @@ def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
-
-def save_current_meter_reader(user: dict) -> None:
-    """Persist the currently logged-in central meter reader identity locally."""
-    conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO current_meter_reader (
-            slot, account_id, username, full_name, contact_number, role_id, account_status, last_login_at
-        )
-        VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(slot) DO UPDATE SET
-            account_id = excluded.account_id,
-            username = excluded.username,
-            full_name = excluded.full_name,
-            contact_number = excluded.contact_number,
-            role_id = excluded.role_id,
-            account_status = excluded.account_status,
-            last_login_at = CURRENT_TIMESTAMP
-        """,
-        (
-            user.get("account_id"),
-            user.get("username"),
-            user.get("full_name") or user.get("name"),
-            user.get("contact_number"),
-            user.get("role_id"),
-            user.get("account_status"),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_current_meter_reader() -> dict | None:
-    """Return the locally stored current central meter reader identity."""
-    conn = get_connection()
-    row = conn.execute(
-        """
-        SELECT account_id, username, full_name, contact_number, role_id, account_status, last_login_at
-        FROM current_meter_reader
-        WHERE slot = 1
-        LIMIT 1
-        """
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def clear_current_meter_reader() -> None:
-    """Clear the locally stored current central meter reader identity."""
-    conn = get_connection()
-    conn.execute("DELETE FROM current_meter_reader WHERE slot = 1")
-    conn.commit()
-    conn.close()
 
 
 def save_reading(
@@ -624,43 +559,25 @@ def get_zone_stats() -> dict:
     conn = get_connection()
 
     stats = {}
-    zones = conn.execute(
-        """
-        SELECT DISTINCT z.id, z.name
-        FROM zones z
-        JOIN consumers c ON c.zone_id = z.id
-        JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
-        ORDER BY z.name
-        """
-    ).fetchall()
+    zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
 
     for z in zones:
         total = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM consumers c
-            JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
-            WHERE c.zone_id = ?
-            """,
-            (z["id"],),
+            "SELECT COUNT(*) FROM consumers WHERE zone_id = ?", (z["id"],)
         ).fetchone()[0]
 
         read = conn.execute(
             """SELECT COUNT(DISTINCT r.consumer_id)
                FROM readings r
                JOIN consumers c ON r.consumer_id = c.id
-               JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
-               WHERE c.zone_id = ?""",
-            (z["id"],),
+               WHERE c.zone_id = ?""", (z["id"],)
         ).fetchone()[0]
 
         flagged = conn.execute(
             """SELECT COUNT(*)
                FROM readings r
                JOIN consumers c ON r.consumer_id = c.id
-               JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
-               WHERE c.zone_id = ? AND r.is_flagged = 1""",
-            (z["id"],),
+               WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
         ).fetchone()[0]
 
         stats[z["name"]] = {"households": total, "read": read, "flagged": flagged}
@@ -672,15 +589,7 @@ def get_zone_stats() -> dict:
 def get_all_zone_names() -> list[str]:
     """Return a sorted list of zone names."""
     conn = get_connection()
-    rows = conn.execute(
-        """
-        SELECT DISTINCT z.name
-        FROM zones z
-        JOIN consumers c ON c.zone_id = z.id
-        JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
-        ORDER BY z.name
-        """
-    ).fetchall()
+    rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
     conn.close()
     return [r["name"] for r in rows]
 
@@ -704,6 +613,7 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             c.due_days,
             c.penalty_percent,
             c.amount_due,
+            c.previous_balance,
             c.due_date,
             c.penalty,
             c.previous_penalty,
@@ -717,7 +627,6 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
             r.exception,
             r.is_flagged
            FROM consumers c
-           JOIN active_assignment_consumers aac ON aac.consumer_id = c.id
            JOIN zones z ON c.zone_id = z.id
            LEFT JOIN (
                SELECT * FROM readings 
@@ -739,6 +648,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
     Mirror consumer records from sync source (Supabase/cache) into local SQLite.
     Returns number of consumer rows upserted.
     """
+    if not consumers:
+        return 0
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -776,9 +688,24 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
 
     zone_rows = cur.execute("SELECT id, name FROM zones").fetchall()
     zone_id_by_name = {row["name"]: row["id"] for row in zone_rows}
+    latest_local_readings = {
+        row["consumer_id"]: row["present_reading"]
+        for row in cur.execute(
+            """
+            SELECT r.consumer_id, r.present_reading
+            FROM readings r
+            JOIN (
+                SELECT consumer_id, MAX(id) AS latest_id
+                FROM readings
+                GROUP BY consumer_id
+            ) latest
+              ON latest.consumer_id = r.consumer_id
+             AND latest.latest_id = r.id
+            """
+        ).fetchall()
+    }
 
     upserted = 0
-    active_consumer_ids: list[int] = []
     for c in consumers:
         c = {key: _sqlite_safe(value) for key, value in c.items()}
         meter_no = _real_meter_no(c)
@@ -792,6 +719,12 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         acct_no = (c.get("acct_no") or "").strip()
         name = (c.get("name") or "Unknown").strip()
         previous_reading = int(c.get("previous_reading") or 0)
+        try:
+            local_previous = latest_local_readings.get(int(c.get("id")))
+        except (TypeError, ValueError):
+            local_previous = None
+        if local_previous is not None:
+            previous_reading = max(previous_reading, int(local_previous or 0))
         classification_id = _optional_int(c.get("classification_id"))
         classification_name = (c.get("classification_name") or "").strip() or None
         minimum_cubic = _optional_int(c.get("minimum_cubic"))
@@ -800,6 +733,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         due_days = _optional_int(c.get("due_days"))
         penalty_percent = _optional_float(c.get("penalty_percent"))
         amount_due = _optional_float(c.get("amount_due"))
+        previous_balance = _optional_float(c.get("previous_balance"))
         due_date = (str(c.get("due_date")).strip() if c.get("due_date") not in (None, "") else None)
         penalty = _optional_float(c.get("penalty"))
         previous_penalty = _optional_float(c.get("previous_penalty"))
@@ -808,17 +742,18 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         late_fee = _optional_float(c.get("late_fee"))
         cid = c.get("id")
 
+        local_consumer_id = None
         if cid is not None:
-            consumer_id = int(cid)
+            local_consumer_id = int(cid)
             cur.execute(
                 """
                 INSERT INTO consumers (
                     id, meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    due_days, penalty_percent, amount_due, previous_balance, due_date, penalty,
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
@@ -832,6 +767,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
                     amount_due = excluded.amount_due,
+                    previous_balance = excluded.previous_balance,
                     due_date = excluded.due_date,
                     penalty = excluded.penalty,
                     previous_penalty = excluded.previous_penalty,
@@ -841,23 +777,22 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     zone_id = excluded.zone_id
                 """,
                 (
-                    consumer_id, meter_no, acct_no, name, previous_reading, classification_id,
+                    int(cid), meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    due_days, penalty_percent, amount_due, previous_balance, due_date, penalty,
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
-            active_consumer_ids.append(consumer_id)
         else:
             cur.execute(
                 """
                 INSERT INTO consumers (
                     meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    due_days, penalty_percent, amount_due, previous_balance, due_date, penalty,
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = excluded.name,
@@ -870,6 +805,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
                     amount_due = excluded.amount_due,
+                    previous_balance = excluded.previous_balance,
                     due_date = excluded.due_date,
                     penalty = excluded.penalty,
                     previous_penalty = excluded.previous_penalty,
@@ -881,19 +817,40 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 (
                     meter_no, acct_no, name, previous_reading, classification_id,
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
-                    due_days, penalty_percent, amount_due, due_date, penalty,
+                    due_days, penalty_percent, amount_due, previous_balance, due_date, penalty,
                     previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
                 ),
             )
-            active_consumer_ids.append(int(cur.lastrowid))
-        upserted += 1
+            local_row = cur.execute("SELECT id FROM consumers WHERE meter_no = ?", (meter_no,)).fetchone()
+            local_consumer_id = int(local_row["id"]) if local_row else local_consumer_id
 
-    cur.execute("DELETE FROM active_assignment_consumers")
-    if active_consumer_ids:
-        cur.executemany(
-            "INSERT INTO active_assignment_consumers (consumer_id) VALUES (?)",
-            [(consumer_id,) for consumer_id in sorted(set(active_consumer_ids))],
-        )
+        latest_reading = _optional_float(c.get("latest_reading"))
+        latest_reading_date = str(c.get("latest_reading_date") or c.get("latest_reading_updated_at") or "").strip()
+        if local_consumer_id is not None and latest_reading is not None and latest_reading_date:
+            existing_reading = cur.execute(
+                """
+                SELECT id FROM readings
+                WHERE consumer_id = ?
+                  AND date(reading_date) = date(?)
+                  AND present_reading = ?
+                LIMIT 1
+                """,
+                (local_consumer_id, latest_reading_date, int(round(float(latest_reading)))),
+            ).fetchone()
+            if existing_reading is None:
+                prior_reading = latest_local_readings.get(local_consumer_id)
+                if prior_reading is None or float(prior_reading) == float(latest_reading):
+                    prior_reading = previous_reading
+                consumption = max(0, int(round(float(latest_reading) - float(prior_reading or 0))))
+                cur.execute(
+                    """
+                    INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged, reading_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_consumer_id, int(round(float(latest_reading))), consumption, "Synced", 0, latest_reading_date),
+                )
+                latest_local_readings[local_consumer_id] = latest_reading
+        upserted += 1
 
     conn.commit()
     conn.close()
