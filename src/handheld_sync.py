@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -110,6 +112,33 @@ def _parse_datetime(value) -> datetime | None:
 def _reading_date(value) -> date:
     parsed = _parse_date(value)
     return parsed or datetime.now().date()
+
+
+def _verify_password(candidate_password: str, stored_password: str | None) -> bool:
+    candidate = str(candidate_password or "")
+    stored = str(stored_password or "")
+    if not stored:
+        return False
+    if stored == candidate:
+        return True
+    if stored.startswith("scrypt$"):
+        parts = stored.split("$", 2)
+        if len(parts) != 3:
+            return False
+        _, salt_hex, expected_hex = parts
+        try:
+            derived = hashlib.scrypt(
+                candidate.encode("utf-8"),
+                salt=bytes.fromhex(salt_hex),
+                n=16384,
+                r=8,
+                p=1,
+                dklen=len(bytes.fromhex(expected_hex)),
+            )
+            return hmac.compare_digest(derived.hex(), expected_hex.lower())
+        except Exception:
+            return False
+    return False
 
 
 def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_per_cubic) -> float:
@@ -373,6 +402,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             meter_no,
             row.get("acct_no"),
             row.get("name", ""),
+            row.get("address") or row.get("consumer_address") or row.get("service_address"),
             row.get("zone_name"),
             classification_id,
             row.get("classification_name"),
@@ -381,6 +411,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             _safe_float(row.get("excess_rate_per_cubic"), None),
             _safe_int(row.get("due_days"), None),
             _safe_float(row.get("penalty_percent"), None),
+            row.get("billing_month"),
+            row.get("date_covered_from"),
+            row.get("date_covered_to"),
             _safe_float(row.get("amount_due"), None),
             _safe_float(row.get("previous_balance"), None),
             row.get("due_date"),
@@ -475,6 +508,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             meter_no TEXT,
             acct_no TEXT,
             name TEXT NOT NULL,
+            address TEXT,
             zone_name TEXT,
             classification_id INTEGER,
             classification_name TEXT,
@@ -483,6 +517,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             excess_rate_per_cubic REAL,
             due_days INTEGER,
             penalty_percent REAL,
+            billing_month TEXT,
+            date_covered_from TEXT,
+            date_covered_to TEXT,
             amount_due REAL,
             previous_balance REAL,
             due_date TEXT,
@@ -511,6 +548,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 conn,
                 "handheld_consumers_cache",
                 {
+                    "address": "TEXT",
                     "classification_id": "INTEGER",
                     "classification_name": "TEXT",
                     "minimum_cubic": "INTEGER",
@@ -518,6 +556,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "excess_rate_per_cubic": "REAL",
                     "due_days": "INTEGER",
                     "penalty_percent": "REAL",
+                    "billing_month": "TEXT",
+                    "date_covered_from": "TEXT",
+                    "date_covered_to": "TEXT",
                     "amount_due": "REAL",
                     "previous_balance": "REAL",
                     "due_date": "TEXT",
@@ -535,17 +576,19 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             return
         sql = """
         INSERT INTO handheld_consumers_cache (
-            id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
+            id, meter_no, acct_no, name, address, zone_name, classification_id, classification_name,
             minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+            billing_month, date_covered_from, date_covered_to,
             amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
             bill_status, late_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
             name = excluded.name,
+            address = excluded.address,
             zone_name = excluded.zone_name,
             classification_id = excluded.classification_id,
             classification_name = excluded.classification_name,
@@ -554,6 +597,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             excess_rate_per_cubic = excluded.excess_rate_per_cubic,
             due_days = excluded.due_days,
             penalty_percent = excluded.penalty_percent,
+            billing_month = excluded.billing_month,
+            date_covered_from = excluded.date_covered_from,
+            date_covered_to = excluded.date_covered_to,
             amount_due = excluded.amount_due,
             previous_balance = excluded.previous_balance,
             due_date = excluded.due_date,
@@ -575,8 +621,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         base = """
-        SELECT id, meter_no, acct_no, name, zone_name, classification_id, classification_name,
+        SELECT id, meter_no, acct_no, name, address, zone_name, classification_id, classification_name,
                minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
+               billing_month, date_covered_from, date_covered_to,
                amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
                bill_status, late_fee,
                previous_reading
@@ -787,6 +834,36 @@ class SupabaseRestClient:
         row = data[0]
         return row if isinstance(row, dict) else {}
 
+    def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        query = {
+            "select": "account_id,username,password,role_id,account_status,full_name,contact_number,phone_number",
+            "username": f"eq.{username}",
+            "deleted_at": "is.null",
+            "limit": "1",
+        }
+        status, data = self._req("GET", "accounts", query=query, use_service_key=True)
+        if status >= 400:
+            raise RuntimeError(f"Supabase account lookup failed: {data}")
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise ValueError("Invalid username or password.")
+        row = data[0]
+        if not _verify_password(password, row.get("password")):
+            raise ValueError("Invalid username or password.")
+        if int(row.get("role_id") or 0) != 3 or str(row.get("account_status") or "").strip() != "Active":
+            raise PermissionError("This account is not an active Meter Reader.")
+        contact_number = row.get("contact_number") or row.get("phone_number") or ""
+        return {
+            "id": row.get("account_id"),
+            "account_id": row.get("account_id"),
+            "username": row.get("username"),
+            "name": row.get("full_name") or row.get("username"),
+            "full_name": row.get("full_name") or row.get("username"),
+            "contact_number": str(contact_number or "").strip(),
+            "role_id": row.get("role_id"),
+            "account_status": row.get("account_status"),
+            "reader_id": str(row.get("account_id") or ""),
+        }
+
     def _load_latest_billing_settings(self) -> dict:
         status, data = self._req(
             "GET",
@@ -866,7 +943,7 @@ class SupabaseRestClient:
             return {}
         data = self._fetch_rows_for_consumer_ids(
             "bills",
-            "bill_id,consumer_id,reading_id,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
+            "bill_id,consumer_id,reading_id,billing_month,date_covered_from,date_covered_to,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
             consumer_ids,
             order_clause="consumer_id.asc,bill_id.desc",
         )
@@ -923,6 +1000,15 @@ class SupabaseRestClient:
             "zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
         )
         return [
+            f"consumer_id,account_number,meter_no,address{base_suffix}",
+            f"consumer_id,account_number,meter_number,address{base_suffix}",
+            f"consumer_id,account_number,address{base_suffix}",
+            f"consumer_id,account_number,meter_no,consumer_address{base_suffix}",
+            f"consumer_id,account_number,meter_number,consumer_address{base_suffix}",
+            f"consumer_id,account_number,consumer_address{base_suffix}",
+            f"consumer_id,account_number,meter_no,service_address{base_suffix}",
+            f"consumer_id,account_number,meter_number,service_address{base_suffix}",
+            f"consumer_id,account_number,service_address{base_suffix}",
             f"consumer_id,account_number,meter_no{base_suffix}",
             f"consumer_id,account_number,meter_number{base_suffix}",
             f"consumer_id,account_number{base_suffix}",
@@ -1002,6 +1088,11 @@ class SupabaseRestClient:
             last = (row.get("last_name") or "").strip()
             full_from_parts = " ".join([p for p in [first, middle, last] if p]).strip()
             name = row.get("name") or row.get("consumer_name") or row.get("fullname") or full_from_parts
+            address = (
+                row.get("address")
+                or row.get("consumer_address")
+                or row.get("service_address")
+            )
             zone_obj = row.get("zone")
             if isinstance(zone_obj, dict):
                 zone_val = zone_obj.get("zone_name")
@@ -1035,6 +1126,7 @@ class SupabaseRestClient:
                     "meter_no": meter_no,
                     "acct_no": acct_no,
                     "name": name,
+                    "address": address,
                     "zone_name": zone_val,
                     "classification_id": classification_id,
                     "classification_name": classification_name,
@@ -1042,6 +1134,9 @@ class SupabaseRestClient:
                     "minimum_rate": (rate_row or {}).get("minimum_rate"),
                     "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
                     "due_days": billing_settings.get("due_days"),
+                    "billing_month": (bill_row or {}).get("billing_month"),
+                    "date_covered_from": (bill_row or {}).get("date_covered_from"),
+                    "date_covered_to": (bill_row or {}).get("date_covered_to"),
                     "amount_due": (bill_row or {}).get("amount_due"),
                     "previous_balance": (bill_row or {}).get("previous_balance"),
                     "due_date": (bill_row or {}).get("due_date"),
@@ -1127,6 +1222,7 @@ class SupabaseRestClient:
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
             "meter_no": (str(consumer_row.get("meter_no") or consumer_row.get("meter_number") or meter_row.get("meter_serial_number") or "").strip() or None),
+            "address": consumer_row.get("address") or consumer_row.get("consumer_address") or consumer_row.get("service_address"),
             "zone_name": zone_obj.get("zone_name") if isinstance(zone_obj, dict) else None,
             "classification_id": classification_id,
             "classification_name": classification_obj.get("classification_name") if isinstance(classification_obj, dict) else None,
@@ -1136,6 +1232,9 @@ class SupabaseRestClient:
             "due_days": billing_settings.get("due_days"),
             "late_fee": admin_settings.get("late_fee"),
             "previous_reading": latest_reading if latest_reading is not None else (consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading")),
+            "billing_month": latest_bill.get("billing_month"),
+            "date_covered_from": latest_bill.get("date_covered_from"),
+            "date_covered_to": latest_bill.get("date_covered_to"),
             "amount_due": latest_bill.get("amount_due"),
             "due_date": latest_bill.get("due_date"),
             "penalty": latest_bill.get("penalty"),
@@ -1311,6 +1410,46 @@ class MainPostgresClient:
             except (TypeError, ValueError):
                 continue
         return rates
+
+    def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        sql = f"""
+        SELECT
+            account_id,
+            username,
+            password,
+            role_id,
+            account_status,
+            full_name,
+            contact_number,
+            phone_number
+        FROM {self._schema}.accounts
+        WHERE username = %s
+          AND deleted_at IS NULL
+        LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (username,))
+                row = cur.fetchone()
+        if not row:
+            raise ValueError("Invalid username or password.")
+        record = dict(row)
+        if not _verify_password(password, record.get("password")):
+            raise ValueError("Invalid username or password.")
+        if int(record.get("role_id") or 0) != 3 or str(record.get("account_status") or "").strip() != "Active":
+            raise PermissionError("This account is not an active Meter Reader.")
+        contact_number = record.get("contact_number") or record.get("phone_number") or ""
+        return {
+            "id": record.get("account_id"),
+            "account_id": record.get("account_id"),
+            "username": record.get("username"),
+            "name": record.get("full_name") or record.get("username"),
+            "full_name": record.get("full_name") or record.get("username"),
+            "contact_number": str(contact_number or "").strip(),
+            "role_id": record.get("role_id"),
+            "account_status": record.get("account_status"),
+            "reader_id": str(record.get("account_id") or ""),
+        }
 
     def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
         where = """
@@ -1868,6 +2007,30 @@ class HandheldSyncDataAccess:
         cached = self.local.load_cached_consumers(effective_zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached
+
+    def authenticateMeterReader(self, username: str, password: str) -> dict:
+        auth_errors: list[tuple[str, Exception]] = []
+        for label, client in (("Supabase", self.remote), ("MAIN_PG", self.main_pg)):
+            if not client:
+                continue
+            try:
+                if hasattr(client, "is_online") and not client.is_online():
+                    continue
+                return client.authenticate_meter_reader(username, password)
+            except (ValueError, PermissionError) as exc:
+                auth_errors.append((label, exc))
+            except Exception as exc:
+                auth_errors.append((label, exc))
+
+        for _label, exc in auth_errors:
+            if isinstance(exc, PermissionError):
+                raise exc
+        for _label, exc in auth_errors:
+            if isinstance(exc, ValueError):
+                raise exc
+        if auth_errors:
+            raise RuntimeError("; ".join(f"{label}: {exc}" for label, exc in auth_errors))
+        raise RuntimeError("No central account source is available for meter reader login.")
 
     def _normalize_reading(self, payload: dict) -> dict:
         reading = dict(payload)

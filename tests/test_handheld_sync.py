@@ -239,6 +239,9 @@ class HandheldSyncTests(unittest.TestCase):
                         {
                             "bill_id": 11,
                             "consumer_id": 8,
+                            "billing_month": "July 2026",
+                            "date_covered_from": "2026-06-09 00:00:00",
+                            "date_covered_to": "2026-07-09 00:00:00",
                             "amount_due": 0,
                             "previous_balance": 0,
                             "penalty": 0,
@@ -248,6 +251,9 @@ class HandheldSyncTests(unittest.TestCase):
                         {
                             "bill_id": 10,
                             "consumer_id": 8,
+                            "billing_month": "July 2026",
+                            "date_covered_from": "2026-06-09 00:00:00",
+                            "date_covered_to": "2026-07-09 00:00:00",
                             "amount_due": 100,
                             "previous_balance": 25,
                             "penalty": 10,
@@ -263,6 +269,9 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(rows[0]["amount_due"], 100)
         self.assertEqual(rows[0]["previous_balance"], 25)
         self.assertEqual(rows[0]["total_after_due_date"], 110)
+        self.assertEqual(rows[0]["billing_month"], "July 2026")
+        self.assertEqual(rows[0]["date_covered_from"], "2026-06-09 00:00:00")
+        self.assertEqual(rows[0]["date_covered_to"], "2026-07-09 00:00:00")
     def test_supabase_pull_uses_latest_meterreading_as_previous_reading(self):
         class FakeSupabaseClient(SupabaseRestClient):
             def __init__(self):
@@ -339,6 +348,50 @@ class HandheldSyncTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["is_read"], 1)
             self.assertEqual(rows[0]["reading_value"], 77)
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_replace_consumers_from_sync_persists_address_and_billing_period(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.replace_consumers_from_sync(
+                [
+                    {
+                        "id": 8,
+                        "meter_no": "09-23-2233",
+                        "acct_no": "04-11-123",
+                        "name": "Charles Ivan De Vera",
+                        "address": "Barangay Uno",
+                        "zone_name": "Zone 1",
+                        "previous_reading": 77,
+                        "classification_id": 1,
+                        "classification_name": "Residential",
+                        "minimum_cubic": 10,
+                        "minimum_rate": 150,
+                        "excess_rate_per_cubic": 15,
+                        "due_days": 15,
+                        "billing_month": "July 2026",
+                        "date_covered_from": "2026-06-09 00:00:00",
+                        "date_covered_to": "2026-07-09 00:00:00",
+                    }
+                ]
+            )
+
+            consumer = database.search_consumer("09-23-2233", unread_only=False)
+
+            self.assertEqual(consumer["address"], "Barangay Uno")
+            self.assertEqual(consumer["billing_month"], "July 2026")
+            self.assertEqual(consumer["date_covered_from"], "2026-06-09 00:00:00")
+            self.assertEqual(consumer["date_covered_to"], "2026-07-09 00:00:00")
         finally:
             database._db_path = original_db_path
             try:
@@ -583,7 +636,9 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
-        self.assertIn("Prev Bill  : Paid", text)
+        self.assertIn("Prev Bill    : PHP 0.00", text)
+        self.assertIn("Billing Month: July 2026", text)
+        self.assertIn("Billing Period: N/A to 2026-07-06", text)
         self.assertIn("TOTAL AMOUNT: PHP    10.00", text)
         self.assertNotIn("TOTAL AMOUNT: PHP   339.00", text)
 
@@ -615,7 +670,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Current Bill: PHP    10.00", text)
         self.assertIn("Previous    : PHP    50.00", text)
         self.assertIn("Prev Penalty(10%): PHP     5.00", text)
-        self.assertIn("Prev Bill  : Unpaid", text)
+        self.assertIn("Prev Bill    : PHP 50.00", text)
         self.assertIn("TOTAL AMOUNT: PHP    65.00", text)
         self.assertIn("After Due   : PHP    66.00", text)
 

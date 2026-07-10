@@ -34,8 +34,8 @@ def _receipt_line(char: str = "-") -> str:
     return char * RECEIPT_WIDTH
 
 
-def _field_line(label: str, value) -> str:
-    return f" {label:<11}: {value}"
+def _field_line(label: str, value, width: int = 11) -> str:
+    return f" {label:<{width}}: {value}"
 
 
 def _money_line(label: str, value: float) -> str:
@@ -90,6 +90,60 @@ def _parse_date(value: str) -> datetime.date:
         return datetime.date.fromisoformat(raw)
     except ValueError as exc:
         raise ValueError("Billing data has an invalid due_date value.") from exc
+
+
+def _display_date(value, default: str = "N/A") -> str:
+    if value in (None, ""):
+        return default
+    raw = str(value).strip()
+    if not raw:
+        return default
+    raw = raw.split("T", 1)[0].split(" ", 1)[0]
+    try:
+        return datetime.date.fromisoformat(raw).isoformat()
+    except ValueError:
+        return raw
+
+
+def _billing_month_text(consumer: dict, reference_date: datetime.date) -> str:
+    raw = str(consumer.get("billing_month") or "").strip()
+    if raw:
+        return raw
+    return reference_date.strftime("%B %Y")
+
+
+def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
+    start_keys = (
+        "date_covered_from",
+        "billing_period_from",
+        "previous_reading_date",
+        "last_reading_date",
+        "latest_reading_date",
+    )
+    end_keys = (
+        "date_covered_to",
+        "billing_period_to",
+        "current_reading_date",
+        "reading_date",
+    )
+    start_value = "N/A"
+    for key in start_keys:
+        start_value = _display_date(consumer.get(key), default="N/A")
+        if start_value != "N/A":
+            break
+    end_value = _display_date(None, default=reference_date.isoformat())
+    for key in end_keys:
+        candidate = _display_date(consumer.get(key), default="")
+        if candidate:
+            end_value = candidate
+            break
+    return f"{start_value} to {end_value}"
+
+
+def _previous_bill_text(previous: float, carried_previous_bill: float) -> str:
+    if previous <= 0:
+        return "None"
+    return f"PHP {carried_previous_bill:.2f}"
 
 
 def _calculate_penalty(
@@ -174,6 +228,10 @@ def build_receipt_text(
     bill_status = previous_bill_status
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
+    billing_month = _billing_month_text(consumer, reference_date)
+    billing_period = _billing_period_text(consumer, reference_date)
+    previous_bill = _previous_bill_text(previous, carried_previous_bill)
+    address = consumer.get("address") or consumer.get("consumer_address") or "N/A"
 
     divider = _receipt_line("-")
     border = _receipt_line("=")
@@ -183,16 +241,19 @@ def build_receipt_text(
         _center_text("SAN LORENZO RUIZ WATERWORKS"),
         _center_text("Water Billing System"),
         border,
-        _field_line("Account No", consumer.get("acct_no", "N/A")),
-        _field_line("Name", consumer.get("name", "N/A")),
-        _field_line("Zone", consumer.get("zone_name", "N/A")),
+        _center_text(str(consumer.get("acct_no", "N/A"))),
+        _center_text(str(consumer.get("name", "N/A"))),
+        divider,
+        _field_line("Address", address),
+        _field_line("Meter No", consumer.get("meter_no", "N/A")),
         _field_line("Class", consumer.get("classification_name", "N/A")),
         divider,
-        _field_line("Meter No", consumer.get("meter_no", "N/A")),
-        _field_line("Prev Read", _format_reading(previous)),
-        _field_line("Curr Read", _format_reading(present)),
-        _field_line("Consumption", f"{_format_reading(consumption)} m3"),
-        _field_line("Prev Bill", bill_status),
+        _field_line("Billing Month", billing_month, width=13),
+        _field_line("Billing Period", billing_period, width=13),
+        _field_line("Present Read", _format_reading(present), width=13),
+        _field_line("Prev Read", _format_reading(previous), width=13),
+        _field_line("Consumption", f"{_format_reading(consumption)} m3", width=13),
+        _field_line("Prev Bill", previous_bill, width=13),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
