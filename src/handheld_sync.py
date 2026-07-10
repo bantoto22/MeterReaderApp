@@ -24,6 +24,9 @@ from urllib import error, parse, request
 
 sqlite3.register_adapter(Decimal, float)
 
+SYNC_BATCH_SIZE = 100
+BACKGROUND_SYNC_INTERVAL_SECONDS = 300
+
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -823,22 +826,52 @@ class SupabaseRestClient:
                 rates[key] = row
         return rates
 
-    def _load_latest_bills_by_consumer(self) -> dict[int, dict]:
-        status, data = self._req(
-            "GET",
-            "bills",
-            query={
-                "select": "bill_id,consumer_id,reading_id,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
-                "order": "bill_id.desc",
-            },
-            use_service_key=True,
-        )
-        if status >= 400 or not isinstance(data, list):
+    def _batched_consumer_ids(self, consumer_ids: list[int]) -> list[list[int]]:
+        normalized = sorted({int(cid) for cid in consumer_ids if cid is not None})
+        return [normalized[idx: idx + SYNC_BATCH_SIZE] for idx in range(0, len(normalized), SYNC_BATCH_SIZE)]
+
+    def _fetch_rows_for_consumer_ids(
+        self,
+        table_name: str,
+        select_clause: str,
+        consumer_ids: list[int],
+        *,
+        order_clause: str | None = None,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        for consumer_batch in self._batched_consumer_ids(consumer_ids):
+            if not consumer_batch:
+                continue
+            in_filter = ",".join(str(cid) for cid in consumer_batch)
+            query = {
+                "select": select_clause,
+                "consumer_id": f"in.({in_filter})",
+                "limit": str(SYNC_BATCH_SIZE),
+            }
+            if order_clause:
+                query["order"] = order_clause
+            status, data = self._req(
+                "GET",
+                table_name,
+                query=query,
+                use_service_key=True,
+            )
+            if status >= 400 or not isinstance(data, list):
+                continue
+            rows.extend(row for row in data if isinstance(row, dict))
+        return rows
+
+    def _load_latest_bills_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
+        if not consumer_ids:
             return {}
+        data = self._fetch_rows_for_consumer_ids(
+            "bills",
+            "bill_id,consumer_id,reading_id,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
+            consumer_ids,
+            order_clause="consumer_id.asc,bill_id.desc",
+        )
         bills: dict[int, dict] = {}
         for row in data:
-            if not isinstance(row, dict):
-                continue
             consumer_id = row.get("consumer_id")
             if consumer_id is None:
                 continue
@@ -855,23 +888,18 @@ class SupabaseRestClient:
                 bills[key] = row
         return bills
 
-    def _load_latest_meterreadings_by_consumer(self) -> dict[int, dict]:
+    def _load_latest_meterreadings_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
+        if not consumer_ids:
+            return {}
         for reading_column in ("current_reading", "present_reading"):
-            status, data = self._req(
-                "GET",
+            data = self._fetch_rows_for_consumer_ids(
                 "meterreadings",
-                query={
-                    "select": f"consumer_id,reading_id,reading_date,updated_at,{reading_column}",
-                    "order": "consumer_id.asc,reading_date.desc,updated_at.desc,reading_id.desc",
-                },
-                use_service_key=True,
+                f"consumer_id,reading_id,reading_date,updated_at,{reading_column}",
+                consumer_ids,
+                order_clause="consumer_id.asc,reading_date.desc,updated_at.desc,reading_id.desc",
             )
-            if status >= 400 or not isinstance(data, list):
-                continue
             latest: dict[int, dict] = {}
             for row in data:
-                if not isinstance(row, dict):
-                    continue
                 consumer_id = row.get("consumer_id")
                 try:
                     key = int(consumer_id)
@@ -885,7 +913,8 @@ class SupabaseRestClient:
                 normalized = dict(row)
                 normalized["latest_reading"] = value
                 latest[key] = normalized
-            return latest
+            if latest:
+                return latest
         return {}
     def _consumer_select_variants(self, include_reading_fields: bool = True) -> list[str]:
         reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
@@ -915,19 +944,17 @@ class SupabaseRestClient:
                 last_error = data
         raise RuntimeError(f"Supabase read failed: {last_error}")
 
-    def _load_meters_by_consumer(self) -> dict[int, dict]:
-        status, data = self._req(
-            "GET",
-            "meter",
-            query={"select": "meter_id,meter_serial_number,consumer_id"},
-            use_service_key=True,
-        )
-        if status >= 400 or not isinstance(data, list):
+    def _load_meters_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
+        if not consumer_ids:
             return {}
+        data = self._fetch_rows_for_consumer_ids(
+            "meter",
+            "meter_id,meter_serial_number,consumer_id",
+            consumer_ids,
+            order_clause="consumer_id.asc,meter_id.desc",
+        )
         meters: dict[int, dict] = {}
         for row in data:
-            if not isinstance(row, dict):
-                continue
             consumer_id = row.get("consumer_id")
             try:
                 key = int(consumer_id)
@@ -941,12 +968,21 @@ class SupabaseRestClient:
         data = self._fetch_consumer_rows(zone_name=zone_name)
         if not isinstance(data, list):
             return []
+        consumer_ids: list[int] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            cid = row.get("consumer_id") or row.get("id")
+            try:
+                consumer_ids.append(int(cid))
+            except (TypeError, ValueError):
+                continue
         admin_settings = self._load_latest_admin_settings()
         billing_settings = self._load_latest_billing_settings()
         rates_by_classification = self._load_waterrates_by_classification()
-        bills_by_consumer = self._load_latest_bills_by_consumer()
-        meters_by_consumer = self._load_meters_by_consumer()
-        latest_readings_by_consumer = self._load_latest_meterreadings_by_consumer()
+        bills_by_consumer = self._load_latest_bills_by_consumer(consumer_ids)
+        meters_by_consumer = self._load_meters_by_consumer(consumer_ids)
+        latest_readings_by_consumer = self._load_latest_meterreadings_by_consumer(consumer_ids)
         normalized: list[dict] = []
         for row in data:
             if not isinstance(row, dict):
@@ -1071,7 +1107,7 @@ class SupabaseRestClient:
         rates_by_classification = self._load_waterrates_by_classification()
         admin_settings = self._load_latest_admin_settings()
         billing_settings = self._load_latest_billing_settings()
-        bills_by_consumer = self._load_latest_bills_by_consumer()
+        bills_by_consumer = self._load_latest_bills_by_consumer([int(consumer_id)])
         meter_status, meter_data = self._req(
             "GET",
             "meter",
@@ -1086,7 +1122,7 @@ class SupabaseRestClient:
             rate_row = {}
         zone_obj = consumer_row.get("zone")
         classification_obj = consumer_row.get("classification")
-        latest_reading = self._load_latest_meterreadings_by_consumer().get(int(consumer_id), {}).get("latest_reading")
+        latest_reading = self._load_latest_meterreadings_by_consumer([int(consumer_id)]).get(int(consumer_id), {}).get("latest_reading")
         return {
             "consumer_id": consumer_id,
             "acct_no": consumer_row.get("account_number"),
@@ -1803,10 +1839,17 @@ class HandheldSyncDataAccess:
 
         return None, errors
 
-    def loadAssignedConsumers(self, zone_name: str | None = None) -> list[dict]:
+    def loadAssignedConsumers(
+        self,
+        meter_reader_id: object | None = None,
+        zone_name: str | None = None,
+    ) -> list[dict]:
+        effective_zone_name = zone_name
+        if zone_name is None and isinstance(meter_reader_id, str) and not meter_reader_id.isdigit():
+            effective_zone_name = meter_reader_id
         if self.remote and self.remote.is_online():
             try:
-                data = self.remote.load_assigned_consumers(zone_name)
+                data = self.remote.load_assigned_consumers(effective_zone_name)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data)})
@@ -1815,14 +1858,14 @@ class HandheldSyncDataAccess:
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         if self.main_pg:
             try:
-                data = self.main_pg.load_assigned_consumers(zone_name)
+                data = self.main_pg.load_assigned_consumers(effective_zone_name)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
                 return data
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"MAIN_PG load failed, fallback to cache: {exc}")
-        cached = self.local.load_cached_consumers(zone_name)
+        cached = self.local.load_cached_consumers(effective_zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached
 
@@ -1969,6 +2012,17 @@ class HandheldSyncDataAccess:
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
 
         pending = self.local.list_pending(None if include_main_pg else "supabase")
+        self.local.log_audit(
+            None,
+            "pending",
+            "Starting sync cycle",
+            {
+                "include_main_pg": include_main_pg,
+                "internet_online": self.is_online(),
+                "main_pg_online": self._main_pg_online() if include_main_pg else False,
+                "pending_count": len(pending),
+            },
+        )
         synced = 0
         failed = 0
         conflicts = 0
@@ -2029,9 +2083,11 @@ class HandheldSyncDataAccess:
                 self.local.log_audit(queue_id, "failed", f"Queue row sync failed: {exc}", payload)
                 failed += 1
 
-        return {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts}
+        result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts}
+        self.local.log_audit(None, "success", "Finished sync cycle", result)
+        return result
 
-    def start_sync_worker(self, interval_seconds: int = 15) -> None:
+    def start_sync_worker(self, interval_seconds: int = BACKGROUND_SYNC_INTERVAL_SECONDS) -> None:
         if self._worker and self._worker.is_alive():
             return
 
@@ -2043,7 +2099,7 @@ class HandheldSyncDataAccess:
                     self.syncPendingReadings(include_main_pg=False)
                 except Exception as exc:
                     self.local.log_audit(None, "failed", f"Background sync worker error: {exc}")
-                time.sleep(max(3, interval_seconds))
+                time.sleep(max(60, interval_seconds))
 
         self._worker = threading.Thread(target=_run, daemon=True, name="handheld-sync-worker")
         self._worker.start()

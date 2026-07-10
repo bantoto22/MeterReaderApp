@@ -356,7 +356,7 @@ class AppBridge(QObject):
         self._last_pull_count = 0
         self._auto_pull_enabled = True
         self._auto_push_enabled = True
-        self._pull_interval = max(15, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "20000")) // 1000)
+        self._pull_interval = max(300, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "300000")) // 1000)
         self._sync_logs = "No sync activity yet."
         self._supabase_logs = "No Supabase activity yet."
         self._sync_dal = None
@@ -738,7 +738,7 @@ class AppBridge(QObject):
 
     @pullInterval.setter
     def pullInterval(self, val: int) -> None:
-        normalized = max(15, int(val or self._pull_interval or 20))
+        normalized = max(300, int(val or self._pull_interval or 300))
         if self._pull_interval != normalized:
             self._pull_interval = normalized
             self.pullIntervalChanged.emit()
@@ -853,7 +853,7 @@ class AppBridge(QObject):
                 self._emit_sync_state()
                 return
             self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
-            self._sync_dal.start_sync_worker(interval_seconds=20)
+            self._sync_dal.start_sync_worker(interval_seconds=max(300, self._pull_interval))
             self._refresh_sync_snapshot()
         except Exception as exc:
             self._sync_dal = None
@@ -914,7 +914,7 @@ class AppBridge(QObject):
             return
         self._auto_pull_timer.stop()
         if self._auto_pull_enabled:
-            self._auto_pull_timer.start(max(15, self._pull_interval) * 1000)
+            self._auto_pull_timer.start(max(300, self._pull_interval) * 1000)
 
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
