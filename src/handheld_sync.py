@@ -898,6 +898,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
 
 class SupabaseRestClient:
+    _ACCOUNT_CONTACT_SELECTS = (
+        "account_id,username,password,role_id,account_status,full_name,contact_number",
+        "account_id,username,password,role_id,account_status,full_name,phone_number",
+        "account_id,username,password,role_id,account_status,full_name",
+    )
+
     def __init__(self, cfg: SyncConfig):
         self._url = cfg.supabase_url
         self._anon_key = cfg.supabase_anon_key
@@ -974,15 +980,24 @@ class SupabaseRestClient:
         return [row for row in data if isinstance(row, dict)]
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        query = {
-            "select": "account_id,username,password,role_id,account_status,full_name,contact_number,phone_number",
-            "username": f"eq.{username}",
-            "deleted_at": "is.null",
-            "limit": "1",
-        }
-        status, data = self._req("GET", "accounts", query=query, use_service_key=True)
-        if status >= 400:
-            raise RuntimeError(f"Supabase account lookup failed: {data}")
+        data = None
+        last_error = None
+        for select_clause in self._ACCOUNT_CONTACT_SELECTS:
+            query = {
+                "select": select_clause,
+                "username": f"eq.{username}",
+                "deleted_at": "is.null",
+                "limit": "1",
+            }
+            status, data = self._req("GET", "accounts", query=query, use_service_key=True)
+            if status < 400:
+                break
+            error_text = json.dumps(data).lower() if isinstance(data, dict) else str(data).lower()
+            last_error = data
+            if "column" not in error_text or "does not exist" not in error_text:
+                raise RuntimeError(f"Supabase account lookup failed: {data}")
+        else:
+            raise RuntimeError(f"Supabase account lookup failed: {last_error}")
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             raise ValueError("Invalid username or password.")
         row = data[0]
@@ -1591,25 +1606,67 @@ class MainPostgresClient:
         return rates
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        sql = f"""
-        SELECT
-            account_id,
-            username,
-            password,
-            role_id,
-            account_status,
-            full_name,
-            contact_number,
-            phone_number
-        FROM {self._schema}.accounts
-        WHERE username = %s
-          AND deleted_at IS NULL
-        LIMIT 1
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (username,))
-                row = cur.fetchone()
+        select_variants = (
+            """
+            SELECT
+                account_id,
+                username,
+                password,
+                role_id,
+                account_status,
+                full_name,
+                contact_number
+            FROM {schema}.accounts
+            WHERE username = %s
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            """
+            SELECT
+                account_id,
+                username,
+                password,
+                role_id,
+                account_status,
+                full_name,
+                phone_number
+            FROM {schema}.accounts
+            WHERE username = %s
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            """
+            SELECT
+                account_id,
+                username,
+                password,
+                role_id,
+                account_status,
+                full_name
+            FROM {schema}.accounts
+            WHERE username = %s
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+        )
+        row = None
+        last_error = None
+        for sql_template in select_variants:
+            sql = sql_template.format(schema=self._schema)
+            try:
+                with self._connect() as conn:
+                    with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                        cur.execute(sql, (username,))
+                        row = cur.fetchone()
+                break
+            except Exception as exc:
+                error_text = str(exc).lower()
+                last_error = exc
+                if "column" not in error_text or "does not exist" not in error_text:
+                    raise
+        else:
+            if last_error is not None:
+                raise last_error
         if not row:
             raise ValueError("Invalid username or password.")
         record = dict(row)
@@ -1637,29 +1694,83 @@ class MainPostgresClient:
         date_to: str,
         status: str = "Scheduled",
     ) -> list[dict]:
-        sql = f"""
-        SELECT
-            rs.schedule_id AS "Schedule_ID",
-            rs.schedule_date::date AS "Schedule_Date",
-            rs.zone_id AS "Zone_ID",
-            z.zone_name AS "Zone_Name",
-            rs.meter_reader_id AS "Meter_Reader_ID",
-            COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
-            COALESCE(a.contact_number, a.phone_number, '') AS "Meter_Reader_Contact",
-            rs.status AS "Status"
-        FROM {self._schema}.reading_schedule rs
-        JOIN {self._schema}.zone z ON z.zone_id = rs.zone_id
-        LEFT JOIN {self._schema}.accounts a ON a.account_id = rs.meter_reader_id
-        WHERE rs.meter_reader_id = %s
-          AND rs.schedule_date::date >= %s
-          AND rs.schedule_date::date <= %s
-          AND rs.status = %s
-        ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (int(meter_reader_id), date_from, date_to, status or "Scheduled"))
-                rows = cur.fetchall()
+        query_variants = (
+            """
+            SELECT
+                rs.schedule_id AS "Schedule_ID",
+                rs.schedule_date::date AS "Schedule_Date",
+                rs.zone_id AS "Zone_ID",
+                z.zone_name AS "Zone_Name",
+                rs.meter_reader_id AS "Meter_Reader_ID",
+                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
+                COALESCE(a.contact_number, '') AS "Meter_Reader_Contact",
+                rs.status AS "Status"
+            FROM {schema}.reading_schedule rs
+            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
+            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
+            WHERE rs.meter_reader_id = %s
+              AND rs.schedule_date::date >= %s
+              AND rs.schedule_date::date <= %s
+              AND rs.status = %s
+            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
+            """,
+            """
+            SELECT
+                rs.schedule_id AS "Schedule_ID",
+                rs.schedule_date::date AS "Schedule_Date",
+                rs.zone_id AS "Zone_ID",
+                z.zone_name AS "Zone_Name",
+                rs.meter_reader_id AS "Meter_Reader_ID",
+                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
+                COALESCE(a.phone_number, '') AS "Meter_Reader_Contact",
+                rs.status AS "Status"
+            FROM {schema}.reading_schedule rs
+            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
+            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
+            WHERE rs.meter_reader_id = %s
+              AND rs.schedule_date::date >= %s
+              AND rs.schedule_date::date <= %s
+              AND rs.status = %s
+            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
+            """,
+            """
+            SELECT
+                rs.schedule_id AS "Schedule_ID",
+                rs.schedule_date::date AS "Schedule_Date",
+                rs.zone_id AS "Zone_ID",
+                z.zone_name AS "Zone_Name",
+                rs.meter_reader_id AS "Meter_Reader_ID",
+                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
+                '' AS "Meter_Reader_Contact",
+                rs.status AS "Status"
+            FROM {schema}.reading_schedule rs
+            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
+            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
+            WHERE rs.meter_reader_id = %s
+              AND rs.schedule_date::date >= %s
+              AND rs.schedule_date::date <= %s
+              AND rs.status = %s
+            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
+            """,
+        )
+        rows = []
+        last_error = None
+        for sql_template in query_variants:
+            sql = sql_template.format(schema=self._schema)
+            try:
+                with self._connect() as conn:
+                    with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                        cur.execute(sql, (int(meter_reader_id), date_from, date_to, status or "Scheduled"))
+                        rows = cur.fetchall()
+                break
+            except Exception as exc:
+                error_text = str(exc).lower()
+                last_error = exc
+                if "column" not in error_text or "does not exist" not in error_text:
+                    raise
+        else:
+            if last_error is not None:
+                raise last_error
         return [dict(r) for r in rows]
 
     def _load_active_consumers_for_zone(self, zone_name: str) -> list[dict]:

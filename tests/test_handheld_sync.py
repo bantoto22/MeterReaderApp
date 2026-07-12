@@ -223,6 +223,48 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(len(main_pg.remote_rows), 1)
         self.assertEqual(len(self.remote.remote_rows), 1)
 
+    def test_supabase_authenticate_meter_reader_falls_back_when_phone_number_column_missing(self):
+        class FakeSupabaseClient(SupabaseRestClient):
+            def __init__(self):
+                super().__init__(
+                    SyncConfig(
+                        supabase_url="https://example.test",
+                        supabase_anon_key="anon",
+                        supabase_service_role_key="service",
+                        main_pg_host="",
+                        main_pg_port=5432,
+                        main_pg_db="",
+                        main_pg_user="",
+                        main_pg_password="",
+                    )
+                )
+                self.select_attempts = []
+
+            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
+                if table_or_path == "accounts":
+                    self.select_attempts.append(query.get("select"))
+                    if query.get("select", "").endswith("contact_number"):
+                        return 200, [
+                            {
+                                "account_id": 12,
+                                "username": "juan.delacruz",
+                                "password": "secret123",
+                                "role_id": 3,
+                                "account_status": "Active",
+                                "full_name": "Juan Dela Cruz",
+                                "contact_number": "09123456789",
+                            }
+                        ]
+                    return 400, {"code": "42703", "message": "column accounts.phone_number does not exist"}
+                return 200, []
+
+        client = FakeSupabaseClient()
+        user = client.authenticate_meter_reader("juan.delacruz", "secret123")
+
+        self.assertEqual(user["account_id"], 12)
+        self.assertEqual(user["contact_number"], "09123456789")
+        self.assertEqual(client.select_attempts[0], "account_id,username,password,role_id,account_status,full_name,contact_number")
+
     def test_supabase_pull_prefers_unpaid_bill_for_previous_balance(self):
         class FakeSupabaseClient(SupabaseRestClient):
             def __init__(self):
