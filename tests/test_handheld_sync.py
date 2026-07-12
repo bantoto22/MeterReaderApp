@@ -418,7 +418,7 @@ class HandheldSyncTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_local_schedule_filter_limits_zones_and_read_status_by_schedule_date(self):
+    def test_local_schedule_filter_limits_zones_and_read_status_by_selected_month(self):
         original_db_path = database._db_path
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
         db_path = handle.name
@@ -474,24 +474,24 @@ class HandheldSyncTests(unittest.TestCase):
                 ]
             )
 
-            zone_names = database.get_all_zone_names("2026-07-15", 12)
+            zone_names = database.get_all_zone_names("2026-07-12", 12)
             self.assertEqual(zone_names, ["Zone 3"])
 
-            scheduled_consumer = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
-            unscheduled_consumer = database.search_consumer("MTR-Z1-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
+            scheduled_consumer = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-12", meter_reader_id=12)
+            unscheduled_consumer = database.search_consumer("MTR-Z1-001", unread_only=True, schedule_date="2026-07-12", meter_reader_id=12)
             self.assertIsNotNone(scheduled_consumer)
             self.assertIsNone(unscheduled_consumer)
 
-            rows_before = database.get_zone_consumers_with_status("Zone 3", "2026-07-15", 12)
+            rows_before = database.get_zone_consumers_with_status("Zone 3", "2026-07-12", 12)
             self.assertEqual(len(rows_before), 1)
             self.assertEqual(rows_before[0]["is_read"], 0)
 
             database.save_reading(1, 30, 10, "None", False, "2026-07-15")
 
-            rows_after = database.get_zone_consumers_with_status("Zone 3", "2026-07-15", 12)
+            rows_after = database.get_zone_consumers_with_status("Zone 3", "2026-07-12", 12)
             self.assertEqual(rows_after[0]["is_read"], 1)
 
-            unread_after = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
+            unread_after = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-12", meter_reader_id=12)
             self.assertIsNone(unread_after)
         finally:
             database._db_path = original_db_path

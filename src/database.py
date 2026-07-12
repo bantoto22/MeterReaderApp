@@ -385,6 +385,18 @@ def _effective_schedule_context(
     return normalized_date, reader_id_int, True
 
 
+def _month_bounds(schedule_date: str | None) -> tuple[str, str]:
+    normalized = _normalize_schedule_date(schedule_date) or date.today().isoformat()
+    anchor = date.fromisoformat(normalized)
+    month_start = anchor.replace(day=1)
+    if month_start.month == 12:
+        next_month = month_start.replace(year=month_start.year + 1, month=1, day=1)
+    else:
+        next_month = month_start.replace(month=month_start.month + 1, day=1)
+    month_end = next_month.fromordinal(next_month.toordinal() - 1)
+    return month_start.isoformat(), month_end.isoformat()
+
+
 def replace_reading_schedules_from_sync(
     schedules: list[dict],
     meter_reader_id: int | str | None,
@@ -484,6 +496,7 @@ def search_consumer(
     conn = get_connection()
     normalized = "".join(ch for ch in str(meter_no or "") if ch.isalnum())
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
@@ -508,11 +521,12 @@ def search_consumer(
                    FROM reading_schedule rs
                    WHERE rs.zone_name = z.name
                      AND rs.meter_reader_id = ?
-                     AND date(rs.schedule_date) = date(?)
+                     AND date(rs.schedule_date) >= date(?)
+                     AND date(rs.schedule_date) <= date(?)
                      AND rs.status IN ('Scheduled', 'In Progress')
                )
         """
-        params.extend([effective_reader_id, effective_date])
+        params.extend([effective_reader_id, month_start, month_end])
     if unread_only:
         if use_schedule_filter:
             sql += """
@@ -520,10 +534,11 @@ def search_consumer(
                    SELECT 1
                    FROM readings r
                    WHERE r.consumer_id = c.id
-                     AND date(r.reading_date) = date(?)
+                     AND date(r.reading_date) >= date(?)
+                     AND date(r.reading_date) <= date(?)
                )
             """
-            params.append(effective_date)
+            params.extend([month_start, month_end])
         else:
             sql += """
                AND NOT EXISTS (
@@ -566,6 +581,7 @@ def search_consumers_by_zone(
     normalized = "".join(ch for ch in str(query or "") if ch.isalnum())
     normalized_like = f"%{normalized}%"
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
@@ -591,21 +607,23 @@ def search_consumers_by_zone(
                    FROM reading_schedule rs
                    WHERE rs.zone_name = z.name
                      AND rs.meter_reader_id = ?
-                     AND date(rs.schedule_date) = date(?)
+                     AND date(rs.schedule_date) >= date(?)
+                     AND date(rs.schedule_date) <= date(?)
                      AND rs.status IN ('Scheduled', 'In Progress')
                )
         """
-        params.extend([effective_reader_id, effective_date])
+        params.extend([effective_reader_id, month_start, month_end])
     if unread_only:
         if use_schedule_filter:
             sql += """
                AND NOT EXISTS (
                    SELECT 1 FROM readings r
                    WHERE r.consumer_id = c.id
-                     AND date(r.reading_date) = date(?)
+                     AND date(r.reading_date) >= date(?)
+                     AND date(r.reading_date) <= date(?)
                )
             """
-            params.append(effective_date)
+            params.extend([month_start, month_end])
         else:
             sql += """
                AND NOT EXISTS (
@@ -798,6 +816,7 @@ def get_zone_stats(
     """Return per-zone progress stats: {zone_name: {households, read, flagged}}."""
     conn = get_connection()
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
     stats = {}
     if use_schedule_filter:
         zones = conn.execute(
@@ -806,11 +825,12 @@ def get_zone_stats(
             FROM zones z
             JOIN reading_schedule rs ON rs.zone_name = z.name
             WHERE rs.meter_reader_id = ?
-              AND date(rs.schedule_date) = date(?)
+              AND date(rs.schedule_date) >= date(?)
+              AND date(rs.schedule_date) <= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
             ORDER BY z.name
             """,
-            (effective_reader_id, effective_date),
+            (effective_reader_id, month_start, month_end),
         ).fetchall()
     else:
         zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
@@ -825,17 +845,19 @@ def get_zone_stats(
                    FROM readings r
                    JOIN consumers c ON r.consumer_id = c.id
                    WHERE c.zone_id = ?
-                     AND date(r.reading_date) = date(?)""",
-                (z["id"], effective_date),
+                     AND date(r.reading_date) >= date(?)
+                     AND date(r.reading_date) <= date(?)""",
+                (z["id"], month_start, month_end),
             ).fetchone()[0]
             flagged = conn.execute(
                 """SELECT COUNT(*)
                    FROM readings r
                    JOIN consumers c ON r.consumer_id = c.id
                    WHERE c.zone_id = ?
-                     AND date(r.reading_date) = date(?)
+                     AND date(r.reading_date) >= date(?)
+                     AND date(r.reading_date) <= date(?)
                      AND r.is_flagged = 1""",
-                (z["id"], effective_date),
+                (z["id"], month_start, month_end),
             ).fetchone()[0]
         else:
             read = conn.execute(
@@ -864,6 +886,7 @@ def get_all_zone_names(
     """Return a sorted list of zone names."""
     conn = get_connection()
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
     if use_schedule_filter:
         rows = conn.execute(
             """
@@ -871,11 +894,12 @@ def get_all_zone_names(
             FROM zones z
             JOIN reading_schedule rs ON rs.zone_name = z.name
             WHERE rs.meter_reader_id = ?
-              AND date(rs.schedule_date) = date(?)
+              AND date(rs.schedule_date) >= date(?)
+              AND date(rs.schedule_date) <= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
             ORDER BY z.name
             """,
-            (effective_reader_id, effective_date),
+            (effective_reader_id, month_start, month_end),
         ).fetchall()
     else:
         rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
@@ -891,6 +915,7 @@ def get_zone_consumers_with_status(
     """Return all consumers in a zone with their reading status."""
     conn = get_connection()
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
     if use_schedule_filter:
         sql = """SELECT 
             c.id,
@@ -929,7 +954,8 @@ def get_zone_consumers_with_status(
                SELECT * FROM readings
                WHERE id IN (
                    SELECT MAX(id) FROM readings
-                   WHERE date(reading_date) = date(?)
+                   WHERE date(reading_date) >= date(?)
+                     AND date(reading_date) <= date(?)
                    GROUP BY consumer_id
                )
            ) r ON c.id = r.consumer_id
@@ -939,11 +965,12 @@ def get_zone_consumers_with_status(
                  FROM reading_schedule rs
                  WHERE rs.zone_name = z.name
                    AND rs.meter_reader_id = ?
-                   AND date(rs.schedule_date) = date(?)
+                   AND date(rs.schedule_date) >= date(?)
+                   AND date(rs.schedule_date) <= date(?)
                    AND rs.status IN ('Scheduled', 'In Progress')
              )
            ORDER BY c.meter_no"""
-        params = (effective_date, zone_name, effective_reader_id, effective_date)
+        params = (month_start, month_end, zone_name, effective_reader_id, month_start, month_end)
     else:
         sql = """SELECT 
             c.id,
