@@ -354,8 +354,8 @@ class AppBridge(QObject):
         self._last_sync = "Never"
         self._last_pull_mirror = 0
         self._last_pull_count = 0
-        self._auto_pull_enabled = True
-        self._auto_push_enabled = True
+        self._auto_pull_enabled = False
+        self._auto_push_enabled = False
         self._pull_interval = max(300, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "300000")) // 1000)
         self._sync_logs = "No sync activity yet."
         self._supabase_logs = "No Supabase activity yet."
@@ -401,10 +401,6 @@ class AppBridge(QObject):
         self._wifi_scan_timer.setInterval(15_000)
         self._wifi_scan_timer.timeout.connect(self.refreshWifiNetworks)
         self._wifi_scan_timer.start()
-
-        self._auto_pull_timer = QTimer(self)
-        self._auto_pull_timer.timeout.connect(self._run_auto_pull)
-        self._reset_auto_pull_timer()
 
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -728,23 +724,22 @@ class AppBridge(QObject):
 
     @Property(bool, notify=autoPullEnabledChanged)
     def autoPullEnabled(self) -> bool:
-        return self._auto_pull_enabled
+        return False
 
     @autoPullEnabled.setter
     def autoPullEnabled(self, val: bool) -> None:
-        if self._auto_pull_enabled != val:
-            self._auto_pull_enabled = val
+        if self._auto_pull_enabled:
+            self._auto_pull_enabled = False
             self.autoPullEnabledChanged.emit()
-            self._reset_auto_pull_timer()
 
     @Property(bool, notify=autoPushEnabledChanged)
     def autoPushEnabled(self) -> bool:
-        return self._auto_push_enabled
+        return False
 
     @autoPushEnabled.setter
     def autoPushEnabled(self, val: bool) -> None:
-        if self._auto_push_enabled != val:
-            self._auto_push_enabled = val
+        if self._auto_push_enabled:
+            self._auto_push_enabled = False
             self.autoPushEnabledChanged.emit()
 
     @Property(int, notify=pullIntervalChanged)
@@ -757,7 +752,6 @@ class AppBridge(QObject):
         if self._pull_interval != normalized:
             self._pull_interval = normalized
             self.pullIntervalChanged.emit()
-            self._reset_auto_pull_timer()
 
     @Property(str, notify=syncLogsChanged)
     def syncLogs(self) -> str:
@@ -868,7 +862,6 @@ class AppBridge(QObject):
                 self._emit_sync_state()
                 return
             self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
-            self._sync_dal.start_sync_worker(interval_seconds=max(300, self._pull_interval))
             self._refresh_sync_snapshot()
         except Exception as exc:
             self._sync_dal = None
@@ -925,11 +918,7 @@ class AppBridge(QObject):
         self._emit_sync_state()
 
     def _reset_auto_pull_timer(self) -> None:
-        if not hasattr(self, "_auto_pull_timer"):
-            return
-        self._auto_pull_timer.stop()
-        if self._auto_pull_enabled:
-            self._auto_pull_timer.start(max(300, self._pull_interval) * 1000)
+        return
 
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
@@ -958,18 +947,7 @@ class AppBridge(QObject):
         self.update_stats()
 
     def _run_auto_pull(self) -> None:
-        if not self._auto_pull_enabled or not self._sync_dal or not self._meter_reader_account_id or self._operation_busy:
-            return
-
-        def _task() -> None:
-            try:
-                consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
-                mirrored = replace_consumers_from_sync(consumers)
-                self.syncTaskFinished.emit({"kind": "pull", "pulled": len(consumers), "mirrored": mirrored})
-            except Exception as exc:
-                self.syncTaskFinished.emit({"kind": "error", "error": str(exc), "silent": True})
-
-        threading.Thread(target=_task, daemon=True).start()
+        return
 
     def _reload_current_consumer_from_db(self) -> None:
         if not self._consumer:
@@ -1059,7 +1037,7 @@ class AppBridge(QObject):
         flagged: bool,
         reading_date: str | None = None,
     ) -> None:
-        if not self._sync_dal or not self._auto_push_enabled:
+        if not self._sync_dal:
             return
         consumer = self._consumer or {}
         payload = {
@@ -1093,11 +1071,11 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                self._sync_dal.saveMeterReading(payload)
+                self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
-                self._sync_logs = f"Sync save failed: {exc}"
+                self._sync_logs = f"Queue save failed: {exc}"
                 self._supabase_status = "Sync Failed"
-                self._supabase_logs = f"Supabase push failed: {exc}"
+                self._supabase_logs = f"Local queue failed: {exc}"
                 self.syncLogsChanged.emit()
                 self.supabaseStatusChanged.emit()
                 self.supabaseLogsChanged.emit()
@@ -1593,11 +1571,7 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 result = self._sync_dal.syncPendingReadings(include_main_pg=True)
-                mirrored = 0
-                if result.get("status") != "offline":
-                    consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
-                    mirrored = replace_consumers_from_sync(consumers)
-                self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": mirrored})
+                self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": 0})
             except Exception as exc:
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
 
@@ -1893,11 +1867,8 @@ class AppBridge(QObject):
                             f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending Supabase sync."
                         )
                         return
-
-                    consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
-                    mirrored = replace_consumers_from_sync(consumers)
                     self.syncTaskFinished.emit(
-                        {"kind": "sync", "result": result, "mirrored": mirrored, "silent": True, "keep_busy": True}
+                        {"kind": "sync", "result": result, "mirrored": 0, "silent": True, "keep_busy": True}
                     )
             except Exception as exc:
                 self.powerOffFailed.emit(

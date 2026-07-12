@@ -154,6 +154,13 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "queued")
         self.assertEqual(len(self.local.list_pending()), 1)
 
+    def test_manual_queue_does_not_upload_until_sync(self):
+        self.remote.online = True
+        result = self.dal.queueMeterReading({"consumer_id": 1, "present_reading": 100, "reading_date": "2026-05-08"})
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(len(self.remote.remote_rows), 0)
+        self.assertEqual(len(self.local.list_pending()), 1)
+
     def test_reconnect_sync_flushes_queue(self):
         self.remote.online = False
         self.dal.saveMeterReading({"consumer_id": 2, "present_reading": 120, "reading_date": "2026-05-08"})

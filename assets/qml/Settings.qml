@@ -237,34 +237,32 @@ Rectangle {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: settingsRoot.compactScreen ? 10 : 12
-                            CustomSwitch {
-                                labelText: "Auto Pull from Main DB (online)"
-                                checked: bridgeObj ? bridgeObj.autoPullEnabled : true
-                                onToggled: { if (bridgeObj) bridgeObj.autoPullEnabled = checked }
-                            }
-                            CustomSwitch {
-                                labelText: "Auto Push New Readings"
-                                checked: bridgeObj ? bridgeObj.autoPushEnabled : true
-                                onToggled: { if (bridgeObj) bridgeObj.autoPushEnabled = checked }
-                            }
-                            RowLayout {
+                            Rectangle {
                                 Layout.fillWidth: true
-                                spacing: settingsRoot.compactScreen ? 8 : 12
-                                Text { text: "Pull interval (sec):"; color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                                TextField {
-                                    id: txtInterval
-                                    property string keyboardMode: "numeric"
-                                    Layout.preferredWidth: settingsRoot.compactScreen ? 84 : 108
-                                    implicitHeight: settingsRoot.compactScreen ? TouchMetrics.compactInputHeight : TouchMetrics.inputHeight
-                                    text: bridgeObj ? bridgeObj.pullInterval : 60
-                                    inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
-                                    validator: IntValidator { bottom: 15 }
-                                    horizontalAlignment: Text.AlignHCenter
-                                    color: "#111827"
-                                    font.family: "Montserrat"
-                                    font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
-                                    background: Rectangle { radius: 7; color: "#F8FAFD"; border.color: txtInterval.activeFocus ? "#60A5FA" : "#C9D5E3" }
-                                    onEditingFinished: { if (bridgeObj && text.length) bridgeObj.pullInterval = parseInt(text) }
+                                radius: 10
+                                color: "#F8FAFD"
+                                border.color: "#D8E1EC"
+                                implicitHeight: manualSyncColumn.implicitHeight + 24
+                                ColumnLayout {
+                                    id: manualSyncColumn
+                                    anchors.fill: parent
+                                    anchors.margins: 12
+                                    spacing: 6
+                                    Text {
+                                        text: "Manual Sync Only"
+                                        color: "#111827"
+                                        font.family: "Montserrat"
+                                        font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.bodyText : TouchMetrics.subheading
+                                        font.bold: true
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        text: "Readings are saved locally on the device and uploaded only when Manual Sync is tapped. Schedule downloads happen on login and manual refresh."
+                                        color: "#526176"
+                                        font.family: "Montserrat"
+                                        font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                    }
                                 }
                             }
                         }

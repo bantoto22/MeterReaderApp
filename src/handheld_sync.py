@@ -2230,6 +2230,13 @@ class HandheldSyncDataAccess:
             main_pg_status="pending" if self.main_pg else "skipped",
         )
 
+    def queueMeterReading(self, payload: dict) -> dict:
+        reading = self._normalize_reading(payload)
+        reading = self._overlay_main_pg_rates_for_reading(reading)
+        queued = self._queue_for_sync("create", reading)
+        self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
+        return {"status": "queued", "queue": queued, "reading": reading}
+
     def saveMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
         reading = self._overlay_main_pg_rates_for_reading(reading)
