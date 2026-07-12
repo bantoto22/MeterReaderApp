@@ -3431,6 +3431,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             consumption = present - previous
             exception = self.exception_var.get()
             is_flagged = (consumption > HIGH_CONSUMPTION_THRESHOLD) or (exception != "None")
+            consumer_snapshot = dict(self._current_consumer)
 
             # Save to database first
             reading_id = save_reading(self._current_consumer["id"], present, consumption, exception, is_flagged)
@@ -3438,7 +3439,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
             # Store for reprint
             self._last_receipt_data = {
-                "consumer": dict(self._current_consumer),
+                "consumer": consumer_snapshot,
                 "reading_id": reading_id,
                 "present": present,
                 "previous": previous,
@@ -3464,6 +3465,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _do_save_to_db(self):
         """Run on a background thread – saves the reading to SQLite."""
         consumer = self._current_consumer
+        consumer_snapshot = dict(consumer)
         present = int(self.present_var.get())
         previous = consumer["previous_reading"]
         consumption = present - previous
@@ -3476,7 +3478,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._current_consumer["previous_reading"] = present
         # Store for potential reprint
         self._last_receipt_data = {
-            "consumer": dict(consumer),
+            "consumer": consumer_snapshot,
             "reading_id": reading_id,
             "present": present,
             "previous": previous,
@@ -3557,7 +3559,8 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                 "name": entry.get("consumer_name"),
                 "meter_no": entry.get("meter_no"),
                 "zone_name": entry.get("zone_name"),
-                "previous_reading": entry.get("present_reading"),
+                "previous_reading": entry.get("previous_reading"),
+                "last_present_reading": entry.get("present_reading"),
                 "_original_previous": entry.get("previous_reading"),
             },
             "reading_id": entry.get("reading_id"),
@@ -3572,6 +3575,10 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
     def _persist_receipt_print(self, consumer, previous, present, exception, reader_name, receipt_text, print_action, reading_id=None):
         consumption = present - previous
+        consumer_snapshot = dict(consumer)
+        consumer_snapshot["previous_reading"] = previous
+        consumer_snapshot["_original_previous"] = previous
+        consumer_snapshot["last_present_reading"] = present
         saved_id = save_receipt_print(
             consumer["id"],
             receipt_text,
@@ -3589,7 +3596,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         )
         self._last_receipt_data = {
             "id": saved_id,
-            "consumer": dict(consumer),
+            "consumer": consumer_snapshot,
             "reading_id": reading_id,
             "present": present,
             "previous": previous,
