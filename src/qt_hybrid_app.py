@@ -324,12 +324,15 @@ class AppBridge(QObject):
         self._operation_busy_message = ""
         self._last_receipt_entry = get_latest_receipt_print()
         self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
-        
-        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
+
+        self._billing_month_offsets = [0, 1]
+        self._selected_billing_month_offset = 0
+
+        self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
         self._selected_zone = self._zones[0] if self._zones else ""
         self._search_query = ""
         self._search_unread_only = False
-        
+
         self._account_no = "-"
         self._consumer_name = "-"
         self._previous_reading = "-"
@@ -337,9 +340,7 @@ class AppBridge(QObject):
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
-        self._billing_month_offsets = [0, 1]
-        self._selected_billing_month_offset = 0
-        
+
         self._exceptions = ["None", "Stuck Meter", "Leaking", "No Access", "Broken Seal"]
         self._selected_exception = "None"
 
