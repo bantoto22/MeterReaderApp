@@ -1427,10 +1427,6 @@ class AppBridge(QObject):
         self._search_query = meter_no
         self.searchQueryChanged.emit()
         self._refresh_search_suggestions()
-        target_offset = 1 if row.get("is_read") else 0
-        if self._selected_billing_month_offset != target_offset:
-            self._selected_billing_month_offset = target_offset
-            self.selectedBillingMonthChanged.emit()
         self._load_consumer_for_new_bill(consumer)
 
     @Slot()
