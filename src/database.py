@@ -5,6 +5,7 @@ Uses Python's built-in sqlite3 module (no extra install needed).
 
 import os
 import sqlite3
+from datetime import date
 from decimal import Decimal
 
 sqlite3.register_adapter(Decimal, float)
@@ -128,6 +129,18 @@ def init_db():
             account_status TEXT,
             last_login_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS reading_schedule (
+            schedule_id INTEGER PRIMARY KEY,
+            schedule_date TEXT NOT NULL,
+            remote_zone_id INTEGER,
+            zone_name TEXT NOT NULL,
+            meter_reader_id INTEGER,
+            meter_reader_name TEXT,
+            meter_reader_contact TEXT,
+            status TEXT NOT NULL DEFAULT 'Scheduled',
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     _ensure_columns(
@@ -153,6 +166,20 @@ def init_db():
             "total_after_due_date": "REAL",
             "bill_status": "TEXT",
             "late_fee": "REAL",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "reading_schedule",
+        {
+            "schedule_date": "TEXT",
+            "remote_zone_id": "INTEGER",
+            "zone_name": "TEXT",
+            "meter_reader_id": "INTEGER",
+            "meter_reader_name": "TEXT",
+            "meter_reader_contact": "TEXT",
+            "status": "TEXT",
+            "updated_at": "DATETIME DEFAULT CURRENT_TIMESTAMP",
         },
     )
 
@@ -329,69 +356,192 @@ def clear_current_meter_reader() -> None:
     conn.close()
 
 
+def _normalize_schedule_date(value) -> str | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    return raw.split("T", 1)[0].split(" ", 1)[0]
+
+
+def _effective_schedule_context(
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> tuple[str | None, int | None, bool]:
+    effective_reader_id = meter_reader_id
+    if effective_reader_id in (None, ""):
+        current = get_current_meter_reader() or {}
+        effective_reader_id = current.get("account_id")
+    try:
+        reader_id_int = int(effective_reader_id) if effective_reader_id not in (None, "") else None
+    except (TypeError, ValueError):
+        reader_id_int = None
+    if reader_id_int is None:
+        return _normalize_schedule_date(schedule_date), None, False
+    normalized_date = _normalize_schedule_date(schedule_date)
+    if normalized_date is None:
+        normalized_date = date.today().isoformat()
+    return normalized_date, reader_id_int, True
+
+
+def replace_reading_schedules_from_sync(
+    schedules: list[dict],
+    meter_reader_id: int | str | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> int:
+    normalized_from = _normalize_schedule_date(date_from)
+    normalized_to = _normalize_schedule_date(date_to)
+    try:
+        reader_id_int = int(meter_reader_id) if meter_reader_id not in (None, "") else None
+    except (TypeError, ValueError):
+        reader_id_int = None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    if reader_id_int is not None and normalized_from and normalized_to:
+        cur.execute(
+            """
+            DELETE FROM reading_schedule
+            WHERE meter_reader_id = ?
+              AND date(schedule_date) >= date(?)
+              AND date(schedule_date) <= date(?)
+            """,
+            (reader_id_int, normalized_from, normalized_to),
+        )
+
+    upserted = 0
+    for row in schedules or []:
+        if not isinstance(row, dict):
+            continue
+        schedule_id = row.get("Schedule_ID", row.get("schedule_id"))
+        schedule_date = _normalize_schedule_date(row.get("Schedule_Date", row.get("schedule_date")))
+        remote_zone_id = row.get("Zone_ID", row.get("zone_id"))
+        zone_name = str(row.get("Zone_Name", row.get("zone_name")) or "").strip()
+        meter_reader_value = row.get("Meter_Reader_ID", row.get("meter_reader_id", reader_id_int))
+        meter_reader_name = row.get("Meter_Reader_Name", row.get("meter_reader_name"))
+        meter_reader_contact = row.get("Meter_Reader_Contact", row.get("meter_reader_contact"))
+        status = str(row.get("Status", row.get("status")) or "Scheduled").strip() or "Scheduled"
+        try:
+            schedule_id_int = int(schedule_id)
+        except (TypeError, ValueError):
+            continue
+        try:
+            remote_zone_id_int = int(remote_zone_id) if remote_zone_id not in (None, "") else None
+        except (TypeError, ValueError):
+            remote_zone_id_int = None
+        try:
+            meter_reader_id_int = int(meter_reader_value) if meter_reader_value not in (None, "") else reader_id_int
+        except (TypeError, ValueError):
+            meter_reader_id_int = reader_id_int
+        if not schedule_date or not zone_name:
+            continue
+        cur.execute(
+            """
+            INSERT INTO reading_schedule (
+                schedule_id, schedule_date, remote_zone_id, zone_name, meter_reader_id,
+                meter_reader_name, meter_reader_contact, status, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(schedule_id) DO UPDATE SET
+                schedule_date = excluded.schedule_date,
+                remote_zone_id = excluded.remote_zone_id,
+                zone_name = excluded.zone_name,
+                meter_reader_id = excluded.meter_reader_id,
+                meter_reader_name = excluded.meter_reader_name,
+                meter_reader_contact = excluded.meter_reader_contact,
+                status = excluded.status,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                schedule_id_int,
+                schedule_date,
+                remote_zone_id_int,
+                zone_name,
+                meter_reader_id_int,
+                meter_reader_name,
+                meter_reader_contact,
+                status,
+            ),
+        )
+        upserted += 1
+
+    conn.commit()
+    conn.close()
+    return upserted
+
+
 # ─── Query helpers ────────────────────────────────────────────────────────────
 
-def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
+def search_consumer(
+    meter_no: str,
+    unread_only: bool = True,
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> dict | None:
     """Look up a consumer by meter/account/name. Returns dict or None."""
     conn = get_connection()
     normalized = "".join(ch for ch in str(meter_no or "") if ch.isalnum())
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
+                    c.classification_id, c.classification_name, c.minimum_cubic,
+                    c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                    c.billing_month, c.date_covered_from, c.date_covered_to,
+                    c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                    c.bill_status, c.late_fee,
+                    z.name AS zone_name
+             FROM consumers c
+             JOIN zones z ON c.zone_id = z.id
+             WHERE (
+                 c.meter_no = ?
+                 OR c.acct_no = ?
+                 OR c.name = ?
+                 OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ?
+                 OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
+             )"""
+    params: list[object] = [meter_no, meter_no, meter_no, normalized, normalized]
+    if use_schedule_filter:
+        sql += """
+               AND EXISTS (
+                   SELECT 1
+                   FROM reading_schedule rs
+                   WHERE rs.zone_name = z.name
+                     AND rs.meter_reader_id = ?
+                     AND date(rs.schedule_date) = date(?)
+                     AND rs.status IN ('Scheduled', 'In Progress')
+               )
+        """
+        params.extend([effective_reader_id, effective_date])
     if unread_only:
-        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                        c.classification_id, c.classification_name, c.minimum_cubic,
-                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.billing_month, c.date_covered_from, c.date_covered_to,
-                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
-                 FROM consumers c
-                 JOIN zones z ON c.zone_id = z.id
-                 WHERE (
-                     c.meter_no = ?
-                     OR c.acct_no = ?
-                     OR c.name = ?
-                     OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ?
-                     OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
-                 )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM readings r WHERE r.consumer_id = c.id
-                   )
-                 ORDER BY CASE
-                     WHEN c.meter_no = ? THEN 0
-                     WHEN c.acct_no = ? THEN 1
-                     WHEN c.name = ? THEN 2
-                     WHEN REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ? THEN 3
-                     WHEN REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ? THEN 4
-                     ELSE 5
-                 END
-                 LIMIT 1"""
-    else:
-        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                        c.classification_id, c.classification_name, c.minimum_cubic,
-                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.billing_month, c.date_covered_from, c.date_covered_to,
-                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
-                 FROM consumers c
-                 JOIN zones z ON c.zone_id = z.id
-                 WHERE (
-                     c.meter_no = ?
-                     OR c.acct_no = ?
-                     OR c.name = ?
-                     OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ?
-                     OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
-                 )
-                 ORDER BY CASE
-                     WHEN c.meter_no = ? THEN 0
-                     WHEN c.acct_no = ? THEN 1
-                     WHEN c.name = ? THEN 2
-                     WHEN REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ? THEN 3
-                     WHEN REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ? THEN 4
-                     ELSE 5
-                 END
-                 LIMIT 1"""
+        if use_schedule_filter:
+            sql += """
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM readings r
+                   WHERE r.consumer_id = c.id
+                     AND date(r.reading_date) = date(?)
+               )
+            """
+            params.append(effective_date)
+        else:
+            sql += """
+               AND NOT EXISTS (
+                   SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+               )
+            """
+    sql += """
+             ORDER BY CASE
+                 WHEN c.meter_no = ? THEN 0
+                 WHEN c.acct_no = ? THEN 1
+                 WHEN c.name = ? THEN 2
+                 WHEN REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') = ? THEN 3
+                 WHEN REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ? THEN 4
+                 ELSE 5
+             END
+             LIMIT 1"""
     params = (
-        meter_no, meter_no, meter_no, normalized, normalized,
+        *params,
         meter_no, meter_no, meter_no, normalized, normalized,
     )
     row = conn.execute(sql, params).fetchone()
@@ -402,59 +552,69 @@ def search_consumer(meter_no: str, unread_only: bool = True) -> dict | None:
 
 
 
-def search_consumers_by_zone(query: str, zone_name: str, limit: int = 8, unread_only: bool = True) -> list[dict]:
+def search_consumers_by_zone(
+    query: str,
+    zone_name: str,
+    limit: int = 8,
+    unread_only: bool = True,
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> list[dict]:
     """Search consumers by partial meter_no or name, filtered to a specific zone."""
     conn = get_connection()
     like_pattern = f"%{query}%"
     normalized = "".join(ch for ch in str(query or "") if ch.isalnum())
     normalized_like = f"%{normalized}%"
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
+                    c.classification_id, c.classification_name, c.minimum_cubic,
+                    c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                    c.billing_month, c.date_covered_from, c.date_covered_to,
+                    c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                    c.bill_status, c.late_fee,
+                    z.name AS zone_name
+             FROM consumers c
+             JOIN zones z ON c.zone_id = z.id
+             WHERE z.name = ?
+               AND (
+                   c.meter_no LIKE ?
+                   OR c.acct_no LIKE ?
+                   OR c.name LIKE ?
+                   OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') LIKE ?
+                   OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
+               )"""
+    params: list[object] = [zone_name, like_pattern, like_pattern, like_pattern, normalized_like, normalized_like]
+    if use_schedule_filter:
+        sql += """
+               AND EXISTS (
+                   SELECT 1
+                   FROM reading_schedule rs
+                   WHERE rs.zone_name = z.name
+                     AND rs.meter_reader_id = ?
+                     AND date(rs.schedule_date) = date(?)
+                     AND rs.status IN ('Scheduled', 'In Progress')
+               )
+        """
+        params.extend([effective_reader_id, effective_date])
     if unread_only:
-        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                        c.classification_id, c.classification_name, c.minimum_cubic,
-                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.billing_month, c.date_covered_from, c.date_covered_to,
-                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
-                 FROM consumers c
-                 JOIN zones z ON c.zone_id = z.id
-                 WHERE z.name = ?
-                   AND (
-                       c.meter_no LIKE ?
-                       OR c.acct_no LIKE ?
-                       OR c.name LIKE ?
-                       OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') LIKE ?
-                       OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM readings r WHERE r.consumer_id = c.id
-                   )
-                 ORDER BY c.meter_no
-                 LIMIT ?"""
-    else:
-        sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                        c.classification_id, c.classification_name, c.minimum_cubic,
-                        c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
-                        c.billing_month, c.date_covered_from, c.date_covered_to,
-                        c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
-                        c.bill_status, c.late_fee,
-                        z.name AS zone_name
-                 FROM consumers c
-                 JOIN zones z ON c.zone_id = z.id
-                 WHERE z.name = ?
-                   AND (
-                       c.meter_no LIKE ?
-                       OR c.acct_no LIKE ?
-                       OR c.name LIKE ?
-                       OR REPLACE(REPLACE(c.meter_no, '-', ''), ' ', '') LIKE ?
-                       OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
-                   )
-                 ORDER BY c.meter_no
-                 LIMIT ?"""
-    rows = conn.execute(
-        sql,
-        (zone_name, like_pattern, like_pattern, like_pattern, normalized_like, normalized_like, limit),
-    ).fetchall()
+        if use_schedule_filter:
+            sql += """
+               AND NOT EXISTS (
+                   SELECT 1 FROM readings r
+                   WHERE r.consumer_id = c.id
+                     AND date(r.reading_date) = date(?)
+               )
+            """
+            params.append(effective_date)
+        else:
+            sql += """
+               AND NOT EXISTS (
+                   SELECT 1 FROM readings r WHERE r.consumer_id = c.id
+               )
+            """
+    sql += " ORDER BY c.meter_no LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -631,31 +791,65 @@ def get_receipt_print_by_id(receipt_print_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_zone_stats() -> dict:
+def get_zone_stats(
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> dict:
     """Return per-zone progress stats: {zone_name: {households, read, flagged}}."""
     conn = get_connection()
-
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     stats = {}
-    zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
+    if use_schedule_filter:
+        zones = conn.execute(
+            """
+            SELECT DISTINCT z.id, z.name
+            FROM zones z
+            JOIN reading_schedule rs ON rs.zone_name = z.name
+            WHERE rs.meter_reader_id = ?
+              AND date(rs.schedule_date) = date(?)
+              AND rs.status IN ('Scheduled', 'In Progress')
+            ORDER BY z.name
+            """,
+            (effective_reader_id, effective_date),
+        ).fetchall()
+    else:
+        zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
 
     for z in zones:
         total = conn.execute(
             "SELECT COUNT(*) FROM consumers WHERE zone_id = ?", (z["id"],)
         ).fetchone()[0]
-
-        read = conn.execute(
-            """SELECT COUNT(DISTINCT r.consumer_id)
-               FROM readings r
-               JOIN consumers c ON r.consumer_id = c.id
-               WHERE c.zone_id = ?""", (z["id"],)
-        ).fetchone()[0]
-
-        flagged = conn.execute(
-            """SELECT COUNT(*)
-               FROM readings r
-               JOIN consumers c ON r.consumer_id = c.id
-               WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
-        ).fetchone()[0]
+        if use_schedule_filter:
+            read = conn.execute(
+                """SELECT COUNT(DISTINCT r.consumer_id)
+                   FROM readings r
+                   JOIN consumers c ON r.consumer_id = c.id
+                   WHERE c.zone_id = ?
+                     AND date(r.reading_date) = date(?)""",
+                (z["id"], effective_date),
+            ).fetchone()[0]
+            flagged = conn.execute(
+                """SELECT COUNT(*)
+                   FROM readings r
+                   JOIN consumers c ON r.consumer_id = c.id
+                   WHERE c.zone_id = ?
+                     AND date(r.reading_date) = date(?)
+                     AND r.is_flagged = 1""",
+                (z["id"], effective_date),
+            ).fetchone()[0]
+        else:
+            read = conn.execute(
+                """SELECT COUNT(DISTINCT r.consumer_id)
+                   FROM readings r
+                   JOIN consumers c ON r.consumer_id = c.id
+                   WHERE c.zone_id = ?""", (z["id"],)
+            ).fetchone()[0]
+            flagged = conn.execute(
+                """SELECT COUNT(*)
+                   FROM readings r
+                   JOIN consumers c ON r.consumer_id = c.id
+                   WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
+            ).fetchone()[0]
 
         stats[z["name"]] = {"households": total, "read": read, "flagged": flagged}
 
@@ -663,20 +857,95 @@ def get_zone_stats() -> dict:
     return stats
 
 
-def get_all_zone_names() -> list[str]:
+def get_all_zone_names(
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> list[str]:
     """Return a sorted list of zone names."""
     conn = get_connection()
-    rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    if use_schedule_filter:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT z.name
+            FROM zones z
+            JOIN reading_schedule rs ON rs.zone_name = z.name
+            WHERE rs.meter_reader_id = ?
+              AND date(rs.schedule_date) = date(?)
+              AND rs.status IN ('Scheduled', 'In Progress')
+            ORDER BY z.name
+            """,
+            (effective_reader_id, effective_date),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
     conn.close()
     return [r["name"] for r in rows]
 
 
-def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
+def get_zone_consumers_with_status(
+    zone_name: str,
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> list[dict]:
     """Return all consumers in a zone with their reading status."""
     conn = get_connection()
-    
-    rows = conn.execute(
-        """SELECT 
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    if use_schedule_filter:
+        sql = """SELECT 
+            c.id,
+            c.meter_no,
+            c.acct_no,
+            c.name,
+            c.address,
+            c.previous_reading,
+            c.classification_id,
+            c.classification_name,
+            c.minimum_cubic,
+            c.minimum_rate,
+            c.excess_rate_per_cubic,
+            c.due_days,
+            c.penalty_percent,
+            c.billing_month,
+            c.date_covered_from,
+            c.date_covered_to,
+            c.amount_due,
+            c.previous_balance,
+            c.due_date,
+            c.penalty,
+            c.previous_penalty,
+            c.total_after_due_date,
+            c.bill_status,
+            c.late_fee,
+            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
+            r.present_reading as reading_value,
+            r.consumption,
+            r.reading_date,
+            r.exception,
+            r.is_flagged
+           FROM consumers c
+           JOIN zones z ON c.zone_id = z.id
+           LEFT JOIN (
+               SELECT * FROM readings
+               WHERE id IN (
+                   SELECT MAX(id) FROM readings
+                   WHERE date(reading_date) = date(?)
+                   GROUP BY consumer_id
+               )
+           ) r ON c.id = r.consumer_id
+           WHERE z.name = ?
+             AND EXISTS (
+                 SELECT 1
+                 FROM reading_schedule rs
+                 WHERE rs.zone_name = z.name
+                   AND rs.meter_reader_id = ?
+                   AND date(rs.schedule_date) = date(?)
+                   AND rs.status IN ('Scheduled', 'In Progress')
+             )
+           ORDER BY c.meter_no"""
+        params = (effective_date, zone_name, effective_reader_id, effective_date)
+    else:
+        sql = """SELECT 
             c.id,
             c.meter_no,
             c.acct_no,
@@ -716,10 +985,9 @@ def get_zone_consumers_with_status(zone_name: str) -> list[dict]:
                )
            ) r ON c.id = r.consumer_id
            WHERE z.name = ?
-           ORDER BY c.meter_no""",
-        (zone_name,)
-    ).fetchall()
-    
+           ORDER BY c.meter_no"""
+        params = (zone_name,)
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

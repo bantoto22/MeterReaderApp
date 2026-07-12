@@ -325,7 +325,7 @@ class AppBridge(QObject):
         self._last_receipt_entry = get_latest_receipt_print()
         self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
         
-        self._zones = get_all_zone_names()
+        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
         self._selected_zone = self._zones[0] if self._zones else ""
         self._search_query = ""
         self._search_unread_only = False
@@ -530,6 +530,8 @@ class AppBridge(QObject):
                 self._selected_zone,
                 limit=6,
                 unread_only=self._search_unread_only,
+                schedule_date=self.selectedBillingDate,
+                meter_reader_id=self._meter_reader_account_id or None,
             )
         except Exception:
             self._search_suggestions = []
@@ -542,7 +544,11 @@ class AppBridge(QObject):
             return
 
         try:
-            self._zone_consumers = get_zone_consumers_with_status(self._selected_zone)
+            self._zone_consumers = get_zone_consumers_with_status(
+                self._selected_zone,
+                schedule_date=self.selectedBillingDate,
+                meter_reader_id=self._meter_reader_account_id or None,
+            )
         except Exception:
             self._zone_consumers = []
         self.zoneConsumersChanged.emit()
@@ -646,6 +652,15 @@ class AppBridge(QObject):
         if self._selected_billing_month_offset != offset:
             self._selected_billing_month_offset = offset
             self.selectedBillingMonthChanged.emit()
+            self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
+            if self._selected_zone not in self._zones:
+                self._selected_zone = self._zones[0] if self._zones else ""
+                self.selectedZoneChanged.emit()
+            self.zonesChanged.emit()
+            self.update_stats()
+            self._refresh_search_suggestions()
+            if self._progress_details_visible:
+                self._refresh_zone_consumers()
 
     @Property(str, notify=selectedBillingMonthChanged)
     def selectedBillingDate(self) -> str:
@@ -918,7 +933,7 @@ class AppBridge(QObject):
 
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
-            self._zones = get_all_zone_names()
+            self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
             self._selected_zone = self._zones[0] if self._zones else ""
             self.zonesChanged.emit()
             self.selectedZoneChanged.emit()
@@ -933,7 +948,7 @@ class AppBridge(QObject):
             except Exception as exc:
                 self._sync_logs = f"Assigned schedule refresh failed: {exc}"
                 self.syncLogsChanged.emit()
-        self._zones = get_all_zone_names()
+        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
         if self._selected_zone not in self._zones:
             self._selected_zone = self._zones[0] if self._zones else ""
         self.zonesChanged.emit()
@@ -962,7 +977,12 @@ class AppBridge(QObject):
         meter_no = (self._consumer.get("meter_no") or "").strip()
         if not meter_no:
             return
-        refreshed = search_consumer(meter_no, unread_only=False)
+        refreshed = search_consumer(
+            meter_no,
+            unread_only=False,
+            schedule_date=self.selectedBillingDate,
+            meter_reader_id=self._meter_reader_account_id or None,
+        )
         if refreshed is None:
             return
         self._consumer = refreshed
@@ -1288,9 +1308,21 @@ class AppBridge(QObject):
         if not query:
             return
 
-        consumer = search_consumer(query, unread_only=self._search_unread_only)
+        consumer = search_consumer(
+            query,
+            unread_only=self._search_unread_only,
+            schedule_date=self.selectedBillingDate,
+            meter_reader_id=self._meter_reader_account_id or None,
+        )
         if consumer is None:
-            matches = search_consumers_by_zone(query, self._selected_zone, limit=1, unread_only=self._search_unread_only)
+            matches = search_consumers_by_zone(
+                query,
+                self._selected_zone,
+                limit=1,
+                unread_only=self._search_unread_only,
+                schedule_date=self.selectedBillingDate,
+                meter_reader_id=self._meter_reader_account_id or None,
+            )
             consumer = matches[0] if matches else None
 
         if consumer is None:
@@ -1334,7 +1366,11 @@ class AppBridge(QObject):
 
     @Slot(int)
     def reprintZoneConsumer(self, consumer_id: int) -> None:
-        rows = get_zone_consumers_with_status(self._selected_zone)
+        rows = get_zone_consumers_with_status(
+            self._selected_zone,
+            schedule_date=self.selectedBillingDate,
+            meter_reader_id=self._meter_reader_account_id or None,
+        )
         row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
         if not row or not row.get("is_read"):
             self.alertRequested.emit("No Receipt", "No saved reading is available for this consumer.")
@@ -1388,14 +1424,23 @@ class AppBridge(QObject):
 
     @Slot(int)
     def startNewBillForZoneConsumer(self, consumer_id: int) -> None:
-        rows = get_zone_consumers_with_status(self._selected_zone)
+        rows = get_zone_consumers_with_status(
+            self._selected_zone,
+            schedule_date=self.selectedBillingDate,
+            meter_reader_id=self._meter_reader_account_id or None,
+        )
         row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
         if not row:
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
 
         meter_no = str(row.get("meter_no") or "").strip()
-        consumer = search_consumer(meter_no, unread_only=False) if meter_no else None
+        consumer = search_consumer(
+            meter_no,
+            unread_only=False,
+            schedule_date=self.selectedBillingDate,
+            meter_reader_id=self._meter_reader_account_id or None,
+        ) if meter_no else None
         if consumer is None:
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
@@ -1904,7 +1949,7 @@ class AppBridge(QObject):
 
     @Slot()
     def update_stats(self) -> None:
-        stats = get_zone_stats()
+        stats = get_zone_stats(self.selectedBillingDate, self._meter_reader_account_id or None)
         if not stats:
             self._overall_percentage = 0
             self._overall_fraction = "0/0"

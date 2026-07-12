@@ -114,6 +114,19 @@ def _reading_date(value) -> date:
     return parsed or datetime.now().date()
 
 
+def _device_schedule_window(today: date | None = None) -> tuple[str, str]:
+    anchor = today or datetime.now().date()
+    start = anchor.replace(day=1)
+    year = start.year + ((start.month) // 12)
+    month = 1 if start.month == 12 else start.month + 1
+    next_month_start = date(year, month, 1)
+    following_year = next_month_start.year + ((next_month_start.month) // 12)
+    following_month = 1 if next_month_start.month == 12 else next_month_start.month + 1
+    following_start = date(following_year, following_month, 1)
+    end = following_start - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 def _verify_password(candidate_password: str, stored_password: str | None) -> bool:
     candidate = str(candidate_password or "")
     stored = str(stored_password or "")
@@ -307,6 +320,15 @@ class SyncConfig:
 
 class LocalSyncStore:
     def ensure_schema(self) -> None:
+        raise NotImplementedError
+
+    def cache_reading_schedules(
+        self,
+        schedules: list[dict],
+        meter_reader_id: int | str | None,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> None:
         raise NotImplementedError
 
     def cache_consumers(self, consumers: list[dict]) -> None:
@@ -531,6 +553,18 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS reading_schedule (
+            schedule_id INTEGER PRIMARY KEY,
+            schedule_date TEXT NOT NULL,
+            remote_zone_id INTEGER,
+            zone_name TEXT NOT NULL,
+            meter_reader_id INTEGER,
+            meter_reader_name TEXT,
+            meter_reader_contact TEXT,
+            status TEXT NOT NULL DEFAULT 'Scheduled',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
         with self._connect() as conn:
             conn.executescript(sql)
@@ -569,6 +603,91 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "late_fee": "REAL",
                 },
             )
+            self._ensure_columns(
+                conn,
+                "reading_schedule",
+                {
+                    "schedule_date": "TEXT",
+                    "remote_zone_id": "INTEGER",
+                    "zone_name": "TEXT",
+                    "meter_reader_id": "INTEGER",
+                    "meter_reader_name": "TEXT",
+                    "meter_reader_contact": "TEXT",
+                    "status": "TEXT NOT NULL DEFAULT 'Scheduled'",
+                    "updated_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                },
+            )
+            conn.commit()
+
+    def cache_reading_schedules(
+        self,
+        schedules: list[dict],
+        meter_reader_id: int | str | None,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> None:
+        try:
+            reader_id = int(meter_reader_id) if meter_reader_id not in (None, "") else None
+        except (TypeError, ValueError):
+            reader_id = None
+        sql = """
+        INSERT INTO reading_schedule (
+            schedule_id, schedule_date, remote_zone_id, zone_name, meter_reader_id,
+            meter_reader_name, meter_reader_contact, status, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(schedule_id) DO UPDATE SET
+            schedule_date = excluded.schedule_date,
+            remote_zone_id = excluded.remote_zone_id,
+            zone_name = excluded.zone_name,
+            meter_reader_id = excluded.meter_reader_id,
+            meter_reader_name = excluded.meter_reader_name,
+            meter_reader_contact = excluded.meter_reader_contact,
+            status = excluded.status,
+            updated_at = CURRENT_TIMESTAMP
+        """
+        with self._connect() as conn:
+            if reader_id is not None and date_from and date_to:
+                conn.execute(
+                    """
+                    DELETE FROM reading_schedule
+                    WHERE meter_reader_id = ?
+                      AND date(schedule_date) >= date(?)
+                      AND date(schedule_date) <= date(?)
+                    """,
+                    (reader_id, date_from, date_to),
+                )
+            for item in schedules or []:
+                if not isinstance(item, dict):
+                    continue
+                schedule_id = item.get("Schedule_ID", item.get("schedule_id"))
+                schedule_date = str(item.get("Schedule_Date", item.get("schedule_date")) or "").split("T", 1)[0].split(" ", 1)[0]
+                zone_name = str(item.get("Zone_Name", item.get("zone_name")) or "").strip()
+                if not schedule_id or not schedule_date or not zone_name:
+                    continue
+                try:
+                    remote_zone_id = item.get("Zone_ID", item.get("zone_id"))
+                    remote_zone_id = int(remote_zone_id) if remote_zone_id not in (None, "") else None
+                except (TypeError, ValueError):
+                    remote_zone_id = None
+                try:
+                    schedule_reader_id = item.get("Meter_Reader_ID", item.get("meter_reader_id", reader_id))
+                    schedule_reader_id = int(schedule_reader_id) if schedule_reader_id not in (None, "") else reader_id
+                except (TypeError, ValueError):
+                    schedule_reader_id = reader_id
+                conn.execute(
+                    sql,
+                    (
+                        int(schedule_id),
+                        schedule_date,
+                        remote_zone_id,
+                        zone_name,
+                        schedule_reader_id,
+                        item.get("Meter_Reader_Name", item.get("meter_reader_name")),
+                        item.get("Meter_Reader_Contact", item.get("meter_reader_contact")),
+                        item.get("Status", item.get("status")) or "Scheduled",
+                    ),
+                )
             conn.commit()
 
     def cache_consumers(self, consumers: list[dict]) -> None:
@@ -834,6 +953,26 @@ class SupabaseRestClient:
         row = data[0]
         return row if isinstance(row, dict) else {}
 
+    def load_reading_schedules(
+        self,
+        meter_reader_id: int | str,
+        date_from: str,
+        date_to: str,
+        status: str = "Scheduled",
+    ) -> list[dict]:
+        query = {
+            "meter_reader_id": str(meter_reader_id),
+            "date_from": str(date_from),
+            "date_to": str(date_to),
+            "status": str(status or "Scheduled"),
+        }
+        http_status, data = self._req("GET", "/api/reading-schedules", query=query, use_service_key=True)
+        if http_status >= 400:
+            raise RuntimeError(f"Supabase reading schedule lookup failed: {data}")
+        if not isinstance(data, list):
+            return []
+        return [row for row in data if isinstance(row, dict)]
+
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
         query = {
             "select": "account_id,username,password,role_id,account_status,full_name,contact_number,phone_number",
@@ -1050,8 +1189,48 @@ class SupabaseRestClient:
                 meters[key] = row
         return meters
 
-    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        data = self._fetch_consumer_rows(zone_name=zone_name)
+    def load_assigned_consumers(
+        self,
+        meter_reader_id: int | str | None = None,
+        zone_name: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        zone_filters: list[str] = []
+        if meter_reader_id not in (None, ""):
+            start_date = date_from or _device_schedule_window()[0]
+            end_date = date_to or _device_schedule_window()[1]
+            schedules = self.load_reading_schedules(meter_reader_id, start_date, end_date, "Scheduled")
+            zone_filters = sorted(
+                {
+                    str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
+                    for row in schedules
+                    if str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
+                }
+            )
+            if zone_name:
+                zone_filters = [name for name in zone_filters if name == zone_name]
+            if not zone_filters:
+                return []
+            data: list[dict] = []
+            seen_consumer_ids: set[int] = set()
+            for scheduled_zone in zone_filters:
+                zone_rows = self._fetch_consumer_rows(zone_name=scheduled_zone)
+                for row in zone_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    cid = row.get("consumer_id") or row.get("id")
+                    try:
+                        cid_int = int(cid)
+                    except (TypeError, ValueError):
+                        cid_int = None
+                    if cid_int is not None and cid_int in seen_consumer_ids:
+                        continue
+                    if cid_int is not None:
+                        seen_consumer_ids.add(cid_int)
+                    data.append(row)
+        else:
+            data = self._fetch_consumer_rows(zone_name=zone_name)
         if not isinstance(data, list):
             return []
         consumer_ids: list[int] = []
@@ -1451,17 +1630,39 @@ class MainPostgresClient:
             "reader_id": str(record.get("account_id") or ""),
         }
 
-    def load_assigned_consumers(self, zone_name: str | None = None) -> list[dict]:
-        where = """
-        WHERE c.status = 'Active'
-          AND rs.schedule_date = CURRENT_DATE
-          AND rs.status IN ('Scheduled', 'In Progress')
-          AND today_read.reading_id IS NULL
+    def load_reading_schedules(
+        self,
+        meter_reader_id: int | str,
+        date_from: str,
+        date_to: str,
+        status: str = "Scheduled",
+    ) -> list[dict]:
+        sql = f"""
+        SELECT
+            rs.schedule_id AS "Schedule_ID",
+            rs.schedule_date::date AS "Schedule_Date",
+            rs.zone_id AS "Zone_ID",
+            z.zone_name AS "Zone_Name",
+            rs.meter_reader_id AS "Meter_Reader_ID",
+            COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
+            COALESCE(a.contact_number, a.phone_number, '') AS "Meter_Reader_Contact",
+            rs.status AS "Status"
+        FROM {self._schema}.reading_schedule rs
+        JOIN {self._schema}.zone z ON z.zone_id = rs.zone_id
+        LEFT JOIN {self._schema}.accounts a ON a.account_id = rs.meter_reader_id
+        WHERE rs.meter_reader_id = %s
+          AND rs.schedule_date::date >= %s
+          AND rs.schedule_date::date <= %s
+          AND rs.status = %s
+        ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
         """
-        params: list[object] = []
-        if zone_name:
-            where += " AND z.zone_name = %s"
-            params.append(zone_name)
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
+                cur.execute(sql, (int(meter_reader_id), date_from, date_to, status or "Scheduled"))
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def _load_active_consumers_for_zone(self, zone_name: str) -> list[dict]:
         sql = f"""
         SELECT
             c.consumer_id AS id,
@@ -1511,7 +1712,6 @@ class MainPostgresClient:
             ORDER BY b.bill_id DESC
             LIMIT 1
         ) lb ON TRUE
-        JOIN {self._schema}.reading_schedule rs ON rs.zone_id = z.zone_id
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
         LEFT JOIN LATERAL (
             SELECT mr.current_reading AS last_reading
@@ -1520,88 +1720,58 @@ class MainPostgresClient:
             ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
             LIMIT 1
         ) prev ON TRUE
-        LEFT JOIN {self._schema}.meterreadings today_read
-          ON today_read.consumer_id = c.consumer_id
-         AND DATE(today_read.reading_date) = rs.schedule_date
-         AND today_read.status = 'Active'
-        {where}
+        WHERE c.status = 'Active'
+          AND z.zone_name = %s
         ORDER BY c.consumer_id
         """
         with self._connect() as conn:
             with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, params)
+                cur.execute(sql, (zone_name,))
                 rows = cur.fetchall()
-                if not rows:
-                    # Fallback: no active schedule today, so return active consumers
-                    # for operational continuity.
-                    fb_where = "WHERE c.status = 'Active'"
-                    fb_params: list[object] = []
-                    if zone_name:
-                        fb_where += " AND z.zone_name = %s"
-                        fb_params.append(zone_name)
-                    fb_sql = f"""
-                    SELECT
-                        c.consumer_id AS id,
-                        COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
-                        c.account_number AS acct_no,
-                        CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
-                        z.zone_name AS zone_name,
-                        c.classification_id,
-                        cls.classification_name,
-                        wr.minimum_cubic,
-                        wr.minimum_rate,
-                        wr.excess_rate_per_cubic,
-                        bs.due_days,
-                        lb.amount_due,
-                        lb.due_date,
-                        lb.penalty,
-                        lb.previous_penalty,
-                        lb.total_after_due_date,
-                        lb.status AS bill_status,
-                        adm.late_fee,
-                        COALESCE(prev.last_reading, 0)::int AS previous_reading
-                    FROM {self._schema}.consumer c
-                    JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
-                    LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-                    LEFT JOIN LATERAL (
-                        SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
-                        FROM {self._schema}.waterrates wr
-                        WHERE wr.classification_id = c.classification_id
-                        ORDER BY wr.rate_id DESC
-                        LIMIT 1
-                    ) wr ON TRUE
-                    LEFT JOIN (
-                        SELECT due_days
-                        FROM {self._schema}.billing_settings
-                        ORDER BY setting_id DESC
-                        LIMIT 1
-                    ) bs ON TRUE
-                    LEFT JOIN (
-                        SELECT late_fee
-                        FROM {self._schema}.admin_settings
-                        LIMIT 1
-                    ) adm ON TRUE
-                    LEFT JOIN LATERAL (
-                        SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
-                        FROM {self._schema}.bills b
-                        WHERE b.consumer_id = c.consumer_id
-                        ORDER BY b.bill_id DESC
-                        LIMIT 1
-                    ) lb ON TRUE
-                    LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-                    LEFT JOIN LATERAL (
-                        SELECT mr.current_reading AS last_reading
-                        FROM {self._schema}.meterreadings mr
-                        WHERE mr.consumer_id = c.consumer_id
-                        ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
-                        LIMIT 1
-                    ) prev ON TRUE
-                    {fb_where}
-                    ORDER BY c.consumer_id
-                    """
-                    cur.execute(fb_sql, fb_params)
-                    rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+    def load_assigned_consumers(
+        self,
+        meter_reader_id: int | str | None = None,
+        zone_name: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        if meter_reader_id in (None, ""):
+            zone_filters = [zone_name] if zone_name else []
+        else:
+            schedules = self.load_reading_schedules(
+                meter_reader_id,
+                date_from or _device_schedule_window()[0],
+                date_to or _device_schedule_window()[1],
+                "Scheduled",
+            )
+            zone_filters = sorted(
+                {
+                    str(row.get("Zone_Name") or "").strip()
+                    for row in schedules
+                    if str(row.get("Zone_Name") or "").strip()
+                }
+            )
+            if zone_name:
+                zone_filters = [name for name in zone_filters if name == zone_name]
+        if not zone_filters:
+            return []
+        rows: list[dict] = []
+        seen: set[int] = set()
+        for scheduled_zone in zone_filters:
+            for row in self._load_active_consumers_for_zone(scheduled_zone):
+                cid = row.get("id")
+                try:
+                    cid_int = int(cid)
+                except (TypeError, ValueError):
+                    cid_int = None
+                if cid_int is not None and cid_int in seen:
+                    continue
+                if cid_int is not None:
+                    seen.add(cid_int)
+                rows.append(row)
+        return rows
 
     def get_consumer_context(self, consumer_id: int) -> dict:
         sql = f"""
@@ -1986,21 +2156,31 @@ class HandheldSyncDataAccess:
         effective_zone_name = zone_name
         if zone_name is None and isinstance(meter_reader_id, str) and not meter_reader_id.isdigit():
             effective_zone_name = meter_reader_id
+        effective_meter_reader_id = None if (isinstance(meter_reader_id, str) and not meter_reader_id.isdigit()) else meter_reader_id
+        date_from, date_to = _device_schedule_window()
         if self.remote and self.remote.is_online():
             try:
-                data = self.remote.load_assigned_consumers(effective_zone_name)
+                schedules = []
+                if effective_meter_reader_id not in (None, ""):
+                    schedules = self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, "Scheduled")
+                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
+                data = self.remote.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
-                self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data)})
+                self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data), "schedule_count": len(schedules)})
                 return data
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         if self.main_pg:
             try:
-                data = self.main_pg.load_assigned_consumers(effective_zone_name)
+                schedules = []
+                if effective_meter_reader_id not in (None, ""):
+                    schedules = self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, "Scheduled")
+                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
+                data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
                 data = self._overlay_main_pg_rates_for_consumers(data)
                 self.local.cache_consumers(data)
-                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data)})
+                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
                 return data
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"MAIN_PG load failed, fallback to cache: {exc}")

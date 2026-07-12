@@ -13,10 +13,18 @@ class FakeLocalStore:
         self.queue = []
         self.audit = []
         self.cached = []
+        self.cached_schedules = []
+        self.cached_schedule_reader_id = None
+        self.cached_schedule_range = (None, None)
         self._id = 1
 
     def ensure_schema(self):
         return
+
+    def cache_reading_schedules(self, schedules, meter_reader_id, date_from, date_to):
+        self.cached_schedules = list(schedules)
+        self.cached_schedule_reader_id = meter_reader_id
+        self.cached_schedule_range = (date_from, date_to)
 
     def cache_consumers(self, consumers):
         self.cached = list(consumers)
@@ -99,12 +107,16 @@ class FakeRemoteStore:
         self.fail_writes = False
         self.fail_reads = False
         self.assigned_consumers = []
+        self.assigned_schedules = []
         self.context_by_consumer = {}
 
     def is_online(self):
         return self.online
 
-    def load_assigned_consumers(self, zone_name=None):
+    def load_reading_schedules(self, meter_reader_id, date_from, date_to, status="Scheduled"):
+        return list(self.assigned_schedules)
+
+    def load_assigned_consumers(self, meter_reader_id=None, zone_name=None, date_from=None, date_to=None):
         return list(self.assigned_consumers)
 
     def _key(self, consumer_id, reading_date):
@@ -392,6 +404,88 @@ class HandheldSyncTests(unittest.TestCase):
             self.assertEqual(consumer["billing_month"], "July 2026")
             self.assertEqual(consumer["date_covered_from"], "2026-06-09 00:00:00")
             self.assertEqual(consumer["date_covered_to"], "2026-07-09 00:00:00")
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_local_schedule_filter_limits_zones_and_read_status_by_schedule_date(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.save_current_meter_reader(
+                {
+                    "account_id": 12,
+                    "username": "juan.delacruz",
+                    "full_name": "Juan Dela Cruz",
+                    "contact_number": "09123456789",
+                    "role_id": 3,
+                    "account_status": "Active",
+                }
+            )
+            database.replace_reading_schedules_from_sync(
+                [
+                    {
+                        "Schedule_ID": 101,
+                        "Schedule_Date": "2026-07-15",
+                        "Zone_ID": 3,
+                        "Zone_Name": "Zone 3",
+                        "Meter_Reader_ID": 12,
+                        "Meter_Reader_Name": "Juan Dela Cruz",
+                        "Meter_Reader_Contact": "09123456789",
+                        "Status": "Scheduled",
+                    }
+                ],
+                meter_reader_id=12,
+                date_from="2026-07-01",
+                date_to="2026-07-31",
+            )
+            database.replace_consumers_from_sync(
+                [
+                    {
+                        "id": 1,
+                        "meter_no": "MTR-Z3-001",
+                        "acct_no": "ACCT-Z3-001",
+                        "name": "Zone Three Consumer",
+                        "zone_name": "Zone 3",
+                        "previous_reading": 20,
+                    },
+                    {
+                        "id": 2,
+                        "meter_no": "MTR-Z1-001",
+                        "acct_no": "ACCT-Z1-001",
+                        "name": "Zone One Consumer",
+                        "zone_name": "Zone 1",
+                        "previous_reading": 15,
+                    },
+                ]
+            )
+
+            zone_names = database.get_all_zone_names("2026-07-15", 12)
+            self.assertEqual(zone_names, ["Zone 3"])
+
+            scheduled_consumer = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
+            unscheduled_consumer = database.search_consumer("MTR-Z1-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
+            self.assertIsNotNone(scheduled_consumer)
+            self.assertIsNone(unscheduled_consumer)
+
+            rows_before = database.get_zone_consumers_with_status("Zone 3", "2026-07-15", 12)
+            self.assertEqual(len(rows_before), 1)
+            self.assertEqual(rows_before[0]["is_read"], 0)
+
+            database.save_reading(1, 30, 10, "None", False, "2026-07-15")
+
+            rows_after = database.get_zone_consumers_with_status("Zone 3", "2026-07-15", 12)
+            self.assertEqual(rows_after[0]["is_read"], 1)
+
+            unread_after = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-15", meter_reader_id=12)
+            self.assertIsNone(unread_after)
         finally:
             database._db_path = original_db_path
             try:
