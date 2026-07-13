@@ -72,6 +72,7 @@ try:
         init_db,
         save_current_meter_reader,
         save_receipt_print,
+        update_consumer_due_date,
         replace_consumers_from_sync,
         save_reading,
         search_consumer,
@@ -92,6 +93,7 @@ except ImportError:
         init_db,
         save_current_meter_reader,
         save_receipt_print,
+        update_consumer_due_date,
         replace_consumers_from_sync,
         save_reading,
         search_consumer,
@@ -150,6 +152,19 @@ def _format_reading(value) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text
+
+
+def _normalize_iso_date(value) -> str | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.split("T", 1)[0].split(" ", 1)[0]
+    try:
+        return datetime.fromisoformat(raw).date().isoformat()
+    except ValueError:
+        return None
 
 
 def _add_months(value: datetime, months: int) -> datetime:
@@ -270,6 +285,7 @@ class AppBridge(QObject):
     consumerNameChanged = Signal()
     previousReadingChanged = Signal()
     presentReadingChanged = Signal()
+    dueDateChanged = Signal()
     consumptionChanged = Signal()
     validationColorChanged = Signal()
     validationMessageChanged = Signal()
@@ -351,6 +367,7 @@ class AppBridge(QObject):
         self._consumer_name = "-"
         self._previous_reading = "-"
         self._present_reading = ""
+        self._due_date = ""
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
@@ -621,6 +638,17 @@ class AppBridge(QObject):
             self.presentReadingChanged.emit()
             self.calculate_consumption()
 
+    @Property(str, notify=dueDateChanged)
+    def dueDate(self) -> str:
+        return self._due_date
+
+    @dueDate.setter
+    def dueDate(self, val: str) -> None:
+        normalized = _normalize_iso_date(val) or str(val or "").strip()
+        if self._due_date != normalized:
+            self._due_date = normalized
+            self.dueDateChanged.emit()
+
     @Property(str, notify=consumptionChanged)
     def consumption(self) -> str:
         return self._consumption
@@ -663,6 +691,9 @@ class AppBridge(QObject):
         if self._selected_billing_month_offset != offset:
             self._selected_billing_month_offset = offset
             self.selectedBillingMonthChanged.emit()
+            if self._consumer:
+                self._due_date = self._default_due_date_for_consumer(self._consumer)
+                self.dueDateChanged.emit()
             self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
             if self._selected_zone not in self._zones:
                 self._selected_zone = self._zones[0] if self._zones else ""
@@ -982,12 +1013,27 @@ class AppBridge(QObject):
         self._account_no = str(refreshed.get("acct_no") or refreshed["id"])
         self._consumer_name = refreshed["name"]
         self._previous_reading = _format_reading(refreshed["previous_reading"])
+        self._due_date = self._default_due_date_for_consumer(refreshed)
         self.accountNoChanged.emit()
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
+        self.dueDateChanged.emit()
 
     def _selected_reading_date(self) -> datetime.date:
         return _add_months(datetime.now(), self._selected_billing_month_offset).date()
+
+    def _default_due_date_for_consumer(self, consumer: dict | None = None) -> str:
+        source = consumer or self._consumer or {}
+        existing_due_date = _normalize_iso_date(source.get("due_date"))
+        if existing_due_date:
+            return existing_due_date
+        reference_date = self._selected_reading_date()
+        due_days = source.get("due_days")
+        try:
+            due_days_int = int(float(due_days)) if due_days not in (None, "") else 0
+        except (TypeError, ValueError):
+            due_days_int = 0
+        return (reference_date + timedelta(days=due_days_int)).isoformat()
 
     def _load_consumer_for_new_bill(self, consumer: dict) -> None:
         self._consumer = consumer
@@ -995,6 +1041,7 @@ class AppBridge(QObject):
         self._consumer_name = consumer["name"]
         self._previous_reading = _format_reading(consumer["previous_reading"])
         self._present_reading = ""
+        self._due_date = self._default_due_date_for_consumer(consumer)
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
@@ -1003,6 +1050,7 @@ class AppBridge(QObject):
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
         self.presentReadingChanged.emit()
+        self.dueDateChanged.emit()
         self.consumptionChanged.emit()
         self.validationColorChanged.emit()
         self.validationMessageChanged.emit()
@@ -1051,6 +1099,7 @@ class AppBridge(QObject):
         exception: str,
         flagged: bool,
         reading_date: str | None = None,
+        due_date: str | None = None,
     ) -> None:
         if not self._sync_dal:
             return
@@ -1069,7 +1118,7 @@ class AppBridge(QObject):
             "late_fee": consumer.get("late_fee"),
             "amount_due": consumer.get("amount_due"),
             "previous_balance": consumer.get("previous_balance"),
-            "due_date": consumer.get("due_date"),
+            "due_date": due_date or consumer.get("due_date"),
             "penalty": consumer.get("penalty"),
             "previous_penalty": consumer.get("previous_penalty"),
             "total_after_due_date": consumer.get("total_after_due_date"),
@@ -1324,6 +1373,7 @@ class AppBridge(QObject):
             self._consumer_name = "Consumer not found"
             self._previous_reading = "-"
             self._present_reading = ""
+            self._due_date = ""
             self._consumption = "-"
         else:
             self._consumer = consumer
@@ -1331,12 +1381,14 @@ class AppBridge(QObject):
             self._consumer_name = consumer["name"]
             self._previous_reading = _format_reading(consumer["previous_reading"])
             self._present_reading = ""
+            self._due_date = self._default_due_date_for_consumer(consumer)
             self._consumption = "-"
 
         self.accountNoChanged.emit()
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
         self.presentReadingChanged.emit()
+        self.dueDateChanged.emit()
         self.consumptionChanged.emit()
 
     @Slot(str)
@@ -1503,16 +1555,20 @@ class AppBridge(QObject):
         consumption = present - previous
         exception = self._selected_exception
         reading_date = self._selected_reading_date().isoformat()
-        receipt = build_receipt_text(self._consumer, previous, present, exception, self._reader_name, reading_date=reading_date)
+        due_date = _normalize_iso_date(self._due_date) or self._default_due_date_for_consumer(self._consumer)
+        consumer_snapshot = dict(self._consumer)
+        consumer_snapshot["due_date"] = due_date
+        receipt = build_receipt_text(consumer_snapshot, previous, present, exception, self._reader_name, reading_date=reading_date)
         return {
             "job_type": "original",
-            "consumer_snapshot": dict(self._consumer),
+            "consumer_snapshot": consumer_snapshot,
             "consumer_id": self._consumer["id"],
             "previous": previous,
             "present": present,
             "consumption": consumption,
             "exception": exception,
             "reading_date": reading_date,
+            "due_date": due_date,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }
@@ -1527,6 +1583,9 @@ class AppBridge(QObject):
             self._reload_current_consumer_from_db()
             present = _to_float(self._present_reading)
             previous = _to_float(self._consumer["previous_reading"])
+            if not _normalize_iso_date(self._due_date):
+                self.alertRequested.emit("Invalid Due Date", "Enter a valid due date in YYYY-MM-DD format.")
+                return
             if present < previous:
                 self.alertRequested.emit("Invalid Reading", "Present reading cannot be lower than the previous reading.")
                 return
@@ -1652,9 +1711,12 @@ class AppBridge(QObject):
                     consumption = _to_float(job["consumption"])
                     exception = str(job["exception"])
                     reading_date = str(job.get("reading_date") or datetime.now().date().isoformat())
+                    due_date = str(job.get("due_date") or consumer.get("due_date") or "")
                     flagged = consumption > 500 or exception != "None"
+                    if due_date:
+                        update_consumer_due_date(job["consumer_id"], due_date)
                     reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
-                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date)
+                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date)
                     saved_receipt_id = save_receipt_print(
                         job["consumer_id"],
                         receipt_text,
@@ -1691,6 +1753,7 @@ class AppBridge(QObject):
                             "present": present,
                             "consumption": consumption,
                             "exception": exception,
+                            "due_date": due_date,
                             "receipt_text": receipt_text,
                         }
                     )
@@ -1754,6 +1817,7 @@ class AppBridge(QObject):
                 "present_reading": present,
                 "consumption": _to_float(result["consumption"]),
                 "exception": result.get("exception") or "None",
+                "due_date": result.get("due_date") or consumer.get("due_date"),
                 "reader_name": self._reader_name,
                 "receipt_text": result["receipt_text"],
                 "print_action": "print",
@@ -1761,6 +1825,10 @@ class AppBridge(QObject):
             self._last_receipt = result["receipt_text"]
             self.canReprintChanged.emit()
             self._consumer["previous_reading"] = present
+            if result.get("due_date"):
+                self._consumer["due_date"] = result["due_date"]
+                self._due_date = result["due_date"]
+                self.dueDateChanged.emit()
             self._previous_reading = _format_reading(present)
             self._present_reading = ""
             self._consumption = "-"

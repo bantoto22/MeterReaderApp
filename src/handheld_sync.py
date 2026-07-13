@@ -1092,12 +1092,39 @@ class SupabaseRestClient:
             rows.extend(row for row in data if isinstance(row, dict))
         return rows
 
+    def _bill_select_clause(self) -> str:
+        preferred = [
+            "bill_id",
+            "consumer_id",
+            "reading_id",
+            "billing_month",
+            "date_covered_from",
+            "date_covered_to",
+            "bill_date",
+            "amount_due",
+            "due_date",
+            "previous_balance",
+            "penalty",
+            "previous_penalty",
+            "total_after_due_date",
+            "status",
+            "sync_id",
+        ]
+        allowed = self._get_table_columns("bills")
+        if not allowed:
+            return ",".join(field for field in preferred if field != "bill_date")
+        selected = [field for field in preferred if field in allowed]
+        required = {"bill_id", "consumer_id"}
+        if not required.issubset(set(selected)):
+            return ",".join(field for field in preferred if field != "bill_date")
+        return ",".join(selected)
+
     def _load_latest_bills_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
         if not consumer_ids:
             return {}
         data = self._fetch_rows_for_consumer_ids(
             "bills",
-            "bill_id,consumer_id,reading_id,billing_month,date_covered_from,date_covered_to,amount_due,due_date,previous_balance,penalty,previous_penalty,total_after_due_date,status,sync_id",
+            self._bill_select_clause(),
             consumer_ids,
             order_clause="consumer_id.asc,bill_id.desc",
         )
@@ -1110,13 +1137,19 @@ class SupabaseRestClient:
                 key = int(consumer_id)
             except (TypeError, ValueError):
                 continue
+            normalized_row = dict(row)
+            fallback_bill_date = normalized_row.get("bill_date")
+            if not normalized_row.get("date_covered_from") and fallback_bill_date not in (None, ""):
+                normalized_row["date_covered_from"] = fallback_bill_date
+            if not normalized_row.get("date_covered_to") and fallback_bill_date not in (None, ""):
+                normalized_row["date_covered_to"] = fallback_bill_date
             selected = bills.get(key)
-            row_status = str(row.get("status") or "").strip().lower()
+            row_status = str(normalized_row.get("status") or "").strip().lower()
             selected_status = str((selected or {}).get("status") or "").strip().lower()
             if selected is None:
-                bills[key] = row
+                bills[key] = normalized_row
             elif selected_status == "paid" and row_status != "paid":
-                bills[key] = row
+                bills[key] = normalized_row
         return bills
 
     def _load_latest_meterreadings_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
@@ -1154,6 +1187,9 @@ class SupabaseRestClient:
             "zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
         )
         return [
+            f"consumer_id,account_number,meter_no,address,consumer_address,service_address{base_suffix}",
+            f"consumer_id,account_number,meter_number,address,consumer_address,service_address{base_suffix}",
+            f"consumer_id,account_number,address,consumer_address,service_address{base_suffix}",
             f"consumer_id,account_number,meter_no,address{base_suffix}",
             f"consumer_id,account_number,meter_number,address{base_suffix}",
             f"consumer_id,account_number,address{base_suffix}",
@@ -1787,6 +1823,9 @@ class MainPostgresClient:
             wr.minimum_rate,
             wr.excess_rate_per_cubic,
             bs.due_days,
+            lb.billing_month,
+            lb.date_covered_from,
+            lb.date_covered_to,
             lb.amount_due,
             lb.due_date,
             lb.penalty,
@@ -1817,7 +1856,8 @@ class MainPostgresClient:
             LIMIT 1
         ) adm ON TRUE
         LEFT JOIN LATERAL (
-            SELECT amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
+            SELECT billing_month, date_covered_from, date_covered_to,
+                   amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
             FROM {self._schema}.bills b
             WHERE b.consumer_id = c.consumer_id
             ORDER BY b.bill_id DESC
@@ -1901,6 +1941,9 @@ class MainPostgresClient:
             adm.late_fee,
             m.meter_id,
             COALESCE(prev.last_reading, 0)::int AS previous_reading,
+            lb.billing_month,
+            lb.date_covered_from,
+            lb.date_covered_to,
             lb.amount_due,
             lb.due_date,
             lb.previous_balance,
@@ -1933,7 +1976,8 @@ class MainPostgresClient:
             LIMIT 1
         ) adm ON TRUE
         LEFT JOIN LATERAL (
-            SELECT amount_due, due_date, previous_balance, penalty, previous_penalty, total_after_due_date, status, sync_id, reading_id
+            SELECT billing_month, date_covered_from, date_covered_to,
+                   amount_due, due_date, previous_balance, penalty, previous_penalty, total_after_due_date, status, sync_id, reading_id
             FROM {self._schema}.bills b
             WHERE b.consumer_id = c.consumer_id
             ORDER BY b.bill_id DESC

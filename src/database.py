@@ -801,6 +801,17 @@ def save_receipt_print(
     return receipt_print_id
 
 
+def update_consumer_due_date(consumer_id: int, due_date: str) -> None:
+    """Persist a manually adjusted due date for a consumer's local billing snapshot."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE consumers SET due_date = ? WHERE id = ?",
+        (str(due_date).strip(), int(consumer_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_latest_receipt_print(consumer_id: int | None = None) -> dict | None:
     """Return the most recent saved receipt print, optionally for one consumer."""
     conn = get_connection()

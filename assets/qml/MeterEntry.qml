@@ -368,6 +368,50 @@ Rectangle {
                         }
                     }
 
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text {
+                            text: "Due Date"
+                            font.pixelSize: TouchMetrics.bodyText
+                            font.family: "Montserrat"
+                            font.bold: true
+                            color: "#0F172A"
+                        }
+
+                        TextField {
+                            id: txtDueDate
+                            property string keyboardMode: "numeric"
+                            Layout.fillWidth: true
+                            placeholderText: "YYYY-MM-DD"
+                            text: bridgeObj ? bridgeObj.dueDate : ""
+                            inputMethodHints: Qt.ImhDate | Qt.ImhNoPredictiveText
+                            font.pixelSize: TouchMetrics.bodyText
+                            font.family: "Montserrat"
+                            color: "#0F172A"
+                            placeholderTextColor: "#94A3B8"
+                            padding: 12
+                            background: Rectangle {
+                                radius: 8
+                                border.color: txtDueDate.activeFocus ? "#3B82F6" : "#E2E8F0"
+                                border.width: txtDueDate.activeFocus ? 2 : 1
+                                color: "#F8FAFC"
+                                Behavior on border.color { ColorAnimation { duration: 150 } }
+                            }
+                            onTextChanged: { if (bridgeObj) bridgeObj.dueDate = text }
+                        }
+
+                        Text {
+                            text: "Edit when a zone needs more than one day to finish."
+                            font.pixelSize: TouchMetrics.helperText
+                            font.family: "Montserrat"
+                            color: "#64748B"
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+                    }
+
                     TextField {
                         id: txtPresent
                         property string keyboardMode: "numeric"
