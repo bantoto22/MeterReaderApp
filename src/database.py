@@ -523,16 +523,6 @@ def replace_reading_schedules_from_sync(
 
     conn = get_connection()
     cur = conn.cursor()
-    if reader_id_int is not None and normalized_from and normalized_to:
-        cur.execute(
-            """
-            DELETE FROM reading_schedule
-            WHERE meter_reader_id = ?
-              AND date(schedule_date) >= date(?)
-              AND date(schedule_date) <= date(?)
-            """,
-            (reader_id_int, normalized_from, normalized_to),
-        )
 
     upserted = 0
     for row in schedules or []:

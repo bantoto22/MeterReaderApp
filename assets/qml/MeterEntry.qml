@@ -373,41 +373,6 @@ Rectangle {
                         spacing: 4
 
                         Text {
-                            text: "Reading Date"
-                            font.pixelSize: TouchMetrics.bodyText
-                            font.family: "Montserrat"
-                            font.bold: true
-                            color: "#0F172A"
-                        }
-
-                        TextField {
-                            id: txtReadingDate
-                            property string keyboardMode: "numeric"
-                            Layout.fillWidth: true
-                            placeholderText: "YYYY-MM-DD"
-                            text: bridgeObj ? bridgeObj.selectedBillingDate : ""
-                            inputMethodHints: Qt.ImhDate | Qt.ImhNoPredictiveText
-                            font.pixelSize: TouchMetrics.bodyText
-                            font.family: "Montserrat"
-                            color: "#0F172A"
-                            placeholderTextColor: "#94A3B8"
-                            padding: 12
-                            background: Rectangle {
-                                radius: 8
-                                border.color: txtReadingDate.activeFocus ? "#3B82F6" : "#E2E8F0"
-                                border.width: txtReadingDate.activeFocus ? 2 : 1
-                                color: "#F8FAFC"
-                                Behavior on border.color { ColorAnimation { duration: 150 } }
-                            }
-                            onTextChanged: { if (bridgeObj) bridgeObj.selectedBillingDate = text }
-                        }
-                    }
-
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 4
-
-                        Text {
                             text: "Due Date"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"

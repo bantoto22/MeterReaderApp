@@ -647,16 +647,6 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             updated_at = CURRENT_TIMESTAMP
         """
         with self._connect() as conn:
-            if reader_id is not None and date_from and date_to:
-                conn.execute(
-                    """
-                    DELETE FROM reading_schedule
-                    WHERE meter_reader_id = ?
-                      AND date(schedule_date) >= date(?)
-                      AND date(schedule_date) <= date(?)
-                    """,
-                    (reader_id, date_from, date_to),
-                )
             for item in schedules or []:
                 if not isinstance(item, dict):
                     continue
@@ -931,7 +921,7 @@ class SupabaseRestClient:
             body = json.dumps(payload).encode("utf-8")
         req = request.Request(url, data=body, method=method, headers=headers)
         try:
-            with request.urlopen(req, timeout=6) as resp:
+            with request.urlopen(req, timeout=3) as resp:
                 raw = resp.read().decode("utf-8").strip()
                 return resp.getcode(), json.loads(raw) if raw else {}
         except error.HTTPError as exc:

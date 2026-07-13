@@ -283,6 +283,12 @@ class LoginBridge(QObject):
         self.errorMessageChanged.emit()
 
         def _task() -> None:
+            cached_user = authenticate_user(username, password)
+            if cached_user:
+                save_current_meter_reader(cached_user)
+                self.loginAttemptFinished.emit(True, cached_user, "")
+                return
+
             offline_error = None
             try:
                 if HandheldSyncDataAccess is None or SyncConfig is None:
@@ -303,11 +309,6 @@ class LoginBridge(QObject):
             except Exception as exc:
                 offline_error = str(exc) or "Unable to verify this account right now."
 
-            user = authenticate_user(username, password)
-            if user:
-                save_current_meter_reader(user)
-                self.loginAttemptFinished.emit(True, user, "")
-                return
             self.loginAttemptFinished.emit(False, None, offline_error)
 
         threading.Thread(target=_task, daemon=True).start()
@@ -431,7 +432,6 @@ class AppBridge(QObject):
 
         self._billing_month_offsets = [0, 1]
         self._selected_billing_month_offset = 0
-        self._selected_reading_date_iso = datetime.now().date().isoformat()
 
         self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
         self._selected_zone = self._zones[0] if self._zones else ""
@@ -501,13 +501,14 @@ class AppBridge(QObject):
         self.printExecutionFinished.connect(self._finish_print_execution)
 
         self._wifi_timer = QTimer(self)
-        self._wifi_timer.setInterval(15_000)
+        self._wifi_timer.setInterval(5_000)
         self._wifi_timer.timeout.connect(self.refreshWifiStatus)
         self._wifi_timer.start()
 
         self._wifi_scan_timer = QTimer(self)
-        self._wifi_scan_timer.setInterval(60_000)
+        self._wifi_scan_timer.setInterval(15_000)
         self._wifi_scan_timer.timeout.connect(self.refreshWifiNetworks)
+        self._wifi_scan_timer.start()
 
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -515,7 +516,7 @@ class AppBridge(QObject):
         self.update_stats()
         self._init_sync()
         self.refreshWifiStatus()
-        self._sync_wifi_polling_for_tab()
+        self.refreshWifiNetworks()
 
     # Properties
     @Property(int, notify=zoneRemainingCountChanged)
@@ -529,7 +530,6 @@ class AppBridge(QObject):
     def currentTab(self, val: int) -> None:
         if self._current_tab != val:
             self._current_tab = val
-            self._sync_wifi_polling_for_tab()
             self.currentTabChanged.emit()
 
     @Property(str, notify=readerNameChanged)
@@ -766,7 +766,6 @@ class AppBridge(QObject):
             offset = 0
         if self._selected_billing_month_offset != offset:
             self._selected_billing_month_offset = offset
-            self._selected_reading_date_iso = _add_months(datetime.now(), offset).date().isoformat()
             self.selectedBillingMonthChanged.emit()
             if self._consumer:
                 self._due_date = self._default_due_date_for_consumer(self._consumer)
@@ -783,37 +782,7 @@ class AppBridge(QObject):
 
     @Property(str, notify=selectedBillingMonthChanged)
     def selectedBillingDate(self) -> str:
-        return self._selected_reading_date_iso
-
-    @selectedBillingDate.setter
-    def selectedBillingDate(self, val: str) -> None:
-        raw = str(val or "").strip()
-        normalized = _normalize_iso_date(raw)
-        next_value = normalized or raw
-        if self._selected_reading_date_iso == next_value:
-            return
-        self._selected_reading_date_iso = next_value
-        if normalized:
-            today = datetime.now().date()
-            selected = datetime.fromisoformat(normalized).date()
-            for offset in self._billing_month_offsets:
-                target = _add_months(datetime.combine(today, datetime.min.time()), offset).date()
-                if target.year == selected.year and target.month == selected.month:
-                    self._selected_billing_month_offset = offset
-                    break
-            if self._consumer:
-                self._due_date = self._default_due_date_for_consumer(self._consumer)
-                self.dueDateChanged.emit()
-            self._zones = get_all_zone_names(normalized, self._meter_reader_account_id or None)
-            if self._selected_zone not in self._zones:
-                self._selected_zone = self._zones[0] if self._zones else ""
-                self.selectedZoneChanged.emit()
-            self.zonesChanged.emit()
-            self.update_stats()
-            self._refresh_search_suggestions()
-            if self._progress_details_visible:
-                self._refresh_zone_consumers()
-        self.selectedBillingMonthChanged.emit()
+        return self._selected_reading_date().isoformat()
 
     # Exception properties
     @Property(list, notify=exceptionsChanged)
@@ -1104,17 +1073,6 @@ class AppBridge(QObject):
     def _reset_auto_pull_timer(self) -> None:
         return
 
-    def _sync_wifi_polling_for_tab(self) -> None:
-        settings_tab_index = 2
-        if self._current_tab == settings_tab_index:
-            if not self._wifi_scan_timer.isActive():
-                self._wifi_scan_timer.start()
-            self.refreshWifiStatus()
-            self.refreshWifiNetworks()
-            return
-        if self._wifi_scan_timer.isActive():
-            self._wifi_scan_timer.stop()
-
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
             self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
@@ -1198,10 +1156,7 @@ class AppBridge(QObject):
         self.dueDateChanged.emit()
 
     def _selected_reading_date(self) -> datetime.date:
-        normalized = _normalize_iso_date(self._selected_reading_date_iso)
-        if normalized:
-            return datetime.fromisoformat(normalized).date()
-        return datetime.now().date()
+        return _add_months(datetime.now(), self._selected_billing_month_offset).date()
 
     def _default_due_date_for_consumer(self, consumer: dict | None = None) -> str:
         source = consumer or self._consumer or {}
@@ -1772,9 +1727,6 @@ class AppBridge(QObject):
             return
 
         try:
-            if not _normalize_iso_date(self._selected_reading_date_iso):
-                self.alertRequested.emit("Invalid Reading Date", "Enter a valid reading date in YYYY-MM-DD format.")
-                return
             self._reload_current_consumer_from_db()
             present = _to_float(self._present_reading)
             previous = _to_float(self._consumer["previous_reading"])
