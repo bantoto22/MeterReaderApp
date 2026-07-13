@@ -1122,7 +1122,7 @@ class AppBridge(QObject):
         if not self._sync_dal or not self._meter_reader_account_id:
             return 0
         schedules: list[dict] = []
-        for client in (getattr(self._sync_dal, "remote", None), getattr(self._sync_dal, "main_pg", None)):
+        for client in (getattr(self._sync_dal, "main_pg", None), getattr(self._sync_dal, "remote", None)):
             if not client:
                 continue
             try:

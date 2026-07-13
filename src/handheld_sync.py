@@ -2391,6 +2391,21 @@ class HandheldSyncDataAccess:
         if not date_from or not date_to:
             date_from, date_to = _device_schedule_window()
         errors: list[str] = []
+        if self.main_pg and self.main_pg.is_online():
+            try:
+                schedules = []
+                if effective_meter_reader_id not in (None, ""):
+                    for schedule_status in ("Scheduled", "In Progress"):
+                        schedules.extend(self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
+                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
+                data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
+                self.local.cache_consumers(data)
+                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
+                if data:
+                    return data
+            except Exception as exc:
+                errors.append(f"MAIN_PG: {exc}")
+                self.local.log_audit(None, "failed", f"MAIN_PG load failed, trying Supabase/cache fallback: {exc}")
         if self.remote and self.remote.is_online():
             try:
                 schedules = []
@@ -2413,21 +2428,6 @@ class HandheldSyncDataAccess:
             except Exception as exc:
                 errors.append(f"Supabase: {exc}")
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
-        if self.main_pg:
-            try:
-                schedules = []
-                if effective_meter_reader_id not in (None, ""):
-                    for schedule_status in ("Scheduled", "In Progress"):
-                        schedules.extend(self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
-                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
-                data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
-                data = self._overlay_main_pg_rates_for_consumers(data)
-                self.local.cache_consumers(data)
-                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
-                return data
-            except Exception as exc:
-                errors.append(f"MAIN_PG: {exc}")
-                self.local.log_audit(None, "failed", f"MAIN_PG load failed, fallback to cache: {exc}")
         cached = self.local.load_cached_consumers(effective_zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached), "errors": errors})
         return cached
