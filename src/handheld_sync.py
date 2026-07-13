@@ -2238,11 +2238,23 @@ class HandheldSyncDataAccess:
     def _main_pg_online(self) -> bool:
         return bool(self.main_pg and self.main_pg.is_online())
 
-    def _available_targets(self, *, include_supabase: bool = True, include_main_pg: bool = False) -> list[tuple[str, str, object]]:
+    def _available_targets(
+        self,
+        *,
+        include_supabase: bool = True,
+        include_main_pg: bool = False,
+        availability: dict[str, bool] | None = None,
+    ) -> list[tuple[str, str, object]]:
         targets: list[tuple[str, str, object]] = []
-        if include_supabase and self.remote and self.remote.is_online():
+        supabase_online = availability.get("supabase") if availability is not None else None
+        main_pg_online = availability.get("main_pg") if availability is not None else None
+        if supabase_online is None:
+            supabase_online = bool(self.remote and self.remote.is_online())
+        if main_pg_online is None:
+            main_pg_online = bool(self.main_pg and self.main_pg.is_online())
+        if include_supabase and self.remote and supabase_online:
             targets.append(("Supabase", "supabase", self.remote))
-        if include_main_pg and self.main_pg and self.main_pg.is_online():
+        if include_main_pg and self.main_pg and main_pg_online:
             targets.append(("MAIN_PG", "main_pg", self.main_pg))
         return targets
 
@@ -2252,12 +2264,14 @@ class HandheldSyncDataAccess:
         *,
         include_supabase: bool = True,
         include_main_pg: bool = False,
+        availability: dict[str, bool] | None = None,
     ) -> tuple[dict[str, dict], list[str]]:
         results: dict[str, dict] = {}
         errors: list[str] = []
         for label, _target_key, target in self._available_targets(
             include_supabase=include_supabase,
             include_main_pg=include_main_pg,
+            availability=availability,
         ):
             try:
                 bundle_writer = getattr(target, "save_reading_bundle", None)
@@ -2315,11 +2329,13 @@ class HandheldSyncDataAccess:
         *,
         include_supabase: bool = True,
         include_main_pg: bool = False,
+        availability: dict[str, bool] | None = None,
     ) -> tuple[dict | None, list[str]]:
         errors: list[str] = []
         online_targets = self._available_targets(
             include_supabase=include_supabase,
             include_main_pg=include_main_pg,
+            availability=availability,
         )
         for label, _target_key, target in online_targets:
             try:
@@ -2374,6 +2390,7 @@ class HandheldSyncDataAccess:
         effective_meter_reader_id = None if (isinstance(meter_reader_id, str) and not meter_reader_id.isdigit()) else meter_reader_id
         if not date_from or not date_to:
             date_from, date_to = _device_schedule_window()
+        errors: list[str] = []
         if self.remote and self.remote.is_online():
             try:
                 schedules = []
@@ -2382,11 +2399,19 @@ class HandheldSyncDataAccess:
                         schedules.extend(self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
                     self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
                 data = self.remote.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
-                data = self._overlay_main_pg_rates_for_consumers(data)
-                self.local.cache_consumers(data)
-                self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data), "schedule_count": len(schedules)})
-                return data
+                if data:
+                    data = self._overlay_main_pg_rates_for_consumers(data)
+                    self.local.cache_consumers(data)
+                    self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data), "schedule_count": len(schedules)})
+                    return data
+                self.local.log_audit(
+                    None,
+                    "failed",
+                    "Supabase returned no assigned consumers; trying MAIN_PG before cache fallback",
+                    {"schedule_count": len(schedules), "meter_reader_id": effective_meter_reader_id, "date_from": date_from, "date_to": date_to},
+                )
             except Exception as exc:
+                errors.append(f"Supabase: {exc}")
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         if self.main_pg:
             try:
@@ -2401,9 +2426,10 @@ class HandheldSyncDataAccess:
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
                 return data
             except Exception as exc:
+                errors.append(f"MAIN_PG: {exc}")
                 self.local.log_audit(None, "failed", f"MAIN_PG load failed, fallback to cache: {exc}")
         cached = self.local.load_cached_consumers(effective_zone_name)
-        self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
+        self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached), "errors": errors})
         return cached
 
     def authenticateMeterReader(self, username: str, password: str) -> dict:
@@ -2575,7 +2601,11 @@ class HandheldSyncDataAccess:
         }
 
     def syncPendingReadings(self, include_main_pg: bool = False) -> dict:
-        if not self.is_online() and not (include_main_pg and self._main_pg_online()):
+        availability = {
+            "supabase": bool(self.remote and self.remote.is_online()),
+            "main_pg": bool(include_main_pg and self.main_pg and self.main_pg.is_online()),
+        }
+        if not availability["supabase"] and not availability["main_pg"]:
             self.local.log_audit(None, "failed", "Sync skipped, offline")
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
 
@@ -2586,8 +2616,8 @@ class HandheldSyncDataAccess:
             "Starting sync cycle",
             {
                 "include_main_pg": include_main_pg,
-                "internet_online": self.is_online(),
-                "main_pg_online": self._main_pg_online() if include_main_pg else False,
+                "internet_online": availability["supabase"],
+                "main_pg_online": availability["main_pg"],
                 "pending_count": len(pending),
             },
         )
@@ -2597,7 +2627,9 @@ class HandheldSyncDataAccess:
 
         for row in pending:
             queue_id = row["id"]
-            payload = self._overlay_main_pg_rates_for_reading(dict(row["payload"]))
+            payload = dict(row["payload"])
+            if include_main_pg:
+                payload = self._overlay_main_pg_rates_for_reading(payload)
             try:
                 row_synced = False
                 requested_targets = []
@@ -2611,6 +2643,7 @@ class HandheldSyncDataAccess:
                         payload,
                         include_supabase=wants_supabase,
                         include_main_pg=wants_main_pg,
+                        availability=availability,
                     )
                     if existing and existing.get("updated_at") and payload.get("updated_at"):
                         if str(existing["updated_at"]) > str(payload["updated_at"]):
@@ -2624,6 +2657,7 @@ class HandheldSyncDataAccess:
                         payload,
                         include_supabase=wants_supabase,
                         include_main_pg=wants_main_pg,
+                        availability=availability,
                     )
                     errors = [*lookup_errors, *errors]
                     if not results:

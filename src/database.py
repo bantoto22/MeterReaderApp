@@ -1064,6 +1064,7 @@ def get_all_zone_names(
             """
             SELECT DISTINCT z.name
             FROM zones z
+            JOIN consumers c ON c.zone_id = z.id
             JOIN reading_schedule rs ON rs.zone_name = z.name
             WHERE rs.meter_reader_id = ?
               AND date(rs.schedule_date) >= date(?)

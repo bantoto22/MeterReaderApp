@@ -403,6 +403,7 @@ class AppBridge(QObject):
     printHistoryRecordsChanged = Signal()
     printHistoryDetailChanged = Signal()
     printExecutionFinished = Signal(object)
+    assignedDatasetFinished = Signal(object)
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -499,6 +500,7 @@ class AppBridge(QObject):
         self.powerOffFailed.connect(self._finish_power_off_failure)
         self.testPrintFinished.connect(self._finish_test_print)
         self.printExecutionFinished.connect(self._finish_print_execution)
+        self.assignedDatasetFinished.connect(self._finish_assigned_consumer_dataset)
 
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(5_000)
@@ -585,7 +587,8 @@ class AppBridge(QObject):
         self._last_receipt_entry = get_latest_receipt_print()
         self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
         self.canReprintChanged.emit()
-        self._refresh_assigned_consumer_dataset()
+        self._refresh_local_assignment_views()
+        QTimer.singleShot(100, self._start_assigned_consumer_dataset_refresh)
 
     @Slot()
     def showWelcomeToast(self) -> None:
@@ -1073,15 +1076,52 @@ class AppBridge(QObject):
     def _reset_auto_pull_timer(self) -> None:
         return
 
+    def _refresh_local_assignment_views(self) -> None:
+        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
+        if self._selected_zone not in self._zones:
+            self._selected_zone = self._zones[0] if self._zones else ""
+        self.zonesChanged.emit()
+        self.selectedZoneChanged.emit()
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
+        self.update_stats()
+
+    def _start_assigned_consumer_dataset_refresh(self) -> None:
+        if not self._meter_reader_account_id or not self._sync_dal:
+            self._refresh_local_assignment_views()
+            return
+
+        def _task() -> None:
+            try:
+                date_from, date_to = _month_window(self._selected_reading_date())
+                consumers = self._sync_dal.loadAssignedConsumers(
+                    self._meter_reader_account_id,
+                    None,
+                    date_from,
+                    date_to,
+                )
+                mirrored = replace_consumers_from_sync(consumers)
+                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored})
+            except Exception as exc:
+                self.assignedDatasetFinished.emit({"success": False, "error": str(exc)})
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_assigned_consumer_dataset(self, result: dict) -> None:
+        if not result.get("success"):
+            self._sync_logs = f"Assigned schedule refresh failed: {result.get('error', 'Unknown error')}"
+            self.syncLogsChanged.emit()
+        else:
+            self._last_pull_count = int(result.get("pulled", self._last_pull_count))
+            self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
+            self.lastPullCountChanged.emit()
+            self.lastPullMirrorChanged.emit()
+        self._refresh_local_assignment_views()
+        self._refresh_sync_snapshot()
+
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
-            self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
-            self._selected_zone = self._zones[0] if self._zones else ""
-            self.zonesChanged.emit()
-            self.selectedZoneChanged.emit()
-            self._refresh_search_suggestions()
-            self._refresh_zone_consumers()
-            self.update_stats()
+            self._refresh_local_assignment_views()
             return
         if self._sync_dal:
             try:
@@ -1096,14 +1136,7 @@ class AppBridge(QObject):
             except Exception as exc:
                 self._sync_logs = f"Assigned schedule refresh failed: {exc}"
                 self.syncLogsChanged.emit()
-        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
-        if self._selected_zone not in self._zones:
-            self._selected_zone = self._zones[0] if self._zones else ""
-        self.zonesChanged.emit()
-        self.selectedZoneChanged.emit()
-        self._refresh_search_suggestions()
-        self._refresh_zone_consumers()
-        self.update_stats()
+        self._refresh_local_assignment_views()
 
     def _run_auto_pull(self) -> None:
         return
@@ -1210,14 +1243,17 @@ class AppBridge(QObject):
         if "pulled" in result:
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self.lastPullCountChanged.emit()
-        self._refresh_assigned_consumer_dataset()
+        self._refresh_local_assignment_views()
         self._reload_current_consumer_from_db()
         self._refresh_sync_snapshot()
         if result.get("kind") == "sync" and not result.get("silent"):
             sync_result = result.get("result", {})
+            pull_error = str(sync_result.get("pull_error") or "").strip()
+            pull_line = f"\nPulled: {self._last_pull_count}\nMirrored: {self._last_pull_mirror}"
+            error_line = f"\nPull warning: {pull_error}" if pull_error else ""
             self.alertRequested.emit(
                 "Sync Complete",
-                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}\nMirrored: {self._last_pull_mirror}",
+                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{error_line}",
             )
 
     def _save_to_sync_layer(
@@ -1788,7 +1824,21 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 result = self._sync_dal.syncPendingReadings(include_main_pg=True)
-                self.syncTaskFinished.emit({"kind": "sync", "result": result, "mirrored": 0})
+                pulled = 0
+                mirrored = 0
+                try:
+                    date_from, date_to = _month_window(self._selected_reading_date())
+                    consumers = self._sync_dal.loadAssignedConsumers(
+                        self._meter_reader_account_id or None,
+                        None,
+                        date_from,
+                        date_to,
+                    )
+                    pulled = len(consumers)
+                    mirrored = replace_consumers_from_sync(consumers)
+                except Exception as pull_exc:
+                    result = {**result, "pull_error": str(pull_exc)}
+                self.syncTaskFinished.emit({"kind": "sync", "result": result, "pulled": pulled, "mirrored": mirrored})
             except Exception as exc:
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
 
@@ -2255,8 +2305,11 @@ class HybridMainWindow(QMainWindow):
         self.main_page.bridge.logoutRequested.connect(self._on_logout_requested)
 
     def _on_login_success(self, user: dict) -> None:
-        self.main_page.bridge.set_user(user)
         self.stack.setCurrentWidget(self.main_page)
+        QTimer.singleShot(0, lambda: self._complete_login_success(user))
+
+    def _complete_login_success(self, user: dict) -> None:
+        self.main_page.bridge.set_user(user)
         self.main_page.bridge.showWelcomeToast()
 
     def _on_logout_requested(self) -> None:
