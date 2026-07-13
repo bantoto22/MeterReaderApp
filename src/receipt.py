@@ -137,6 +137,16 @@ def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
         if candidate:
             end_value = candidate
             break
+    if start_value == "N/A":
+        raw_billing_month = str(consumer.get("billing_month") or "").strip()
+        if raw_billing_month:
+            try:
+                month_anchor = datetime.datetime.strptime(raw_billing_month, "%B %Y").date()
+                start_value = month_anchor.replace(day=1).isoformat()
+            except ValueError:
+                start_value = "N/A"
+    if start_value == "N/A":
+        start_value = reference_date.replace(day=1).isoformat()
     return f"{start_value} to {end_value}"
 
 

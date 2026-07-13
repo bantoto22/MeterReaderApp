@@ -571,6 +571,11 @@ def search_consumer(
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
+                    (
+                        SELECT MAX(date(r_prev.reading_date))
+                        FROM readings r_prev
+                        WHERE r_prev.consumer_id = c.id
+                    ) AS latest_reading_date,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                     c.billing_month, c.date_covered_from, c.date_covered_to,
@@ -656,6 +661,11 @@ def search_consumers_by_zone(
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
+                    (
+                        SELECT MAX(date(r_prev.reading_date))
+                        FROM readings r_prev
+                        WHERE r_prev.consumer_id = c.id
+                    ) AS latest_reading_date,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
                     c.billing_month, c.date_covered_from, c.date_covered_to,
@@ -1212,7 +1222,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
                     name = excluded.name,
-                    address = excluded.address,
+                    address = COALESCE(excluded.address, consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
                     classification_name = excluded.classification_name,
@@ -1221,9 +1231,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
-                    billing_month = excluded.billing_month,
-                    date_covered_from = excluded.date_covered_from,
-                    date_covered_to = excluded.date_covered_to,
+                    billing_month = COALESCE(excluded.billing_month, consumers.billing_month),
+                    date_covered_from = COALESCE(excluded.date_covered_from, consumers.date_covered_from),
+                    date_covered_to = COALESCE(excluded.date_covered_to, consumers.date_covered_to),
                     amount_due = excluded.amount_due,
                     previous_balance = excluded.previous_balance,
                     due_date = excluded.due_date,
@@ -1256,7 +1266,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = excluded.name,
-                    address = excluded.address,
+                    address = COALESCE(excluded.address, consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
                     classification_name = excluded.classification_name,
@@ -1265,9 +1275,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
-                    billing_month = excluded.billing_month,
-                    date_covered_from = excluded.date_covered_from,
-                    date_covered_to = excluded.date_covered_to,
+                    billing_month = COALESCE(excluded.billing_month, consumers.billing_month),
+                    date_covered_from = COALESCE(excluded.date_covered_from, consumers.date_covered_from),
+                    date_covered_to = COALESCE(excluded.date_covered_to, consumers.date_covered_to),
                     amount_due = excluded.amount_due,
                     previous_balance = excluded.previous_balance,
                     due_date = excluded.due_date,

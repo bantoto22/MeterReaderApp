@@ -781,7 +781,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Current Bill: PHP    10.00", text)
         self.assertIn("Prev Bill    : PHP 0.00", text)
         self.assertIn("Billing Month: July 2026", text)
-        self.assertIn("Billing Period: N/A to 2026-07-06", text)
+        self.assertIn("Billing Period: 2026-07-01 to 2026-07-06", text)
         self.assertIn("TOTAL AMOUNT: PHP    10.00", text)
         self.assertNotIn("TOTAL AMOUNT: PHP   339.00", text)
 
@@ -948,6 +948,33 @@ class HandheldSyncTests(unittest.TestCase):
 
         self.assertIn("Due Penalty(10%): PHP    10.00", text)
         self.assertIn("After Due   : PHP   110.00", text)
+
+    def test_receipt_uses_latest_reading_date_for_billing_period_start(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "late_fee": None,
+                "bill_status": "Paid",
+                "latest_reading_date": "2026-07-02",
+            },
+            previous=24,
+            present=25,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-06",
+        )
+
+        self.assertIn("Billing Period: 2026-07-02 to 2026-07-06", text)
 
 
 if __name__ == "__main__":
