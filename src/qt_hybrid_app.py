@@ -60,6 +60,7 @@ except ImportError:
 try:
     from .database import (
         authenticate_user,
+        cache_meter_reader_credentials,
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
@@ -79,6 +80,7 @@ try:
 except ImportError:
     from database import (
         authenticate_user,
+        cache_meter_reader_credentials,
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
@@ -196,12 +198,14 @@ class LoginBridge(QObject):
             self.loginFailed.emit()
             return
 
+        offline_error = None
         try:
             if HandheldSyncDataAccess is None or SyncConfig is None:
                 raise RuntimeError("Sync module is unavailable.")
             if self._sync_dal is None:
                 self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
             user = self._sync_dal.authenticateMeterReader(username, password)
+            cache_meter_reader_credentials(user, password)
             save_current_meter_reader(user)
         except PermissionError as exc:
             self._error_message = str(exc) or "This account is not an active Meter Reader."
@@ -214,7 +218,17 @@ class LoginBridge(QObject):
             self.loginFailed.emit()
             return
         except Exception as exc:
-            self._error_message = str(exc) or "Unable to verify this account right now."
+            offline_error = str(exc) or "Unable to verify this account right now."
+        
+        if offline_error is not None:
+            user = authenticate_user(username, password)
+            if user:
+                save_current_meter_reader(user)
+                self._error_message = ""
+                self.errorMessageChanged.emit()
+                self.loginSuccess.emit(user)
+                return
+            self._error_message = offline_error
             self.errorMessageChanged.emit()
             self.loginFailed.emit()
             return

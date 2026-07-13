@@ -170,6 +170,17 @@ def init_db():
     )
     _ensure_columns(
         conn,
+        "users",
+        {
+            "account_id": "INTEGER",
+            "full_name": "TEXT",
+            "contact_number": "TEXT",
+            "role_id": "INTEGER",
+            "account_status": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
         "reading_schedule",
         {
             "schedule_date": "TEXT",
@@ -278,7 +289,11 @@ def authenticate_user(username: str, password: str) -> dict | None:
     """Validate user credentials. Returns user dict or None if invalid."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT username, password, name, reader_id FROM users WHERE username = ?",
+        """
+        SELECT username, password, name, reader_id, account_id, full_name, contact_number, role_id, account_status
+        FROM users
+        WHERE username = ?
+        """,
         (username,)
     ).fetchone()
     conn.close()
@@ -286,10 +301,68 @@ def authenticate_user(username: str, password: str) -> dict | None:
     if row and row['password'] == password:
         return {
             'username': row['username'],
-            'name': row['name'],
-            'id': row['reader_id']
+            'name': row['full_name'] or row['name'],
+            'full_name': row['full_name'] or row['name'],
+            'id': row['account_id'] if row['account_id'] not in (None, "") else row['reader_id'],
+            'account_id': row['account_id'],
+            'reader_id': row['reader_id'],
+            'contact_number': row['contact_number'],
+            'role_id': row['role_id'],
+            'account_status': row['account_status'] or "Offline Cached",
         }
     return None
+
+
+def cache_meter_reader_credentials(user: dict, password: str) -> None:
+    """Persist a successful meter-reader login locally for offline auth fallback."""
+    username = str(user.get("username") or "").strip()
+    if not username or password in (None, ""):
+        return
+
+    full_name = str(user.get("full_name") or user.get("name") or username).strip()
+    reader_id = str(user.get("reader_id") or user.get("account_id") or user.get("id") or username).strip()
+    account_id = user.get("account_id", user.get("id"))
+    try:
+        account_id = int(account_id) if account_id not in (None, "") else None
+    except (TypeError, ValueError):
+        account_id = None
+    role_id = user.get("role_id")
+    try:
+        role_id = int(role_id) if role_id not in (None, "") else None
+    except (TypeError, ValueError):
+        role_id = None
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO users (
+            username, password, name, reader_id, account_id, full_name, contact_number, role_id, account_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET
+            password = excluded.password,
+            name = excluded.name,
+            reader_id = excluded.reader_id,
+            account_id = excluded.account_id,
+            full_name = excluded.full_name,
+            contact_number = excluded.contact_number,
+            role_id = excluded.role_id,
+            account_status = excluded.account_status
+        """,
+        (
+            username,
+            str(password),
+            full_name,
+            reader_id,
+            account_id,
+            full_name,
+            user.get("contact_number"),
+            role_id,
+            user.get("account_status") or "Active",
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_all_users() -> list[dict]:
