@@ -76,6 +76,8 @@ def init_db():
             total_after_due_date REAL,
             bill_status TEXT,
             late_fee REAL,
+            latest_reading REAL,
+            latest_reading_date TEXT,
             zone_id          INTEGER NOT NULL,
             FOREIGN KEY (zone_id) REFERENCES zones(id)
         );
@@ -141,6 +143,12 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'Scheduled',
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     _ensure_columns(
@@ -166,6 +174,8 @@ def init_db():
             "total_after_due_date": "REAL",
             "bill_status": "TEXT",
             "late_fee": "REAL",
+            "latest_reading": "REAL",
+            "latest_reading_date": "TEXT",
         },
     )
     _ensure_columns(
@@ -360,6 +370,34 @@ def cache_meter_reader_credentials(user: dict, password: str) -> None:
             role_id,
             user.get("account_status") or "Active",
         ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_app_setting(key: str, default=None):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?",
+        (str(key),),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return default
+    return row["value"]
+
+
+def set_app_setting(key: str, value) -> None:
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (str(key), None if value is None else str(value)),
     )
     conn.commit()
     conn.close()
@@ -571,10 +609,14 @@ def search_consumer(
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                    (
-                        SELECT MAX(date(r_prev.reading_date))
-                        FROM readings r_prev
-                        WHERE r_prev.consumer_id = c.id
+                    c.latest_reading,
+                    COALESCE(
+                        c.latest_reading_date,
+                        (
+                            SELECT MAX(date(r_prev.reading_date))
+                            FROM readings r_prev
+                            WHERE r_prev.consumer_id = c.id
+                        )
                     ) AS latest_reading_date,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
@@ -615,8 +657,13 @@ def search_consumer(
                      AND date(r.reading_date) >= date(?)
                      AND date(r.reading_date) <= date(?)
                )
+               AND NOT (
+                   c.latest_reading_date IS NOT NULL
+                   AND date(c.latest_reading_date) >= date(?)
+                   AND date(c.latest_reading_date) <= date(?)
+               )
             """
-            params.extend([month_start, month_end])
+            params.extend([month_start, month_end, month_start, month_end])
         else:
             sql += """
                AND NOT EXISTS (
@@ -661,10 +708,14 @@ def search_consumers_by_zone(
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
     sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
-                    (
-                        SELECT MAX(date(r_prev.reading_date))
-                        FROM readings r_prev
-                        WHERE r_prev.consumer_id = c.id
+                    c.latest_reading,
+                    COALESCE(
+                        c.latest_reading_date,
+                        (
+                            SELECT MAX(date(r_prev.reading_date))
+                            FROM readings r_prev
+                            WHERE r_prev.consumer_id = c.id
+                        )
                     ) AS latest_reading_date,
                     c.classification_id, c.classification_name, c.minimum_cubic,
                     c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
@@ -705,8 +756,13 @@ def search_consumers_by_zone(
                      AND date(r.reading_date) >= date(?)
                      AND date(r.reading_date) <= date(?)
                )
+               AND NOT (
+                   c.latest_reading_date IS NOT NULL
+                   AND date(c.latest_reading_date) >= date(?)
+                   AND date(c.latest_reading_date) <= date(?)
+               )
             """
-            params.extend([month_start, month_end])
+            params.extend([month_start, month_end, month_start, month_end])
         else:
             sql += """
                AND NOT EXISTS (
@@ -943,6 +999,23 @@ def get_zone_stats(
                      AND date(r.reading_date) <= date(?)""",
                 (z["id"], month_start, month_end),
             ).fetchone()[0]
+            synced_only_read = conn.execute(
+                """SELECT COUNT(*)
+                   FROM consumers c
+                   WHERE c.zone_id = ?
+                     AND c.latest_reading_date IS NOT NULL
+                     AND date(c.latest_reading_date) >= date(?)
+                     AND date(c.latest_reading_date) <= date(?)
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM readings r
+                         WHERE r.consumer_id = c.id
+                           AND date(r.reading_date) >= date(?)
+                           AND date(r.reading_date) <= date(?)
+                     )""",
+                (z["id"], month_start, month_end, month_start, month_end),
+            ).fetchone()[0]
+            read += synced_only_read
             flagged = conn.execute(
                 """SELECT COUNT(*)
                    FROM readings r
@@ -1018,6 +1091,8 @@ def get_zone_consumers_with_status(
             c.name,
             c.address,
             c.previous_reading,
+            c.latest_reading,
+            c.latest_reading_date,
             c.classification_id,
             c.classification_name,
             c.minimum_cubic,
@@ -1036,10 +1111,25 @@ def get_zone_consumers_with_status(
             c.total_after_due_date,
             c.bill_status,
             c.late_fee,
-            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
-            r.present_reading as reading_value,
+            CASE
+                WHEN r.id IS NOT NULL THEN 1
+                WHEN c.latest_reading_date IS NOT NULL
+                 AND date(c.latest_reading_date) >= date(?)
+                 AND date(c.latest_reading_date) <= date(?)
+                THEN 1
+                ELSE 0
+            END as is_read,
+            COALESCE(
+                r.present_reading,
+                CASE
+                    WHEN c.latest_reading_date IS NOT NULL
+                     AND date(c.latest_reading_date) >= date(?)
+                     AND date(c.latest_reading_date) <= date(?)
+                    THEN c.latest_reading
+                END
+            ) as reading_value,
             r.consumption,
-            r.reading_date,
+            COALESCE(r.reading_date, c.latest_reading_date) as reading_date,
             r.exception,
             r.is_flagged
            FROM consumers c
@@ -1064,7 +1154,12 @@ def get_zone_consumers_with_status(
                    AND rs.status IN ('Scheduled', 'In Progress')
              )
            ORDER BY c.meter_no"""
-        params = (month_start, month_end, zone_name, effective_reader_id, month_start, month_end)
+        params = (
+            month_start, month_end,
+            month_start, month_end,
+            month_start, month_end,
+            zone_name, effective_reader_id, month_start, month_end,
+        )
     else:
         sql = """SELECT 
             c.id,
@@ -1073,6 +1168,8 @@ def get_zone_consumers_with_status(
             c.name,
             c.address,
             c.previous_reading,
+            c.latest_reading,
+            c.latest_reading_date,
             c.classification_id,
             c.classification_name,
             c.minimum_cubic,
@@ -1091,10 +1188,14 @@ def get_zone_consumers_with_status(
             c.total_after_due_date,
             c.bill_status,
             c.late_fee,
-            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END as is_read,
-            r.present_reading as reading_value,
+            CASE
+                WHEN r.id IS NOT NULL THEN 1
+                WHEN c.latest_reading_date IS NOT NULL THEN 1
+                ELSE 0
+            END as is_read,
+            COALESCE(r.present_reading, c.latest_reading) as reading_value,
             r.consumption,
-            r.reading_date,
+            COALESCE(r.reading_date, c.latest_reading_date) as reading_date,
             r.exception,
             r.is_flagged
            FROM consumers c
@@ -1214,6 +1315,8 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         total_after_due_date = _optional_float(c.get("total_after_due_date"))
         bill_status = (str(c.get("bill_status")).strip() if c.get("bill_status") not in (None, "") else None)
         late_fee = _optional_float(c.get("late_fee"))
+        latest_reading = _optional_float(c.get("latest_reading"))
+        latest_reading_date = (str(c.get("latest_reading_date") or c.get("latest_reading_updated_at")).strip() if c.get("latest_reading_date") not in (None, "") or c.get("latest_reading_updated_at") not in (None, "") else None)
         cid = c.get("id")
 
         local_consumer_id = None
@@ -1226,14 +1329,14 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
+                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
                     name = excluded.name,
-                    address = COALESCE(excluded.address, consumers.address),
+                    address = COALESCE(NULLIF(TRIM(excluded.address), ''), consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
                     classification_name = excluded.classification_name,
@@ -1242,17 +1345,19 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
-                    billing_month = COALESCE(excluded.billing_month, consumers.billing_month),
-                    date_covered_from = COALESCE(excluded.date_covered_from, consumers.date_covered_from),
-                    date_covered_to = COALESCE(excluded.date_covered_to, consumers.date_covered_to),
+                    billing_month = COALESCE(NULLIF(TRIM(excluded.billing_month), ''), consumers.billing_month),
+                    date_covered_from = COALESCE(NULLIF(TRIM(excluded.date_covered_from), ''), consumers.date_covered_from),
+                    date_covered_to = COALESCE(NULLIF(TRIM(excluded.date_covered_to), ''), consumers.date_covered_to),
                     amount_due = excluded.amount_due,
                     previous_balance = excluded.previous_balance,
-                    due_date = excluded.due_date,
+                    due_date = COALESCE(NULLIF(TRIM(excluded.due_date), ''), consumers.due_date),
                     penalty = excluded.penalty,
                     previous_penalty = excluded.previous_penalty,
                     total_after_due_date = excluded.total_after_due_date,
                     bill_status = excluded.bill_status,
                     late_fee = excluded.late_fee,
+                    latest_reading = excluded.latest_reading,
+                    latest_reading_date = excluded.latest_reading_date,
                     zone_id = excluded.zone_id
                 """,
                 (
@@ -1260,7 +1365,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id,
                 ),
             )
         else:
@@ -1271,13 +1376,13 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id
+                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = excluded.name,
-                    address = COALESCE(excluded.address, consumers.address),
+                    address = COALESCE(NULLIF(TRIM(excluded.address), ''), consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
                     classification_name = excluded.classification_name,
@@ -1286,17 +1391,19 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     excess_rate_per_cubic = excluded.excess_rate_per_cubic,
                     due_days = excluded.due_days,
                     penalty_percent = excluded.penalty_percent,
-                    billing_month = COALESCE(excluded.billing_month, consumers.billing_month),
-                    date_covered_from = COALESCE(excluded.date_covered_from, consumers.date_covered_from),
-                    date_covered_to = COALESCE(excluded.date_covered_to, consumers.date_covered_to),
+                    billing_month = COALESCE(NULLIF(TRIM(excluded.billing_month), ''), consumers.billing_month),
+                    date_covered_from = COALESCE(NULLIF(TRIM(excluded.date_covered_from), ''), consumers.date_covered_from),
+                    date_covered_to = COALESCE(NULLIF(TRIM(excluded.date_covered_to), ''), consumers.date_covered_to),
                     amount_due = excluded.amount_due,
                     previous_balance = excluded.previous_balance,
-                    due_date = excluded.due_date,
+                    due_date = COALESCE(NULLIF(TRIM(excluded.due_date), ''), consumers.due_date),
                     penalty = excluded.penalty,
                     previous_penalty = excluded.previous_penalty,
                     total_after_due_date = excluded.total_after_due_date,
                     bill_status = excluded.bill_status,
                     late_fee = excluded.late_fee,
+                    latest_reading = excluded.latest_reading,
+                    latest_reading_date = excluded.latest_reading_date,
                     zone_id = excluded.zone_id
                 """,
                 (
@@ -1304,14 +1411,12 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, zone_id,
+                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id,
                 ),
             )
             local_row = cur.execute("SELECT id FROM consumers WHERE meter_no = ?", (meter_no,)).fetchone()
             local_consumer_id = int(local_row["id"]) if local_row else local_consumer_id
 
-        latest_reading = _optional_float(c.get("latest_reading"))
-        latest_reading_date = str(c.get("latest_reading_date") or c.get("latest_reading_updated_at") or "").strip()
         if local_consumer_id is not None and latest_reading is not None and latest_reading_date:
             existing_reading = cur.execute(
                 """

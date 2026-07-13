@@ -46,6 +46,30 @@ def _percent_line(label: str, value: float) -> str:
     return f" {label:<11}: {value:>8.2f}%"
 
 
+def _wrap_field_lines(label: str, value, width: int = 11, indent: int | None = None) -> list[str]:
+    text = str(value if value not in (None, "") else "N/A")
+    prefix = f" {label:<{width}}: "
+    remaining = max(8, RECEIPT_WIDTH - len(prefix))
+    continuation_indent = " " * (indent if indent is not None else len(prefix))
+    lines: list[str] = []
+    current = text.strip()
+    first = True
+    while current:
+        if len(current) <= remaining:
+            lines.append((prefix if first else continuation_indent) + current)
+            break
+        split_at = current.rfind(" ", 0, remaining + 1)
+        if split_at <= 0:
+            split_at = remaining
+        chunk = current[:split_at].rstrip()
+        lines.append((prefix if first else continuation_indent) + chunk)
+        current = current[split_at:].lstrip()
+        first = False
+    if not lines:
+        lines.append(prefix.rstrip())
+    return lines
+
+
 def _require_float(consumer: dict, field_name: str) -> float:
     value = consumer.get(field_name)
     if value is None or value == "":
@@ -254,20 +278,22 @@ def build_receipt_text(
         _center_text(str(consumer.get("acct_no", "N/A"))),
         _center_text(str(consumer.get("name", "N/A"))),
         divider,
-        _field_line("Address", address),
+    ]
+    lines.extend(_wrap_field_lines("Address", address))
+    lines += [
         _field_line("Meter No", consumer.get("meter_no", "N/A")),
         _field_line("Class", consumer.get("classification_name", "N/A")),
         divider,
-        _field_line("Billing Month", billing_month, width=13),
-        _field_line("Billing Period", billing_period, width=13),
-        _field_line("Present Read", _format_reading(present), width=13),
-        _field_line("Prev Read", _format_reading(previous), width=13),
-        _field_line("Consumption", f"{_format_reading(consumption)} m3", width=13),
-        _field_line("Prev Bill", previous_bill, width=13),
+        _field_line("Bill Month", billing_month, width=11),
+        _field_line("Coverage", billing_period, width=11),
+        _field_line("Present", _format_reading(present), width=11),
+        _field_line("Previous", _format_reading(previous), width=11),
+        _field_line("Use", f"{_format_reading(consumption)} m3", width=11),
+        _field_line("Prev Bill", previous_bill, width=11),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
-        lines.append(_field_line("Exception", exception))
+        lines.extend(_wrap_field_lines("Exception", exception))
 
     lines += [
         divider,
@@ -275,12 +301,12 @@ def build_receipt_text(
         _money_line("Min Rate", minimum_rate),
         _money_line("Excess Rate", excess_rate),
         _money_line("Current Bill", current_bill),
-        _money_line("Due Penalty(10%)", penalty),
+        _money_line("Due Pen(10%)", penalty),
         _money_line("Previous", carried_previous_bill),
-        _money_line("Prev Penalty(10%)", previous_penalty),
+        _money_line("Prev Pen(10%)", previous_penalty),
         border,
-        _money_line("TOTAL AMOUNT", amount_due),
-        _money_line("After Due", after_due),
+        _money_line("TOTAL DUE", amount_due),
+        _money_line("AFTER DUE", after_due),
         _field_line("Due Date", due_date),
         border,
         _field_line("Date", date_str),
@@ -289,7 +315,6 @@ def build_receipt_text(
         divider,
         _center_text("Thank you!"),
         border,
-        "",
         "",
         "",
     ]

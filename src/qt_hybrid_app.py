@@ -64,6 +64,7 @@ try:
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
+        get_app_setting,
         get_current_meter_reader,
         get_latest_receipt_print,
         list_receipt_print_history,
@@ -71,6 +72,7 @@ try:
         get_zone_stats,
         init_db,
         save_current_meter_reader,
+        set_app_setting,
         save_receipt_print,
         update_consumer_due_date,
         replace_consumers_from_sync,
@@ -85,6 +87,7 @@ except ImportError:
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_all_zone_names,
+        get_app_setting,
         get_current_meter_reader,
         get_latest_receipt_print,
         list_receipt_print_history,
@@ -92,6 +95,7 @@ except ImportError:
         get_zone_stats,
         init_db,
         save_current_meter_reader,
+        set_app_setting,
         save_receipt_print,
         update_consumer_due_date,
         replace_consumers_from_sync,
@@ -186,6 +190,46 @@ def _normalize_shutdown_error(detail: str) -> str:
             "Add: pi ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff, /bin/systemctl"
         )
     return detail or "Power-off command failed."
+
+
+def _friendly_save_target_text(value: str) -> str:
+    normalized = (value or "").strip()
+    mapping = {
+        "Local SQLite Queue (Supabase retry pending)": "Saved on device, waiting to retry upload",
+        "Supabase auto-sync on change": "Automatic cloud upload is on",
+        "MAIN_PG available, Supabase offline": "Saved on device, cloud unavailable",
+        "Local SQLite Queue (offline)": "Saved on device while offline",
+        "Local SQLite only": "Saved on device",
+    }
+    return mapping.get(normalized, normalized or "Saved on device")
+
+
+def _friendly_backup_state_text(value: str) -> str:
+    normalized = (value or "").strip()
+    mapping = {
+        "Manual MAIN_PG sync not configured": "Secondary backup not configured",
+        "MAIN_PG conflicts need review": "Backup needs review",
+        "MAIN_PG manual sync needed": "Secondary backup waiting for manual sync",
+        "Backed up to MAIN_PG": "Secondary backup complete",
+        "MAIN_PG unavailable": "Secondary backup unavailable",
+        "Not configured": "Not configured",
+    }
+    return mapping.get(normalized, normalized or "Not configured")
+
+
+def _has_receipt_context_gaps(consumer: dict | None) -> bool:
+    if not consumer:
+        return False
+    address = str(consumer.get("address") or consumer.get("consumer_address") or "").strip()
+    if not address or address.lower() == "n/a":
+        return True
+    if not str(consumer.get("billing_month") or "").strip():
+        return True
+    if not str(consumer.get("date_covered_from") or "").strip():
+        return True
+    if not str(consumer.get("date_covered_to") or "").strip():
+        return True
+    return False
 
 
 class LoginBridge(QObject):
@@ -310,6 +354,7 @@ class AppBridge(QObject):
     lastPullCountChanged = Signal()
     autoPullEnabledChanged = Signal()
     autoPushEnabledChanged = Signal()
+    autoSyncEnabledChanged = Signal()
     pullIntervalChanged = Signal()
     syncLogsChanged = Signal()
     supabaseLogsChanged = Signal()
@@ -388,6 +433,7 @@ class AppBridge(QObject):
         self._last_pull_count = 0
         self._auto_pull_enabled = False
         self._auto_push_enabled = False
+        self._auto_sync_enabled = self._load_auto_sync_enabled()
         self._pull_interval = max(300, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "300000")) // 1000)
         self._sync_logs = "No sync activity yet."
         self._supabase_logs = "No Supabase activity yet."
@@ -788,6 +834,20 @@ class AppBridge(QObject):
             self._auto_push_enabled = False
             self.autoPushEnabledChanged.emit()
 
+    @Property(bool, notify=autoSyncEnabledChanged)
+    def autoSyncEnabled(self) -> bool:
+        return self._auto_sync_enabled
+
+    @autoSyncEnabled.setter
+    def autoSyncEnabled(self, val: bool) -> None:
+        normalized = bool(val)
+        if self._auto_sync_enabled == normalized:
+            return
+        self._auto_sync_enabled = normalized
+        set_app_setting("auto_sync_enabled", "1" if normalized else "0")
+        self.autoSyncEnabledChanged.emit()
+        self._apply_auto_sync_setting()
+
     @Property(int, notify=pullIntervalChanged)
     def pullInterval(self) -> int:
         return self._pull_interval
@@ -798,6 +858,9 @@ class AppBridge(QObject):
         if self._pull_interval != normalized:
             self._pull_interval = normalized
             self.pullIntervalChanged.emit()
+            if self._sync_dal and self._auto_sync_enabled:
+                self._sync_dal.stop_sync_worker()
+                self._sync_dal.start_sync_worker(interval_seconds=self._pull_interval)
 
     @Property(str, notify=syncLogsChanged)
     def syncLogs(self) -> str:
@@ -884,6 +947,20 @@ class AppBridge(QObject):
         self.lastSyncChanged.emit()
         self.lastPullMirrorChanged.emit()
 
+    def _load_auto_sync_enabled(self) -> bool:
+        raw = get_app_setting("auto_sync_enabled", "1")
+        return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+    def _apply_auto_sync_setting(self) -> None:
+        if not self._sync_dal:
+            self._emit_sync_state()
+            return
+        if self._auto_sync_enabled:
+            self._sync_dal.start_sync_worker(interval_seconds=self._pull_interval)
+        else:
+            self._sync_dal.stop_sync_worker()
+        self._refresh_sync_snapshot()
+
     def _init_sync(self) -> None:
         if HandheldSyncDataAccess is None or SyncConfig is None:
             self._sync_status = "Sync Failed"
@@ -908,7 +985,7 @@ class AppBridge(QObject):
                 self._emit_sync_state()
                 return
             self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
-            self._refresh_sync_snapshot()
+            self._apply_auto_sync_setting()
         except Exception as exc:
             self._sync_dal = None
             self._sync_status = "Sync Failed"
@@ -935,8 +1012,8 @@ class AppBridge(QObject):
             self._supabase_status = "Online" if snapshot.get("supabase_online") else "Offline"
             self._supabase_pending_count = int(snapshot.get("supabase_pending_count", 0))
             self._supabase_last_sync = str(snapshot.get("supabase_last_sync_time") or "Never")
-            self._save_target = str(snapshot.get("save_target", "Local SQLite only"))
-            self._backup_state = str(snapshot.get("backup_state", "Not configured"))
+            self._save_target = _friendly_save_target_text(str(snapshot.get("save_target", "Local SQLite only")))
+            self._backup_state = _friendly_backup_state_text(str(snapshot.get("backup_state", "Not configured")))
             self._last_sync = str(snapshot.get("last_sync_time") or "Never")
             entries = self._sync_dal.get_recent_audit_entries(limit=25)
             self._sync_logs = "\n\n".join(
@@ -994,6 +1071,29 @@ class AppBridge(QObject):
 
     def _run_auto_pull(self) -> None:
         return
+
+    def _ensure_current_consumer_receipt_context(self) -> None:
+        if not self._consumer or not self._sync_dal:
+            return
+        if not _has_receipt_context_gaps(self._consumer):
+            return
+        consumer_id = self._consumer.get("id")
+        try:
+            consumer_id_int = int(consumer_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            refreshed = self._sync_dal.getConsumerContext(consumer_id_int)
+        except Exception:
+            return
+        if not refreshed:
+            return
+        replace_consumers_from_sync([refreshed])
+        self._reload_current_consumer_from_db()
+
+    @Slot(bool)
+    def setAutoSyncEnabled(self, enabled: bool) -> None:
+        self.autoSyncEnabled = enabled
 
     def _reload_current_consumer_from_db(self) -> None:
         if not self._consumer:
@@ -1074,15 +1174,8 @@ class AppBridge(QObject):
         if "pulled" in result:
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self.lastPullCountChanged.emit()
-        self._zones = get_all_zone_names()
-        if self._selected_zone not in self._zones:
-            self._selected_zone = self._zones[0] if self._zones else ""
-        self.zonesChanged.emit()
-        self.selectedZoneChanged.emit()
-        self._refresh_search_suggestions()
-        self._refresh_zone_consumers()
+        self._refresh_assigned_consumer_dataset()
         self._reload_current_consumer_from_db()
-        self.update_stats()
         self._refresh_sync_snapshot()
         if result.get("kind") == "sync" and not result.get("silent"):
             sync_result = result.get("result", {})
@@ -1427,6 +1520,21 @@ class AppBridge(QObject):
         if latest_entry:
             receipt = latest_entry["receipt_text"]
         else:
+            if _has_receipt_context_gaps(row) and self._sync_dal:
+                try:
+                    refreshed = self._sync_dal.getConsumerContext(int(consumer_id))
+                except Exception:
+                    refreshed = None
+                if refreshed:
+                    replace_consumers_from_sync([refreshed])
+                    updated = search_consumer(
+                        str(row.get("meter_no") or consumer_id),
+                        unread_only=False,
+                        schedule_date=self.selectedBillingDate,
+                        meter_reader_id=self._meter_reader_account_id or None,
+                    )
+                    if updated:
+                        row = updated
             receipt = build_receipt_text(row, previous, present, row.get("exception") or "None", self._reader_name)
             latest_entry = {
                 "consumer_id": consumer_id,
@@ -1550,6 +1658,7 @@ class AppBridge(QObject):
 
     def _build_pending_receipt_job(self) -> dict:
         self._reload_current_consumer_from_db()
+        self._ensure_current_consumer_receipt_context()
         present = _to_float(self._present_reading)
         previous = _to_float(self._consumer["previous_reading"])
         consumption = present - previous

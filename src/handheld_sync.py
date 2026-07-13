@@ -707,7 +707,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
             name = excluded.name,
-            address = excluded.address,
+            address = COALESCE(NULLIF(TRIM(excluded.address), ''), handheld_consumers_cache.address),
             zone_name = excluded.zone_name,
             classification_id = excluded.classification_id,
             classification_name = excluded.classification_name,
@@ -716,12 +716,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             excess_rate_per_cubic = excluded.excess_rate_per_cubic,
             due_days = excluded.due_days,
             penalty_percent = excluded.penalty_percent,
-            billing_month = excluded.billing_month,
-            date_covered_from = excluded.date_covered_from,
-            date_covered_to = excluded.date_covered_to,
+            billing_month = COALESCE(NULLIF(TRIM(excluded.billing_month), ''), handheld_consumers_cache.billing_month),
+            date_covered_from = COALESCE(NULLIF(TRIM(excluded.date_covered_from), ''), handheld_consumers_cache.date_covered_from),
+            date_covered_to = COALESCE(NULLIF(TRIM(excluded.date_covered_to), ''), handheld_consumers_cache.date_covered_to),
             amount_due = excluded.amount_due,
             previous_balance = excluded.previous_balance,
-            due_date = excluded.due_date,
+            due_date = COALESCE(NULLIF(TRIM(excluded.due_date), ''), handheld_consumers_cache.due_date),
             penalty = excluded.penalty,
             previous_penalty = excluded.previous_penalty,
             total_after_due_date = excluded.total_after_due_date,
@@ -1816,6 +1816,7 @@ class MainPostgresClient:
             COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
             c.account_number AS acct_no,
             CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
+            c.address AS address,
             z.zone_name AS zone_name,
             c.classification_id,
             cls.classification_name,
@@ -1833,7 +1834,9 @@ class MainPostgresClient:
             lb.total_after_due_date,
             lb.status AS bill_status,
             adm.late_fee,
-            COALESCE(prev.last_reading, 0)::int AS previous_reading
+            COALESCE(prev.last_reading, 0)::int AS previous_reading,
+            prev.last_reading::int AS latest_reading,
+            prev.last_reading_date AS latest_reading_date
         FROM {self._schema}.consumer c
         JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
         LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
@@ -1865,7 +1868,8 @@ class MainPostgresClient:
         ) lb ON TRUE
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
         LEFT JOIN LATERAL (
-            SELECT mr.current_reading AS last_reading
+            SELECT mr.current_reading AS last_reading,
+                   mr.reading_date AS last_reading_date
             FROM {self._schema}.meterreadings mr
             WHERE mr.consumer_id = c.consumer_id
             ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
@@ -1930,6 +1934,7 @@ class MainPostgresClient:
             c.consumer_id,
             c.account_number AS acct_no,
             COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
+            c.address AS address,
             z.zone_name,
             c.classification_id,
             cls.classification_name,
@@ -1941,6 +1946,8 @@ class MainPostgresClient:
             adm.late_fee,
             m.meter_id,
             COALESCE(prev.last_reading, 0)::int AS previous_reading,
+            prev.last_reading::int AS latest_reading,
+            prev.last_reading_date AS latest_reading_date,
             lb.billing_month,
             lb.date_covered_from,
             lb.date_covered_to,
@@ -1985,7 +1992,8 @@ class MainPostgresClient:
         ) lb ON TRUE
         LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
         LEFT JOIN LATERAL (
-            SELECT mr.current_reading AS last_reading
+            SELECT mr.current_reading AS last_reading,
+                   mr.reading_date AS last_reading_date
             FROM {self._schema}.meterreadings mr
             WHERE mr.consumer_id = c.consumer_id
             ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
@@ -2302,6 +2310,36 @@ class HandheldSyncDataAccess:
                 errors.append(f"{label}: {exc}")
 
         return None, errors
+
+    def getConsumerContext(self, consumer_id: int) -> dict:
+        errors: list[str] = []
+        if self.remote and self.remote.is_online():
+            try:
+                context = self.remote.get_consumer_context(int(consumer_id))
+                if context:
+                    context = self._overlay_main_pg_rates_for_consumers([context])[0]
+                    self.local.cache_consumers([context])
+                    return context
+            except Exception as exc:
+                errors.append(f"Supabase: {exc}")
+        if self.main_pg and self.main_pg.is_online():
+            try:
+                context = self.main_pg.get_consumer_context(int(consumer_id))
+                if context:
+                    self.local.cache_consumers([context])
+                    return context
+            except Exception as exc:
+                errors.append(f"MAIN_PG: {exc}")
+        cached = self.local.load_cached_consumers(None)
+        for row in cached:
+            try:
+                if int(row.get("id")) == int(consumer_id):
+                    return row
+            except (TypeError, ValueError):
+                continue
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return {}
 
     def loadAssignedConsumers(
         self,

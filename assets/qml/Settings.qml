@@ -129,7 +129,7 @@ Rectangle {
 
     Dialog {
         id: supabaseLogsDialog
-        title: "Supabase Activity"
+        title: "Cloud Sync Activity"
         anchors.centerIn: parent
         width: Math.min(parent.width - 32, 560)
         height: Math.min(parent.height - 60, 520)
@@ -144,7 +144,7 @@ Rectangle {
 
             TextArea {
                 width: supabaseLogsDialog.availableWidth
-                text: bridgeObj ? bridgeObj.supabaseLogs : "No Supabase activity yet."
+                text: bridgeObj ? bridgeObj.supabaseLogs : "No cloud sync activity yet."
                 readOnly: true
                 wrapMode: TextEdit.Wrap
                 color: "#111827"
@@ -206,19 +206,19 @@ Rectangle {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: settingsRoot.compactScreen ? 6 : 9
-                            Text { text: "Pending: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
-                            Text { text: "Supabase: " + (bridgeObj ? bridgeObj.supabaseStatus : "Offline"); color: bridgeObj && bridgeObj.supabaseStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Supabase pending: " + (bridgeObj ? bridgeObj.supabasePendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Supabase last sync: " + (bridgeObj ? bridgeObj.supabaseLastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Save Target: " + (bridgeObj ? bridgeObj.saveTarget : "Local SQLite only"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Pending uploads: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
+                            Text { text: "Cloud sync: " + (bridgeObj ? bridgeObj.supabaseStatus : "Offline"); color: bridgeObj && bridgeObj.supabaseStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Waiting for cloud upload: " + (bridgeObj ? bridgeObj.supabasePendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Cloud last sync: " + (bridgeObj ? bridgeObj.supabaseLastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Storage mode: " + (bridgeObj ? bridgeObj.saveTarget : "Saved on device"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Secondary backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text {
-                                text: "Last pull: "
+                                text: "Last download: "
                                       + (bridgeObj ? bridgeObj.lastPullCount : 0)
-                                      + " pulled | "
+                                      + " downloaded | "
                                       + (bridgeObj ? bridgeObj.lastPullMirror : 0)
-                                      + " mirrored"
+                                      + " updated on device"
                                 color: "#526176"
                                 font.family: "Montserrat"
                                 font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
@@ -249,7 +249,7 @@ Rectangle {
                                     anchors.margins: 12
                                     spacing: 6
                                     Text {
-                                        text: "Manual Sync Only"
+                                        text: "Sync Mode"
                                         color: "#111827"
                                         font.family: "Montserrat"
                                         font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.bodyText : TouchMetrics.subheading
@@ -258,12 +258,29 @@ Rectangle {
                                     Text {
                                         Layout.fillWidth: true
                                         wrapMode: Text.WordWrap
-                                        text: "Readings are saved locally on the device and uploaded only when Manual Sync is tapped. Schedule downloads happen on login and manual refresh."
+                                        text: "Readings are always saved on the device first. You can let the device sync them automatically in the background, or disable that and use Manual Sync when needed."
                                         color: "#526176"
                                         font.family: "Montserrat"
                                         font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
                                     }
                                 }
+                            }
+                            CustomSwitch {
+                                checked: bridgeObj ? bridgeObj.autoSyncEnabled : true
+                                labelText: "Automatic Sync"
+                                onToggled: {
+                                    if (bridgeObj) bridgeObj.setAutoSyncEnabled(checked)
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                text: bridgeObj && bridgeObj.autoSyncEnabled
+                                      ? "When enabled, pending readings sync automatically in the background whenever the device has internet."
+                                      : "When disabled, readings stay on the device until Manual Sync is tapped."
+                                color: "#526176"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
                             }
                         }
                     }
@@ -288,7 +305,7 @@ Rectangle {
                             onClicked: logsDialog.open()
                         }
                         ActionButton {
-                            text: "Supabase Logs"
+                            text: "Cloud Logs"
                             buttonColor: "#0F766E"
                             hoverColor: "#115E59"
                             Layout.fillWidth: true
