@@ -911,12 +911,12 @@ class SupabaseRestClient:
         self._schema = cfg.supabase_db_schema or "public"
         self._table_columns_cache: dict[str, set[str]] = {}
 
-    def _req(self, method: str, table_or_path: str, *, query: dict | None = None, payload: dict | list | None = None,
+    def _req(self, method: str, table_or_path: str, *, query: dict | list | tuple | None = None, payload: dict | list | None = None,
              use_service_key: bool = False, extra_headers: dict | None = None) -> tuple[int, object]:
         base = table_or_path if table_or_path.startswith("/") else f"/rest/v1/{table_or_path}"
         url = f"{self._url}{base}"
         if query:
-            url += "?" + parse.urlencode(query)
+            url += "?" + parse.urlencode(query, doseq=True)
         body = None
         headers = {
             "apikey": self._service_key if use_service_key else self._anon_key,
@@ -973,11 +973,40 @@ class SupabaseRestClient:
             "status": str(status or "Scheduled"),
         }
         http_status, data = self._req("GET", "/api/reading-schedules", query=query, use_service_key=True)
-        if http_status >= 400:
-            raise RuntimeError(f"Supabase reading schedule lookup failed: {data}")
-        if not isinstance(data, list):
+        if http_status < 400 and isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+
+        fallback_query = [
+            ("select", "schedule_id,schedule_date,zone_id,meter_reader_id,status,zone:zone_id(zone_name)"),
+            ("meter_reader_id", f"eq.{meter_reader_id}"),
+            ("schedule_date", f"gte.{date_from}"),
+            ("schedule_date", f"lte.{date_to}"),
+            ("status", f"eq.{status or 'Scheduled'}"),
+            ("order", "schedule_date.asc,schedule_id.asc"),
+        ]
+        fallback_status, fallback_data = self._req("GET", "reading_schedule", query=fallback_query, use_service_key=True)
+        if fallback_status >= 400:
+            raise RuntimeError(f"Supabase reading schedule lookup failed: {data}; fallback failed: {fallback_data}")
+        if not isinstance(fallback_data, list):
             return []
-        return [row for row in data if isinstance(row, dict)]
+        normalized: list[dict] = []
+        for row in fallback_data:
+            if not isinstance(row, dict):
+                continue
+            zone_obj = row.get("zone") if isinstance(row.get("zone"), dict) else {}
+            normalized.append(
+                {
+                    "Schedule_ID": row.get("schedule_id"),
+                    "Schedule_Date": row.get("schedule_date"),
+                    "Zone_ID": row.get("zone_id"),
+                    "Zone_Name": zone_obj.get("zone_name") or row.get("zone_name"),
+                    "Meter_Reader_ID": row.get("meter_reader_id"),
+                    "Meter_Reader_Name": None,
+                    "Meter_Reader_Contact": None,
+                    "Status": row.get("status"),
+                }
+            )
+        return normalized
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
         data = None
@@ -1251,7 +1280,9 @@ class SupabaseRestClient:
         if meter_reader_id not in (None, ""):
             start_date = date_from or _device_schedule_window()[0]
             end_date = date_to or _device_schedule_window()[1]
-            schedules = self.load_reading_schedules(meter_reader_id, start_date, end_date, "Scheduled")
+            schedules: list[dict] = []
+            for schedule_status in ("Scheduled", "In Progress"):
+                schedules.extend(self.load_reading_schedules(meter_reader_id, start_date, end_date, schedule_status))
             zone_filters = sorted(
                 {
                     str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
@@ -1895,12 +1926,11 @@ class MainPostgresClient:
         if meter_reader_id in (None, ""):
             zone_filters = [zone_name] if zone_name else []
         else:
-            schedules = self.load_reading_schedules(
-                meter_reader_id,
-                date_from or _device_schedule_window()[0],
-                date_to or _device_schedule_window()[1],
-                "Scheduled",
-            )
+            start_date = date_from or _device_schedule_window()[0]
+            end_date = date_to or _device_schedule_window()[1]
+            schedules: list[dict] = []
+            for schedule_status in ("Scheduled", "In Progress"):
+                schedules.extend(self.load_reading_schedules(meter_reader_id, start_date, end_date, schedule_status))
             zone_filters = sorted(
                 {
                     str(row.get("Zone_Name") or "").strip()
@@ -2345,17 +2375,21 @@ class HandheldSyncDataAccess:
         self,
         meter_reader_id: object | None = None,
         zone_name: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
     ) -> list[dict]:
         effective_zone_name = zone_name
         if zone_name is None and isinstance(meter_reader_id, str) and not meter_reader_id.isdigit():
             effective_zone_name = meter_reader_id
         effective_meter_reader_id = None if (isinstance(meter_reader_id, str) and not meter_reader_id.isdigit()) else meter_reader_id
-        date_from, date_to = _device_schedule_window()
+        if not date_from or not date_to:
+            date_from, date_to = _device_schedule_window()
         if self.remote and self.remote.is_online():
             try:
                 schedules = []
                 if effective_meter_reader_id not in (None, ""):
-                    schedules = self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, "Scheduled")
+                    for schedule_status in ("Scheduled", "In Progress"):
+                        schedules.extend(self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
                     self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
                 data = self.remote.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
                 data = self._overlay_main_pg_rates_for_consumers(data)
@@ -2368,7 +2402,8 @@ class HandheldSyncDataAccess:
             try:
                 schedules = []
                 if effective_meter_reader_id not in (None, ""):
-                    schedules = self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, "Scheduled")
+                    for schedule_status in ("Scheduled", "In Progress"):
+                        schedules.extend(self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
                     self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
                 data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
                 data = self._overlay_main_pg_rates_for_consumers(data)

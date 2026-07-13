@@ -285,7 +285,9 @@ def build_receipt_text(
         _field_line("Class", consumer.get("classification_name", "N/A")),
         divider,
         _field_line("Bill Month", billing_month, width=11),
-        _field_line("Coverage", billing_period, width=11),
+    ]
+    lines.extend(_wrap_field_lines("Coverage", billing_period, width=11))
+    lines += [
         _field_line("Present", _format_reading(present), width=11),
         _field_line("Previous", _format_reading(previous), width=11),
         _field_line("Use", f"{_format_reading(consumption)} m3", width=11),

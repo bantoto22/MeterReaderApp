@@ -180,6 +180,16 @@ def _add_months(value: datetime, months: int) -> datetime:
     return value.replace(year=year, month=month, day=min(value.day, last_day))
 
 
+def _month_window(value: datetime.date) -> tuple[str, str]:
+    start = value.replace(day=1)
+    if start.month == 12:
+        next_month = start.replace(year=start.year + 1, month=1, day=1)
+    else:
+        next_month = start.replace(month=start.month + 1, day=1)
+    end = next_month - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 def _normalize_shutdown_error(detail: str) -> str:
     lowered = (detail or "").lower()
     if "a password is required" in lowered or "password" in lowered or "interactive authentication required" in lowered:
@@ -235,66 +245,85 @@ def _has_receipt_context_gaps(consumer: dict | None) -> bool:
 class LoginBridge(QObject):
     loginSuccess = Signal(dict)
     loginFailed = Signal()
+    loginBusyChanged = Signal()
+    loginAttemptFinished = Signal(bool, object, str)
     errorMessageChanged = Signal()
     clearInputsRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._error_message = ""
+        self._login_busy = False
         self._sync_dal = None
+        self.loginAttemptFinished.connect(self._finish_login_attempt)
 
     @Property(str, notify=errorMessageChanged)
     def errorMessage(self) -> str:
         return self._error_message
 
+    @Property(bool, notify=loginBusyChanged)
+    def loginBusy(self) -> bool:
+        return self._login_busy
+
     @Slot(str, str)
     def attemptLogin(self, username, password):
         username = username.strip()
         password = password.strip()
+        if self._login_busy:
+            return
         if not username or not password:
             self._error_message = "Please enter username and password"
             self.errorMessageChanged.emit()
             self.loginFailed.emit()
             return
 
-        offline_error = None
-        try:
-            if HandheldSyncDataAccess is None or SyncConfig is None:
-                raise RuntimeError("Sync module is unavailable.")
-            if self._sync_dal is None:
-                self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
-            user = self._sync_dal.authenticateMeterReader(username, password)
-            cache_meter_reader_credentials(user, password)
-            save_current_meter_reader(user)
-        except PermissionError as exc:
-            self._error_message = str(exc) or "This account is not an active Meter Reader."
-            self.errorMessageChanged.emit()
-            self.loginFailed.emit()
-            return
-        except ValueError:
-            self._error_message = "Invalid username or password."
-            self.errorMessageChanged.emit()
-            self.loginFailed.emit()
-            return
-        except Exception as exc:
-            offline_error = str(exc) or "Unable to verify this account right now."
-        
-        if offline_error is not None:
+        self._login_busy = True
+        self._error_message = ""
+        self.loginBusyChanged.emit()
+        self.errorMessageChanged.emit()
+
+        def _task() -> None:
+            offline_error = None
+            try:
+                if HandheldSyncDataAccess is None or SyncConfig is None:
+                    raise RuntimeError("Sync module is unavailable.")
+                if self._sync_dal is None:
+                    self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
+                user = self._sync_dal.authenticateMeterReader(username, password)
+                cache_meter_reader_credentials(user, password)
+                save_current_meter_reader(user)
+                self.loginAttemptFinished.emit(True, user, "")
+                return
+            except PermissionError as exc:
+                self.loginAttemptFinished.emit(False, None, str(exc) or "This account is not an active Meter Reader.")
+                return
+            except ValueError:
+                self.loginAttemptFinished.emit(False, None, "Invalid username or password.")
+                return
+            except Exception as exc:
+                offline_error = str(exc) or "Unable to verify this account right now."
+
             user = authenticate_user(username, password)
             if user:
                 save_current_meter_reader(user)
-                self._error_message = ""
-                self.errorMessageChanged.emit()
-                self.loginSuccess.emit(user)
+                self.loginAttemptFinished.emit(True, user, "")
                 return
-            self._error_message = offline_error
-            self.errorMessageChanged.emit()
-            self.loginFailed.emit()
-            return
+            self.loginAttemptFinished.emit(False, None, offline_error)
 
-        self._error_message = ""
+        threading.Thread(target=_task, daemon=True).start()
+
+    @Slot(bool, object, str)
+    def _finish_login_attempt(self, success: bool, user: object, message: str) -> None:
+        self._login_busy = False
+        self.loginBusyChanged.emit()
+        if success and isinstance(user, dict):
+            self._error_message = ""
+            self.errorMessageChanged.emit()
+            self.loginSuccess.emit(user)
+            return
+        self._error_message = message or "Unable to log in."
         self.errorMessageChanged.emit()
-        self.loginSuccess.emit(user)
+        self.loginFailed.emit()
 
 
 class AppBridge(QObject):
@@ -402,6 +431,7 @@ class AppBridge(QObject):
 
         self._billing_month_offsets = [0, 1]
         self._selected_billing_month_offset = 0
+        self._selected_reading_date_iso = datetime.now().date().isoformat()
 
         self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
         self._selected_zone = self._zones[0] if self._zones else ""
@@ -736,6 +766,7 @@ class AppBridge(QObject):
             offset = 0
         if self._selected_billing_month_offset != offset:
             self._selected_billing_month_offset = offset
+            self._selected_reading_date_iso = _add_months(datetime.now(), offset).date().isoformat()
             self.selectedBillingMonthChanged.emit()
             if self._consumer:
                 self._due_date = self._default_due_date_for_consumer(self._consumer)
@@ -752,7 +783,37 @@ class AppBridge(QObject):
 
     @Property(str, notify=selectedBillingMonthChanged)
     def selectedBillingDate(self) -> str:
-        return self._selected_reading_date().isoformat()
+        return self._selected_reading_date_iso
+
+    @selectedBillingDate.setter
+    def selectedBillingDate(self, val: str) -> None:
+        raw = str(val or "").strip()
+        normalized = _normalize_iso_date(raw)
+        next_value = normalized or raw
+        if self._selected_reading_date_iso == next_value:
+            return
+        self._selected_reading_date_iso = next_value
+        if normalized:
+            today = datetime.now().date()
+            selected = datetime.fromisoformat(normalized).date()
+            for offset in self._billing_month_offsets:
+                target = _add_months(datetime.combine(today, datetime.min.time()), offset).date()
+                if target.year == selected.year and target.month == selected.month:
+                    self._selected_billing_month_offset = offset
+                    break
+            if self._consumer:
+                self._due_date = self._default_due_date_for_consumer(self._consumer)
+                self.dueDateChanged.emit()
+            self._zones = get_all_zone_names(normalized, self._meter_reader_account_id or None)
+            if self._selected_zone not in self._zones:
+                self._selected_zone = self._zones[0] if self._zones else ""
+                self.selectedZoneChanged.emit()
+            self.zonesChanged.emit()
+            self.update_stats()
+            self._refresh_search_suggestions()
+            if self._progress_details_visible:
+                self._refresh_zone_consumers()
+        self.selectedBillingMonthChanged.emit()
 
     # Exception properties
     @Property(list, notify=exceptionsChanged)
@@ -1066,7 +1127,13 @@ class AppBridge(QObject):
             return
         if self._sync_dal:
             try:
-                consumers = self._sync_dal.loadAssignedConsumers(self._meter_reader_account_id, None)
+                date_from, date_to = _month_window(self._selected_reading_date())
+                consumers = self._sync_dal.loadAssignedConsumers(
+                    self._meter_reader_account_id,
+                    None,
+                    date_from,
+                    date_to,
+                )
                 replace_consumers_from_sync(consumers)
             except Exception as exc:
                 self._sync_logs = f"Assigned schedule refresh failed: {exc}"
@@ -1131,7 +1198,10 @@ class AppBridge(QObject):
         self.dueDateChanged.emit()
 
     def _selected_reading_date(self) -> datetime.date:
-        return _add_months(datetime.now(), self._selected_billing_month_offset).date()
+        normalized = _normalize_iso_date(self._selected_reading_date_iso)
+        if normalized:
+            return datetime.fromisoformat(normalized).date()
+        return datetime.now().date()
 
     def _default_due_date_for_consumer(self, consumer: dict | None = None) -> str:
         source = consumer or self._consumer or {}
@@ -1702,6 +1772,9 @@ class AppBridge(QObject):
             return
 
         try:
+            if not _normalize_iso_date(self._selected_reading_date_iso):
+                self.alertRequested.emit("Invalid Reading Date", "Enter a valid reading date in YYYY-MM-DD format.")
+                return
             self._reload_current_consumer_from_db()
             present = _to_float(self._present_reading)
             previous = _to_float(self._consumer["previous_reading"])
@@ -1962,8 +2035,8 @@ class AppBridge(QObject):
             self.validationColorChanged.emit()
             self.validationMessageChanged.emit()
             self.update_stats()
-            if self._progress_details_visible:
-                self._refresh_zone_consumers()
+            self._refresh_search_suggestions()
+            self._refresh_zone_consumers()
             self.refreshPrintHistory()
             if result.get("printed", True):
                 self.alertRequested.emit("Print Complete", "Receipt printed successfully.")

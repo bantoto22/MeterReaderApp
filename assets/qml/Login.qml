@@ -222,7 +222,7 @@ Rectangle {
                             }
 
                             contentItem: Text {
-                                text: "Log In"
+                                text: (typeof loginBridge !== "undefined" && loginBridge && loginBridge.loginBusy) ? "Logging in..." : "Log In"
                                 color: "white"
                                 font.pixelSize: TouchMetrics.buttonText
                                 font.family: "Montserrat"
@@ -230,6 +230,7 @@ Rectangle {
                                 horizontalAlignment: Text.AlignHCenter
                                 verticalAlignment: Text.AlignVCenter
                             }
+                            enabled: !(typeof loginBridge !== "undefined" && loginBridge && loginBridge.loginBusy)
                             background: Rectangle { radius: 8; color: loginButton.pressed ? "#1E40AF" : (loginButton.hovered ? "#1D4ED8" : "#2563EB") }
                             onClicked: {
                                 if (typeof loginBridge !== "undefined" && loginBridge) {

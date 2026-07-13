@@ -799,9 +799,17 @@ def save_reading(
             "VALUES (?, ?, ?, ?, ?)",
             (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0),
         )
+    effective_reading_date = str(reading_date).strip() if reading_date else date.today().isoformat()
     conn.execute(
-        "UPDATE consumers SET previous_reading = ? WHERE id = ?",
-        (present_reading, consumer_id))
+        """
+        UPDATE consumers
+        SET previous_reading = ?,
+            latest_reading = ?,
+            latest_reading_date = ?
+        WHERE id = ?
+        """,
+        (present_reading, present_reading, effective_reading_date, consumer_id),
+    )
     conn.commit()
     reading_id = cur.lastrowid
     conn.close()
@@ -826,6 +834,13 @@ def save_receipt_print(
     """Persist a printed receipt snapshot for later tracing and reprinting."""
     conn = get_connection()
     cur = conn.cursor()
+    consumer_row = conn.execute(
+        "SELECT acct_no, name, meter_no FROM consumers WHERE id = ? LIMIT 1",
+        (int(consumer_id),),
+    ).fetchone()
+    resolved_acct_no = acct_no or (consumer_row["acct_no"] if consumer_row else None)
+    resolved_consumer_name = consumer_name or (consumer_row["name"] if consumer_row else None)
+    resolved_meter_no = meter_no or (consumer_row["meter_no"] if consumer_row else None)
     cur.execute(
         """
         INSERT INTO receipt_prints (
@@ -838,9 +853,9 @@ def save_receipt_print(
         (
             consumer_id,
             reading_id,
-            acct_no,
-            consumer_name or "Unknown",
-            meter_no or "N/A",
+            resolved_acct_no,
+            resolved_consumer_name or "Unknown",
+            resolved_meter_no or "N/A",
             zone_name,
             previous_reading,
             present_reading,
