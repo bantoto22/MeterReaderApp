@@ -471,14 +471,13 @@ class AppBridge(QObject):
         self.printExecutionFinished.connect(self._finish_print_execution)
 
         self._wifi_timer = QTimer(self)
-        self._wifi_timer.setInterval(5_000)
+        self._wifi_timer.setInterval(15_000)
         self._wifi_timer.timeout.connect(self.refreshWifiStatus)
         self._wifi_timer.start()
 
         self._wifi_scan_timer = QTimer(self)
-        self._wifi_scan_timer.setInterval(15_000)
+        self._wifi_scan_timer.setInterval(60_000)
         self._wifi_scan_timer.timeout.connect(self.refreshWifiNetworks)
-        self._wifi_scan_timer.start()
 
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -486,7 +485,7 @@ class AppBridge(QObject):
         self.update_stats()
         self._init_sync()
         self.refreshWifiStatus()
-        self.refreshWifiNetworks()
+        self._sync_wifi_polling_for_tab()
 
     # Properties
     @Property(int, notify=zoneRemainingCountChanged)
@@ -500,6 +499,7 @@ class AppBridge(QObject):
     def currentTab(self, val: int) -> None:
         if self._current_tab != val:
             self._current_tab = val
+            self._sync_wifi_polling_for_tab()
             self.currentTabChanged.emit()
 
     @Property(str, notify=readerNameChanged)
@@ -1043,6 +1043,17 @@ class AppBridge(QObject):
     def _reset_auto_pull_timer(self) -> None:
         return
 
+    def _sync_wifi_polling_for_tab(self) -> None:
+        settings_tab_index = 2
+        if self._current_tab == settings_tab_index:
+            if not self._wifi_scan_timer.isActive():
+                self._wifi_scan_timer.start()
+            self.refreshWifiStatus()
+            self.refreshWifiNetworks()
+            return
+        if self._wifi_scan_timer.isActive():
+            self._wifi_scan_timer.stop()
+
     def _refresh_assigned_consumer_dataset(self) -> None:
         if not self._meter_reader_account_id:
             self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
@@ -1307,6 +1318,8 @@ class AppBridge(QObject):
 
     @Slot()
     def refreshWifiNetworks(self) -> None:
+        if self._current_tab != 2:
+            return
         self._start_wifi_scan(True)
 
     def _finish_wifi_scan(self, networks: list, error: str) -> None:
