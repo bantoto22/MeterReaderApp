@@ -696,7 +696,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
-            name = excluded.name,
+            name = COALESCE(NULLIF(NULLIF(NULLIF(TRIM(excluded.name), ''), 'Unknown'), 'unknown'), handheld_consumers_cache.name),
             address = COALESCE(NULLIF(TRIM(excluded.address), ''), handheld_consumers_cache.address),
             zone_name = excluded.zone_name,
             classification_id = excluded.classification_id,

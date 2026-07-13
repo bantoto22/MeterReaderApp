@@ -66,6 +66,7 @@ try:
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
+        get_consumer_by_id,
         get_latest_receipt_print,
         list_receipt_print_history,
         get_zone_consumers_with_status,
@@ -89,6 +90,7 @@ except ImportError:
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
+        get_consumer_by_id,
         get_latest_receipt_print,
         list_receipt_print_history,
         get_zone_consumers_with_status,
@@ -1601,9 +1603,8 @@ class AppBridge(QObject):
                     refreshed = None
                 if refreshed:
                     replace_consumers_from_sync([refreshed])
-                    updated = search_consumer(
-                        str(row.get("meter_no") or consumer_id),
-                        unread_only=False,
+                    updated = get_consumer_by_id(
+                        consumer_id,
                         schedule_date=self.selectedBillingDate,
                         meter_reader_id=self._meter_reader_account_id or None,
                     )
@@ -1661,18 +1662,16 @@ class AppBridge(QObject):
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
 
-        meter_no = str(row.get("meter_no") or "").strip()
-        consumer = search_consumer(
-            meter_no,
-            unread_only=False,
+        consumer = get_consumer_by_id(
+            consumer_id,
             schedule_date=self.selectedBillingDate,
             meter_reader_id=self._meter_reader_account_id or None,
-        ) if meter_no else None
+        )
         if consumer is None:
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
 
-        self._search_query = meter_no
+        self._search_query = str(consumer.get("meter_no") or consumer.get("acct_no") or consumer_id)
         self.searchQueryChanged.emit()
         self._refresh_search_suggestions()
         self._load_consumer_for_new_bill(consumer)

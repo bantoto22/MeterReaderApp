@@ -32,6 +32,13 @@ def _sqlite_safe(value):
     return value
 
 
+def _clean_display_name(value) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"unknown", "n/a", "none", "null"}:
+        return None
+    return " ".join(text.split())
+
+
 def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: dict[str, str]) -> None:
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     for name, definition in column_defs.items():
@@ -681,6 +688,54 @@ def search_consumer(
     return None
 
 
+def get_consumer_by_id(
+    consumer_id: int | str,
+    schedule_date: str | None = None,
+    meter_reader_id: int | str | None = None,
+) -> dict | None:
+    """Look up a consumer by exact local/remote consumer id."""
+    conn = get_connection()
+    effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
+    month_start, month_end = _month_bounds(effective_date)
+    sql = """SELECT c.id, c.meter_no, c.acct_no, c.name, c.address, c.previous_reading,
+                    c.latest_reading,
+                    COALESCE(
+                        c.latest_reading_date,
+                        (
+                            SELECT MAX(date(r_prev.reading_date))
+                            FROM readings r_prev
+                            WHERE r_prev.consumer_id = c.id
+                        )
+                    ) AS latest_reading_date,
+                    c.classification_id, c.classification_name, c.minimum_cubic,
+                    c.minimum_rate, c.excess_rate_per_cubic, c.due_days, c.penalty_percent,
+                    c.billing_month, c.date_covered_from, c.date_covered_to,
+                    c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
+                    c.bill_status, c.late_fee,
+                    z.name AS zone_name
+             FROM consumers c
+             JOIN zones z ON c.zone_id = z.id
+             WHERE c.id = ?"""
+    params: list[object] = [int(consumer_id)]
+    if use_schedule_filter:
+        sql += """
+               AND EXISTS (
+                   SELECT 1
+                   FROM reading_schedule rs
+                   WHERE rs.zone_name = z.name
+                     AND rs.meter_reader_id = ?
+                     AND date(rs.schedule_date) >= date(?)
+                     AND date(rs.schedule_date) <= date(?)
+                     AND rs.status IN ('Scheduled', 'In Progress')
+               )
+        """
+        params.extend([effective_reader_id, month_start, month_end])
+    sql += " LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 
 def search_consumers_by_zone(
     query: str,
@@ -829,7 +884,7 @@ def save_receipt_print(
         (int(consumer_id),),
     ).fetchone()
     resolved_acct_no = acct_no or (consumer_row["acct_no"] if consumer_row else None)
-    resolved_consumer_name = consumer_name or (consumer_row["name"] if consumer_row else None)
+    resolved_consumer_name = _clean_display_name(consumer_name) or _clean_display_name(consumer_row["name"] if consumer_row else None)
     resolved_meter_no = meter_no or (consumer_row["meter_no"] if consumer_row else None)
     cur.execute(
         """
@@ -983,7 +1038,7 @@ def get_zone_stats(
               AND date(rs.schedule_date) >= date(?)
               AND date(rs.schedule_date) <= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
-            ORDER BY z.name
+            ORDER BY rs.zone_name
             """,
             (effective_reader_id, month_start, month_end),
         ).fetchall()
@@ -1062,14 +1117,13 @@ def get_all_zone_names(
     if use_schedule_filter:
         rows = conn.execute(
             """
-            SELECT DISTINCT z.name
-            FROM zones z
-            JOIN reading_schedule rs ON rs.zone_name = z.name
+            SELECT DISTINCT rs.zone_name AS name
+            FROM reading_schedule rs
             WHERE rs.meter_reader_id = ?
               AND date(rs.schedule_date) >= date(?)
               AND date(rs.schedule_date) <= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
-            ORDER BY z.name
+            ORDER BY rs.zone_name
             """,
             (effective_reader_id, month_start, month_end),
         ).fetchall()
@@ -1293,7 +1347,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
             continue
 
         acct_no = (c.get("acct_no") or "").strip()
-        name = (c.get("name") or "Unknown").strip()
+        name = _clean_display_name(c.get("name")) or "Unknown"
         address = (str(c.get("address")).strip() if c.get("address") not in (None, "") else None)
         previous_reading = int(c.get("previous_reading") or 0)
         try:
@@ -1340,7 +1394,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
-                    name = excluded.name,
+                    name = COALESCE(NULLIF(NULLIF(NULLIF(TRIM(excluded.name), ''), 'Unknown'), 'unknown'), consumers.name),
                     address = COALESCE(NULLIF(TRIM(excluded.address), ''), consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
@@ -1386,7 +1440,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
-                    name = excluded.name,
+                    name = COALESCE(NULLIF(NULLIF(NULLIF(TRIM(excluded.name), ''), 'Unknown'), 'unknown'), consumers.name),
                     address = COALESCE(NULLIF(TRIM(excluded.address), ''), consumers.address),
                     previous_reading = excluded.previous_reading,
                     classification_id = excluded.classification_id,
