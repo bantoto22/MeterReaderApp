@@ -4,6 +4,7 @@ Uses Python's built-in sqlite3 module (no extra install needed).
 """
 
 import os
+import re
 import sqlite3
 from datetime import date
 from decimal import Decimal
@@ -515,6 +516,12 @@ def _month_bounds(schedule_date: str | None) -> tuple[str, str]:
     return month_start.isoformat(), month_end.isoformat()
 
 
+def _natural_zone_key(value: str) -> tuple:
+    text = str(value or "")
+    parts = re.split(r"(\d+)", text.lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
 def replace_reading_schedules_from_sync(
     schedules: list[dict],
     meter_reader_id: int | str | None,
@@ -557,6 +564,7 @@ def replace_reading_schedules_from_sync(
             meter_reader_id_int = reader_id_int
         if not schedule_date or not zone_name:
             continue
+        cur.execute("INSERT OR IGNORE INTO zones (name) VALUES (?)", (zone_name,))
         cur.execute(
             """
             INSERT INTO reading_schedule (
@@ -1130,7 +1138,7 @@ def get_all_zone_names(
     else:
         rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
     conn.close()
-    return [r["name"] for r in rows]
+    return sorted([r["name"] for r in rows], key=_natural_zone_key)
 
 
 def get_zone_consumers_with_status(

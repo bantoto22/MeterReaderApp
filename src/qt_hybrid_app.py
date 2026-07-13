@@ -77,6 +77,7 @@ try:
         save_receipt_print,
         update_consumer_due_date,
         replace_consumers_from_sync,
+        replace_reading_schedules_from_sync,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
@@ -101,6 +102,7 @@ except ImportError:
         save_receipt_print,
         update_consumer_due_date,
         replace_consumers_from_sync,
+        replace_reading_schedules_from_sync,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
@@ -427,6 +429,8 @@ class AppBridge(QObject):
         self._paper_status = "OK"
         self._search_suggestions = []
         self._zone_consumers = []
+        self._zone_refreshing: set[str] = set()
+        self._zone_refresh_attempted: set[str] = set()
         self._progress_details_visible = False
         self._operation_busy = False
         self._operation_busy_message = ""
@@ -661,6 +665,32 @@ class AppBridge(QObject):
         except Exception:
             self._zone_consumers = []
         self.zoneConsumersChanged.emit()
+        if not self._zone_consumers:
+            self._start_selected_zone_consumer_refresh(self._selected_zone)
+
+    def _start_selected_zone_consumer_refresh(self, zone_name: str) -> None:
+        if not zone_name or not self._sync_dal or not self._meter_reader_account_id:
+            return
+        if zone_name in self._zone_refreshing or zone_name in self._zone_refresh_attempted:
+            return
+        self._zone_refreshing.add(zone_name)
+        self._zone_refresh_attempted.add(zone_name)
+
+        def _task() -> None:
+            try:
+                date_from, date_to = _month_window(self._selected_reading_date())
+                consumers = self._sync_dal.loadAssignedConsumers(
+                    self._meter_reader_account_id,
+                    zone_name,
+                    date_from,
+                    date_to,
+                )
+                mirrored = replace_consumers_from_sync(consumers)
+                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored, "zone": zone_name})
+            except Exception as exc:
+                self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
+
+        threading.Thread(target=_task, daemon=True).start()
 
     @Property(list, notify=zonesChanged)
     def zones(self) -> list:
@@ -1088,6 +1118,24 @@ class AppBridge(QObject):
         self._refresh_zone_consumers()
         self.update_stats()
 
+    def _mirror_assigned_schedules(self, date_from: str, date_to: str) -> int:
+        if not self._sync_dal or not self._meter_reader_account_id:
+            return 0
+        schedules: list[dict] = []
+        for client in (getattr(self._sync_dal, "remote", None), getattr(self._sync_dal, "main_pg", None)):
+            if not client:
+                continue
+            try:
+                if hasattr(client, "is_online") and not client.is_online():
+                    continue
+                for status in ("Scheduled", "In Progress"):
+                    schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
+                if schedules:
+                    break
+            except Exception:
+                continue
+        return replace_reading_schedules_from_sync(schedules, self._meter_reader_account_id, date_from, date_to)
+
     def _start_assigned_consumer_dataset_refresh(self) -> None:
         if not self._meter_reader_account_id or not self._sync_dal:
             self._refresh_local_assignment_views()
@@ -1096,6 +1144,7 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 date_from, date_to = _month_window(self._selected_reading_date())
+                schedule_count = self._mirror_assigned_schedules(date_from, date_to)
                 consumers = self._sync_dal.loadAssignedConsumers(
                     self._meter_reader_account_id,
                     None,
@@ -1103,13 +1152,16 @@ class AppBridge(QObject):
                     date_to,
                 )
                 mirrored = replace_consumers_from_sync(consumers)
-                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored})
+                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored, "schedules": schedule_count})
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc)})
 
         threading.Thread(target=_task, daemon=True).start()
 
     def _finish_assigned_consumer_dataset(self, result: dict) -> None:
+        zone_name = str(result.get("zone") or "")
+        if zone_name:
+            self._zone_refreshing.discard(zone_name)
         if not result.get("success"):
             self._sync_logs = f"Assigned schedule refresh failed: {result.get('error', 'Unknown error')}"
             self.syncLogsChanged.emit()
@@ -1128,6 +1180,7 @@ class AppBridge(QObject):
         if self._sync_dal:
             try:
                 date_from, date_to = _month_window(self._selected_reading_date())
+                self._mirror_assigned_schedules(date_from, date_to)
                 consumers = self._sync_dal.loadAssignedConsumers(
                     self._meter_reader_account_id,
                     None,
@@ -1741,10 +1794,17 @@ class AppBridge(QObject):
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
         receipt = build_receipt_text(consumer_snapshot, previous, present, exception, self._reader_name, reading_date=reading_date)
+        flagged = consumption > 500 or exception != "None"
+        if due_date:
+            update_consumer_due_date(self._consumer["id"], due_date)
+        reading_id = save_reading(self._consumer["id"], present, consumption, exception, flagged, reading_date)
+        self._save_to_sync_layer(self._consumer["id"], present, consumption, exception, flagged, reading_date, due_date)
         return {
             "job_type": "original",
             "consumer_snapshot": consumer_snapshot,
             "consumer_id": self._consumer["id"],
+            "reading_id": reading_id,
+            "saved_locally": True,
             "previous": previous,
             "present": present,
             "consumption": consumption,
@@ -1776,6 +1836,9 @@ class AppBridge(QObject):
                 return
             job = self._build_pending_receipt_job()
             self._open_print_preview("Print Preview", job["receipt_text"], "Proceed to Print", job)
+            self.update_stats()
+            self._refresh_search_suggestions()
+            self._refresh_zone_consumers()
         except Exception as e:
             self.alertRequested.emit("Save Failed", str(e))
 
@@ -1827,6 +1890,7 @@ class AppBridge(QObject):
                 mirrored = 0
                 try:
                     date_from, date_to = _month_window(self._selected_reading_date())
+                    self._mirror_assigned_schedules(date_from, date_to)
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id or None,
                         None,
@@ -1908,11 +1972,13 @@ class AppBridge(QObject):
                     exception = str(job["exception"])
                     reading_date = str(job.get("reading_date") or datetime.now().date().isoformat())
                     due_date = str(job.get("due_date") or consumer.get("due_date") or "")
-                    flagged = consumption > 500 or exception != "None"
-                    if due_date:
-                        update_consumer_due_date(job["consumer_id"], due_date)
-                    reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
-                    self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date)
+                    reading_id = int(job.get("reading_id") or 0)
+                    if not reading_id:
+                        flagged = consumption > 500 or exception != "None"
+                        if due_date:
+                            update_consumer_due_date(job["consumer_id"], due_date)
+                        reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
+                        self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date)
                     saved_receipt_id = save_receipt_print(
                         job["consumer_id"],
                         receipt_text,
