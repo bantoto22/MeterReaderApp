@@ -596,6 +596,41 @@ class HandheldSyncTests(unittest.TestCase):
                 os.remove(db_path)
             except OSError:
                 pass
+
+    def test_replace_consumers_from_sync_keeps_consumers_without_meter_numbers(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            mirrored = database.replace_consumers_from_sync(
+                [
+                    {
+                        "id": 33,
+                        "meter_no": None,
+                        "acct_no": "ACCT-Z3-033",
+                        "name": "No Meter Yet",
+                        "zone_name": "Zone 3",
+                        "previous_reading": 0,
+                    }
+                ]
+            )
+
+            rows = database.get_zone_consumers_with_status("Zone 3")
+
+            self.assertEqual(mirrored, 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["meter_no"], "ACCT-Z3-033")
+            self.assertEqual(rows[0]["acct_no"], "ACCT-Z3-033")
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
     def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             def load_waterrates_by_classification(self):
@@ -631,6 +666,68 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(rows[0]["minimum_cubic"], 10)
         self.assertEqual(rows[0]["minimum_rate"], 150.0)
         self.assertEqual(rows[0]["excess_rate_per_cubic"], 15.0)
+
+    def test_supabase_assigned_consumer_pull_fetches_each_scheduled_zone_by_id(self):
+        class FakeSupabaseClient(SupabaseRestClient):
+            def __init__(self):
+                super().__init__(
+                    SyncConfig(
+                        supabase_url="https://example.invalid",
+                        supabase_anon_key="anon",
+                        supabase_service_role_key="service",
+                        main_pg_host="",
+                        main_pg_port=5432,
+                        main_pg_db="",
+                        main_pg_user="",
+                        main_pg_password="",
+                    )
+                )
+                self.consumer_zone_queries = []
+
+            def load_reading_schedules(self, meter_reader_id, date_from, date_to, status="Scheduled"):
+                if status != "Scheduled":
+                    return []
+                return [
+                    {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
+                    {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
+                ]
+
+            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
+                if table_or_path == "consumer":
+                    self.consumer_zone_queries.append(query.get("zone_id"))
+                    if query.get("zone_id") == "eq.1":
+                        return 200, [
+                            {
+                                "consumer_id": 101,
+                                "account_number": "A-101",
+                                "meter_no": "MTR-Z1-101",
+                                "first_name": "Zone",
+                                "last_name": "One",
+                                "zone_id": 1,
+                                "zone": {"zone_name": "Zone 1"},
+                            }
+                        ]
+                    if query.get("zone_id") == "eq.3":
+                        return 200, [
+                            {
+                                "consumer_id": 301,
+                                "account_number": "A-301",
+                                "meter_no": "MTR-Z3-301",
+                                "first_name": "Zone",
+                                "last_name": "Three",
+                                "zone_id": 3,
+                                "zone": {"zone_name": "Zone 3"},
+                            }
+                        ]
+                    return 200, []
+                return 200, []
+
+        client = FakeSupabaseClient()
+        rows = client.load_assigned_consumers(12, None, "2026-07-01", "2026-07-31")
+
+        self.assertEqual(client.consumer_zone_queries, ["eq.1", "eq.3"])
+        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
+        self.assertEqual([row["id"] for row in rows], [101, 301])
 
     def test_save_reading_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):

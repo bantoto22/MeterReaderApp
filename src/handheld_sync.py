@@ -411,8 +411,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     def _normalize_cached_consumer(cls, item: dict) -> tuple:
         row = cls._sqlite_safe_row(item)
         meter_no = str(row.get("meter_no") or "").strip()
-        if not meter_no or meter_no.startswith("ACCT-") or meter_no.startswith("CID-"):
-            return ()
+        if not meter_no:
+            acct_no = str(row.get("acct_no") or "").strip()
+            consumer_id = row.get("id")
+            meter_no = acct_no if acct_no.upper().startswith("ACCT-") else f"ACCT-{acct_no}" if acct_no else f"CID-{consumer_id}"
         classification_id = row.get("classification_id")
         if classification_id not in (None, ""):
             try:
@@ -1199,11 +1201,12 @@ class SupabaseRestClient:
             if latest:
                 return latest
         return {}
-    def _consumer_select_variants(self, include_reading_fields: bool = True) -> list[str]:
+    def _consumer_select_variants(self, include_reading_fields: bool = True, inner_zone: bool = False) -> list[str]:
         reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
+        zone_select = "zone:zone_id!inner(zone_name)" if inner_zone else "zone:zone_id(zone_name)"
         base_suffix = (
             f",first_name,middle_name,last_name,zone_id,classification_id{reading_fields},status,"
-            "zone:zone_id(zone_name),classification:classification_id(classification_id,classification_name)"
+            f"{zone_select},classification:classification_id(classification_id,classification_name)"
         )
         return [
             f"consumer_id,account_number,meter_no,address,consumer_address,service_address{base_suffix}",
@@ -1223,12 +1226,22 @@ class SupabaseRestClient:
             f"consumer_id,account_number{base_suffix}",
         ]
 
-    def _fetch_consumer_rows(self, zone_name: str | None = None, consumer_id: int | None = None) -> list[dict]:
+    def _fetch_consumer_rows(
+        self,
+        zone_name: str | None = None,
+        consumer_id: int | None = None,
+        zone_id: int | str | None = None,
+    ) -> list[dict]:
         last_error: object = {"error": "No consumer query variant attempted."}
         for include_reading_fields in (True, False):
-            for select in self._consumer_select_variants(include_reading_fields=include_reading_fields):
+            for select in self._consumer_select_variants(
+                include_reading_fields=include_reading_fields,
+                inner_zone=bool(zone_name and zone_id in (None, "")),
+            ):
                 query = {"select": select}
-                if zone_name:
+                if zone_id not in (None, ""):
+                    query["zone_id"] = f"eq.{zone_id}"
+                elif zone_name:
                     query["zone.zone_name"] = f"eq.{zone_name}"
                 if consumer_id is not None:
                     query["consumer_id"] = f"eq.{consumer_id}"
@@ -1266,28 +1279,36 @@ class SupabaseRestClient:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> list[dict]:
-        zone_filters: list[str] = []
+        zone_filters: list[tuple[int | None, str]] = []
         if meter_reader_id not in (None, ""):
             start_date = date_from or _device_schedule_window()[0]
             end_date = date_to or _device_schedule_window()[1]
             schedules: list[dict] = []
             for schedule_status in ("Scheduled", "In Progress"):
                 schedules.extend(self.load_reading_schedules(meter_reader_id, start_date, end_date, schedule_status))
-            zone_filters = sorted(
-                {
-                    str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
-                    for row in schedules
-                    if str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
-                }
-            )
+            seen_zones: set[tuple[int | None, str]] = set()
+            for row in schedules:
+                raw_zone_id = row.get("Zone_ID", row.get("zone_id"))
+                try:
+                    parsed_zone_id = int(raw_zone_id) if raw_zone_id not in (None, "") else None
+                except (TypeError, ValueError):
+                    parsed_zone_id = None
+                scheduled_zone_name = str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
+                if parsed_zone_id is None and not scheduled_zone_name:
+                    continue
+                key = (parsed_zone_id, scheduled_zone_name)
+                if key not in seen_zones:
+                    seen_zones.add(key)
+                    zone_filters.append(key)
+            zone_filters.sort(key=lambda item: (item[1].lower(), item[0] or 0))
             if zone_name:
-                zone_filters = [name for name in zone_filters if name == zone_name]
+                zone_filters = [item for item in zone_filters if item[1] == zone_name]
             if not zone_filters:
                 return []
             data: list[dict] = []
             seen_consumer_ids: set[int] = set()
-            for scheduled_zone in zone_filters:
-                zone_rows = self._fetch_consumer_rows(zone_name=scheduled_zone)
+            for scheduled_zone_id, scheduled_zone in zone_filters:
+                zone_rows = self._fetch_consumer_rows(zone_name=scheduled_zone, zone_id=scheduled_zone_id)
                 for row in zone_rows:
                     if not isinstance(row, dict):
                         continue
