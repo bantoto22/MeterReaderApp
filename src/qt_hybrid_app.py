@@ -817,8 +817,7 @@ class AppBridge(QObject):
             self.zonesChanged.emit()
             self.update_stats()
             self._refresh_search_suggestions()
-            if self._progress_details_visible:
-                self._refresh_zone_consumers()
+            self._refresh_zone_consumers()
 
     @Property(str, notify=selectedBillingMonthChanged)
     def selectedBillingDate(self) -> str:
@@ -1152,6 +1151,9 @@ class AppBridge(QObject):
 
     def _start_assigned_consumer_dataset_refresh(self) -> None:
         if not self._meter_reader_account_id or not self._sync_dal:
+            if not self._sync_dal:
+                self._sync_logs = "Assigned consumer refresh skipped: sync is not available."
+                self.syncLogsChanged.emit()
             self._refresh_local_assignment_views()
             return
         if self._assigned_dataset_refreshing:
@@ -1169,7 +1171,22 @@ class AppBridge(QObject):
                     date_to,
                 )
                 mirrored = replace_consumers_from_sync(consumers)
-                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored, "schedules": schedule_count})
+                pulled_zones = sorted(
+                    {
+                        str(item.get("zone_name") or "").strip()
+                        for item in consumers
+                        if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
+                    }
+                )
+                self.assignedDatasetFinished.emit(
+                    {
+                        "success": True,
+                        "pulled": len(consumers),
+                        "mirrored": mirrored,
+                        "schedules": schedule_count,
+                        "pulled_zones": pulled_zones,
+                    }
+                )
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc)})
 
@@ -1192,6 +1209,15 @@ class AppBridge(QObject):
                 self._zone_refresh_attempted.clear()
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
+            pulled_zones = result.get("pulled_zones") or []
+            if pulled_zones:
+                self._sync_logs = (
+                    f"Assigned consumers refreshed.\n"
+                    f"Pulled: {self._last_pull_count}\n"
+                    f"Mirrored: {self._last_pull_mirror}\n"
+                    f"Zones: {', '.join(str(zone) for zone in pulled_zones)}"
+                )
+                self.syncLogsChanged.emit()
             self.lastPullCountChanged.emit()
             self.lastPullMirrorChanged.emit()
         self._refresh_local_assignment_views()
