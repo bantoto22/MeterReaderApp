@@ -1646,7 +1646,20 @@ class AppBridge(QObject):
         consumption = _to_float(row.get("consumption") or 0)
         previous = present - consumption
         latest_entry = get_latest_receipt_print(consumer_id)
+        latest_receipt_matches_current_row = False
         if latest_entry:
+            latest_present = _to_float(latest_entry.get("present_reading"))
+            latest_consumption = _to_float(latest_entry.get("consumption"))
+            latest_exception = str(latest_entry.get("exception") or "None")
+            latest_reading_date = str(latest_entry.get("reading_date") or "").split("T", 1)[0].split(" ", 1)[0]
+            row_reading_date = str(row.get("reading_date") or "").split("T", 1)[0].split(" ", 1)[0]
+            latest_receipt_matches_current_row = (
+                latest_present == present
+                and latest_consumption == consumption
+                and latest_exception == str(row.get("exception") or "None")
+                and latest_reading_date == row_reading_date
+            )
+        if latest_entry and latest_receipt_matches_current_row:
             receipt = latest_entry["receipt_text"]
         else:
             if _has_receipt_context_gaps(row) and self._sync_dal:
@@ -1667,6 +1680,7 @@ class AppBridge(QObject):
             latest_entry = {
                 "consumer_id": consumer_id,
                 "reading_id": None,
+                "reading_date": row.get("reading_date"),
                 "acct_no": row.get("acct_no"),
                 "consumer_name": row.get("name"),
                 "meter_no": row.get("meter_no"),
@@ -2067,7 +2081,7 @@ class AppBridge(QObject):
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
             present = _to_float(result["present"])
-            self._last_receipt_entry = {
+            self._last_receipt_entry = get_latest_receipt_print(consumer["id"]) or {
                 "id": result["saved_receipt_id"],
                 "consumer_id": consumer["id"],
                 "reading_id": result["reading_id"],

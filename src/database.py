@@ -501,7 +501,24 @@ def _effective_schedule_context(
     normalized_date = _normalize_schedule_date(schedule_date)
     if normalized_date is None:
         normalized_date = date.today().isoformat()
-    return normalized_date, reader_id_int, True
+    month_start, month_end = _month_bounds(normalized_date)
+    conn = get_connection()
+    try:
+        has_schedule_rows = conn.execute(
+            """
+            SELECT 1
+            FROM reading_schedule rs
+            WHERE rs.meter_reader_id = ?
+              AND date(rs.schedule_date) >= date(?)
+              AND date(rs.schedule_date) <= date(?)
+              AND rs.status IN ('Scheduled', 'In Progress')
+            LIMIT 1
+            """,
+            (reader_id_int, month_start, month_end),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+    return normalized_date, reader_id_int, has_schedule_rows
 
 
 def _month_bounds(schedule_date: str | None) -> tuple[str, str]:

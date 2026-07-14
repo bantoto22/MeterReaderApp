@@ -541,6 +541,61 @@ class HandheldSyncTests(unittest.TestCase):
                 os.remove(db_path)
             except OSError:
                 pass
+
+    def test_local_schedule_queries_fall_back_to_cached_consumers_when_month_schedule_missing(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.save_current_meter_reader(
+                {
+                    "account_id": 12,
+                    "username": "juan.delacruz",
+                    "full_name": "Juan Dela Cruz",
+                    "contact_number": "09123456789",
+                    "role_id": 3,
+                    "account_status": "Active",
+                }
+            )
+            database.replace_consumers_from_sync(
+                [
+                    {
+                        "id": 1,
+                        "meter_no": "MTR-Z3-001",
+                        "acct_no": "ACCT-Z3-001",
+                        "name": "Zone Three Consumer",
+                        "zone_name": "Zone 3",
+                        "previous_reading": 20,
+                    },
+                    {
+                        "id": 2,
+                        "meter_no": "MTR-Z1-001",
+                        "acct_no": "ACCT-Z1-001",
+                        "name": "Zone One Consumer",
+                        "zone_name": "Zone 1",
+                        "previous_reading": 15,
+                    },
+                ]
+            )
+
+            zone_names = database.get_all_zone_names("2026-07-12", 12)
+            self.assertEqual(zone_names, ["Zone 1", "Zone 3"])
+
+            consumer = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-12", meter_reader_id=12)
+            self.assertIsNotNone(consumer)
+
+            rows = database.get_zone_consumers_with_status("Zone 3", "2026-07-12", 12)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["name"], "Zone Three Consumer")
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
     def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
         class FakeMainPgStore(FakeRemoteStore):
             def load_waterrates_by_classification(self):
