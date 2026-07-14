@@ -597,7 +597,7 @@ class HandheldSyncTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_replace_consumers_from_sync_keeps_consumers_without_meter_numbers(self):
+    def test_replace_consumers_from_sync_skips_consumers_without_meter_numbers(self):
         original_db_path = database._db_path
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
         db_path = handle.name
@@ -620,10 +620,8 @@ class HandheldSyncTests(unittest.TestCase):
 
             rows = database.get_zone_consumers_with_status("Zone 3")
 
-            self.assertEqual(mirrored, 1)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["meter_no"], "ACCT-Z3-033")
-            self.assertEqual(rows[0]["acct_no"], "ACCT-Z3-033")
+            self.assertEqual(mirrored, 0)
+            self.assertEqual(rows, [])
         finally:
             database._db_path = original_db_path
             try:
@@ -666,6 +664,77 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(rows[0]["minimum_cubic"], 10)
         self.assertEqual(rows[0]["minimum_rate"], 150.0)
         self.assertEqual(rows[0]["excess_rate_per_cubic"], 15.0)
+
+    def test_load_assigned_consumers_merges_supabase_when_main_pg_is_partial(self):
+        main_pg = FakeRemoteStore()
+        main_pg.online = True
+        main_pg.assigned_schedules = [
+            {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
+            {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
+        ]
+        main_pg.assigned_consumers = [
+            {
+                "id": 101,
+                "meter_no": "MTR-Z1-101",
+                "acct_no": "A-101",
+                "name": "Zone One",
+                "zone_name": "Zone 1",
+            }
+        ]
+        self.remote.online = True
+        self.remote.assigned_schedules = list(main_pg.assigned_schedules)
+        self.remote.assigned_consumers = [
+            {
+                "id": 101,
+                "meter_no": "MTR-Z1-101",
+                "acct_no": "A-101",
+                "name": "Zone One",
+                "zone_name": "Zone 1",
+            },
+            {
+                "id": 301,
+                "meter_no": "MTR-Z3-301",
+                "acct_no": "A-301",
+                "name": "Zone Three",
+                "zone_name": "Zone 3",
+            },
+        ]
+        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
+
+        rows = self.dal.loadAssignedConsumers(12, None, "2026-07-01", "2026-07-31")
+
+        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
+        self.assertEqual([row["id"] for row in rows], [101, 301])
+
+    def test_load_assigned_consumers_merges_cache_when_supabase_is_partial(self):
+        self.local.cached = [
+            {
+                "id": 301,
+                "meter_no": "MTR-Z3-301",
+                "acct_no": "A-301",
+                "name": "Cached Zone Three",
+                "zone_name": "Zone 3",
+            }
+        ]
+        self.remote.online = True
+        self.remote.assigned_schedules = [
+            {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
+            {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
+        ]
+        self.remote.assigned_consumers = [
+            {
+                "id": 101,
+                "meter_no": "MTR-Z1-101",
+                "acct_no": "A-101",
+                "name": "Zone One",
+                "zone_name": "Zone 1",
+            }
+        ]
+
+        rows = self.dal.loadAssignedConsumers(12, None, "2026-07-01", "2026-07-31")
+
+        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
+        self.assertEqual([row["id"] for row in rows], [101, 301])
 
     def test_supabase_assigned_consumer_pull_fetches_each_scheduled_zone_by_id(self):
         class FakeSupabaseClient(SupabaseRestClient):

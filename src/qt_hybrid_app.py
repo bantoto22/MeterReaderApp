@@ -431,6 +431,7 @@ class AppBridge(QObject):
         self._zone_consumers = []
         self._zone_refreshing: set[str] = set()
         self._zone_refresh_attempted: set[str] = set()
+        self._assigned_dataset_refreshing = False
         self._progress_details_visible = False
         self._operation_busy = False
         self._operation_busy_message = ""
@@ -517,6 +518,10 @@ class AppBridge(QObject):
         self._wifi_scan_timer.setInterval(15_000)
         self._wifi_scan_timer.timeout.connect(self.refreshWifiNetworks)
         self._wifi_scan_timer.start()
+
+        self._assignment_refresh_timer = QTimer(self)
+        self._assignment_refresh_timer.setInterval(self._pull_interval * 1000)
+        self._assignment_refresh_timer.timeout.connect(self._run_auto_pull)
 
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -926,6 +931,7 @@ class AppBridge(QObject):
             if self._sync_dal and self._auto_sync_enabled:
                 self._sync_dal.stop_sync_worker()
                 self._sync_dal.start_sync_worker(interval_seconds=self._pull_interval)
+            self._reset_auto_pull_timer()
 
     @Property(str, notify=syncLogsChanged)
     def syncLogs(self) -> str:
@@ -1024,6 +1030,7 @@ class AppBridge(QObject):
             self._sync_dal.start_sync_worker(interval_seconds=self._pull_interval)
         else:
             self._sync_dal.stop_sync_worker()
+        self._reset_auto_pull_timer()
         self._refresh_sync_snapshot()
 
     def _init_sync(self) -> None:
@@ -1047,6 +1054,7 @@ class AppBridge(QObject):
                 self._supabase_logs = self._sync_logs
                 self.syncLogsChanged.emit()
                 self.supabaseLogsChanged.emit()
+                self._reset_auto_pull_timer()
                 self._emit_sync_state()
                 return
             self._sync_dal = HandheldSyncDataAccess.from_env(fail_fast=True)
@@ -1106,7 +1114,13 @@ class AppBridge(QObject):
         self._emit_sync_state()
 
     def _reset_auto_pull_timer(self) -> None:
-        return
+        if not hasattr(self, "_assignment_refresh_timer"):
+            return
+        self._assignment_refresh_timer.setInterval(self._pull_interval * 1000)
+        if self._sync_dal and self._auto_sync_enabled:
+            self._assignment_refresh_timer.start()
+        else:
+            self._assignment_refresh_timer.stop()
 
     def _refresh_local_assignment_views(self) -> None:
         self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
@@ -1140,6 +1154,9 @@ class AppBridge(QObject):
         if not self._meter_reader_account_id or not self._sync_dal:
             self._refresh_local_assignment_views()
             return
+        if self._assigned_dataset_refreshing:
+            return
+        self._assigned_dataset_refreshing = True
 
         def _task() -> None:
             try:
@@ -1159,13 +1176,20 @@ class AppBridge(QObject):
         threading.Thread(target=_task, daemon=True).start()
 
     def _finish_assigned_consumer_dataset(self, result: dict) -> None:
+        self._assigned_dataset_refreshing = False
         zone_name = str(result.get("zone") or "")
         if zone_name:
             self._zone_refreshing.discard(zone_name)
         if not result.get("success"):
+            if zone_name:
+                self._zone_refresh_attempted.discard(zone_name)
             self._sync_logs = f"Assigned schedule refresh failed: {result.get('error', 'Unknown error')}"
             self.syncLogsChanged.emit()
         else:
+            if zone_name:
+                self._zone_refresh_attempted.discard(zone_name)
+            else:
+                self._zone_refresh_attempted.clear()
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
             self.lastPullCountChanged.emit()
@@ -1194,7 +1218,9 @@ class AppBridge(QObject):
         self._refresh_local_assignment_views()
 
     def _run_auto_pull(self) -> None:
-        return
+        if not self._auto_sync_enabled or not self._sync_dal or not self._meter_reader_account_id:
+            return
+        self._start_assigned_consumer_dataset_refresh()
 
     def _ensure_current_consumer_receipt_context(self) -> None:
         if not self._consumer or not self._sync_dal:

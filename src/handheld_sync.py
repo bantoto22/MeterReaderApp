@@ -411,10 +411,8 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     def _normalize_cached_consumer(cls, item: dict) -> tuple:
         row = cls._sqlite_safe_row(item)
         meter_no = str(row.get("meter_no") or "").strip()
-        if not meter_no:
-            acct_no = str(row.get("acct_no") or "").strip()
-            consumer_id = row.get("id")
-            meter_no = acct_no if acct_no.upper().startswith("ACCT-") else f"ACCT-{acct_no}" if acct_no else f"CID-{consumer_id}"
+        if not meter_no or meter_no.startswith("ACCT-") or meter_no.startswith("CID-"):
+            return ()
         classification_id = row.get("classification_id")
         if classification_id not in (None, ""):
             try:
@@ -2411,7 +2409,37 @@ class HandheldSyncDataAccess:
         effective_meter_reader_id = None if (isinstance(meter_reader_id, str) and not meter_reader_id.isdigit()) else meter_reader_id
         if not date_from or not date_to:
             date_from, date_to = _device_schedule_window()
+
+        def _scheduled_zone_names(rows: list[dict]) -> set[str]:
+            return {
+                str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
+                for row in rows or []
+                if str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
+            }
+
+        def _consumer_zone_names(rows: list[dict]) -> set[str]:
+            return {
+                str(row.get("zone_name") or "").strip()
+                for row in rows or []
+                if str(row.get("zone_name") or "").strip()
+            }
+
+        def _merge_consumers(primary: list[dict], secondary: list[dict]) -> list[dict]:
+            merged: list[dict] = []
+            seen: set[object] = set()
+            for row in [*(primary or []), *(secondary or [])]:
+                if not isinstance(row, dict):
+                    continue
+                key = row.get("id") or row.get("consumer_id") or row.get("meter_no") or row.get("acct_no")
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+            return merged
+
         errors: list[str] = []
+        main_pg_data: list[dict] = []
+        main_pg_schedule_zones: set[str] = set()
         if self.main_pg and self.main_pg.is_online():
             try:
                 schedules = []
@@ -2419,24 +2447,51 @@ class HandheldSyncDataAccess:
                     for schedule_status in ("Scheduled", "In Progress"):
                         schedules.extend(self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
                     self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
+                    main_pg_schedule_zones = _scheduled_zone_names(schedules)
                 data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
+                main_pg_data = data
                 self.local.cache_consumers(data)
                 self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
                 if data:
-                    return data
+                    if effective_zone_name or not main_pg_schedule_zones or main_pg_schedule_zones.issubset(_consumer_zone_names(data)):
+                        return data
+                    self.local.log_audit(
+                        None,
+                        "failed",
+                        "MAIN_PG returned only part of the assigned zones; trying Supabase for missing consumers",
+                        {
+                            "main_pg_zones": sorted(_consumer_zone_names(data)),
+                            "scheduled_zones": sorted(main_pg_schedule_zones),
+                        },
+                    )
             except Exception as exc:
                 errors.append(f"MAIN_PG: {exc}")
                 self.local.log_audit(None, "failed", f"MAIN_PG load failed, trying Supabase/cache fallback: {exc}")
         if self.remote and self.remote.is_online():
             try:
                 schedules = []
+                supabase_schedule_zones: set[str] = set()
                 if effective_meter_reader_id not in (None, ""):
                     for schedule_status in ("Scheduled", "In Progress"):
                         schedules.extend(self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
                     self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
+                    supabase_schedule_zones = _scheduled_zone_names(schedules)
                 data = self.remote.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
                 if data:
                     data = self._overlay_main_pg_rates_for_consumers(data)
+                    data = _merge_consumers(main_pg_data, data)
+                    if not effective_zone_name and supabase_schedule_zones and not supabase_schedule_zones.issubset(_consumer_zone_names(data)):
+                        cached = self.local.load_cached_consumers(None)
+                        data = _merge_consumers(data, cached)
+                        self.local.log_audit(
+                            None,
+                            "failed",
+                            "Supabase returned only part of the assigned zones; merged available local cache",
+                            {
+                                "supabase_zones": sorted(_consumer_zone_names(data)),
+                                "scheduled_zones": sorted(supabase_schedule_zones),
+                            },
+                        )
                     self.local.cache_consumers(data)
                     self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data), "schedule_count": len(schedules)})
                     return data
@@ -2450,6 +2505,8 @@ class HandheldSyncDataAccess:
                 errors.append(f"Supabase: {exc}")
                 self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
         cached = self.local.load_cached_consumers(effective_zone_name)
+        if main_pg_data:
+            cached = _merge_consumers(main_pg_data, cached)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached), "errors": errors})
         return cached
 

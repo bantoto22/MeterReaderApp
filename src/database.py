@@ -1311,13 +1311,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
 
     def _real_meter_no(consumer: dict) -> str:
         meter_no = str(consumer.get("meter_no") or "").strip()
-        if meter_no:
+        if meter_no and not meter_no.startswith("ACCT-") and not meter_no.startswith("CID-"):
             return meter_no
-        acct_no = str(consumer.get("acct_no") or "").strip()
-        if acct_no:
-            return acct_no if acct_no.upper().startswith("ACCT-") else f"ACCT-{acct_no}"
-        cid = consumer.get("id")
-        return f"CID-{cid}" if cid not in (None, "") else ""
+        return ""
 
     def _optional_int(value):
         value = _sqlite_safe(value)
