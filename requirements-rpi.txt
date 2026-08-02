@@ -1,6 +1,5 @@
 # Python packages installed with pip on Raspberry Pi OS armhf.
 Pillow
-psycopg2-binary
 python-dotenv
 ttkbootstrap
 

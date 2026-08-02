@@ -381,7 +381,7 @@ Rectangle {
                             Button {
                                 implicitWidth: 140
                                 implicitHeight: TouchMetrics.buttonHeight
-                                contentItem: Text { text: "Manual Sync"; color: "#2563EB"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                contentItem: Text { text: "Sync Now"; color: "#2563EB"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.bodyText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                                 background: Rectangle { radius: 7; color: parent.hovered ? "#DBEAFE" : "white"; border.color: "#BFDBFE" }
                                 onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                             }

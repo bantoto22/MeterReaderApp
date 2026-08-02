@@ -86,7 +86,7 @@ Rectangle {
                     Text {
                         Layout.alignment: Qt.AlignHCenter
                         Layout.fillWidth: true
-                        text: "Water Billing and Payment Record Management System"
+                        text: "Meter Reading Device - Online and Offline"
                         font.pixelSize: loginRoot.compactScreen ? TouchMetrics.helperText : 15
                         font.family: "Montserrat"
                         color: "#475569"
@@ -193,6 +193,16 @@ Rectangle {
                                 }
                                 onAccepted: loginButton.clicked()
                             }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "First login requires the Backend API. After a successful login, this account can sign in and record readings offline."
+                            color: "#64748B"
+                            font.pixelSize: TouchMetrics.helperText
+                            font.family: "Montserrat"
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.Wrap
                         }
 
                         // Error message

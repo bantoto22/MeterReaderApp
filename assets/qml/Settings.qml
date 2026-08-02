@@ -128,8 +128,8 @@ Rectangle {
     }
 
     Dialog {
-        id: supabaseLogsDialog
-        title: "Cloud Sync Activity"
+        id: backendLogsDialog
+        title: "Backend API Activity"
         anchors.centerIn: parent
         width: Math.min(parent.width - 32, 560)
         height: Math.min(parent.height - 60, 520)
@@ -143,8 +143,8 @@ Rectangle {
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
             TextArea {
-                width: supabaseLogsDialog.availableWidth
-                text: bridgeObj ? bridgeObj.supabaseLogs : "No cloud sync activity yet."
+                width: backendLogsDialog.availableWidth
+                text: bridgeObj ? bridgeObj.backendLogs : "No Backend API activity yet."
                 readOnly: true
                 wrapMode: TextEdit.Wrap
                 color: "#111827"
@@ -207,11 +207,12 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: settingsRoot.compactScreen ? 6 : 9
                             Text { text: "Pending uploads: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
-                            Text { text: "Cloud sync: " + (bridgeObj ? bridgeObj.supabaseStatus : "Offline"); color: bridgeObj && bridgeObj.supabaseStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Waiting for cloud upload: " + (bridgeObj ? bridgeObj.supabasePendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Cloud last sync: " + (bridgeObj ? bridgeObj.supabaseLastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Storage mode: " + (bridgeObj ? bridgeObj.saveTarget : "Saved on device"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                            Text { text: "Secondary backup: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Backend API: " + (bridgeObj ? bridgeObj.backendStatus : "Offline"); color: bridgeObj && bridgeObj.backendStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Funnel endpoint: " + (bridgeObj ? bridgeObj.backendEndpoint : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true }
+                            Text { text: "Queued on device: " + (bridgeObj ? bridgeObj.backendPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Last backend sync: " + (bridgeObj ? bridgeObj.backendLastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Offline storage: " + (bridgeObj ? bridgeObj.saveTarget : "Saved on device"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                            Text { text: "Server database: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text {
                                 text: "Last download: "
@@ -258,7 +259,7 @@ Rectangle {
                                     Text {
                                         Layout.fillWidth: true
                                         wrapMode: Text.WordWrap
-                                        text: "Readings are always saved on the device first. You can let the device sync them automatically in the background, or disable that and use Manual Sync when needed."
+                                        text: "Readings are saved to SQLite on this device first. When the Backend API is reachable through the Tailscale Funnel, queued work is uploaded to PostgreSQL."
                                         color: "#526176"
                                         font.family: "Montserrat"
                                         font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
@@ -276,8 +277,8 @@ Rectangle {
                                 Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
                                 text: bridgeObj && bridgeObj.autoSyncEnabled
-                                      ? "When enabled, pending readings sync automatically in the background whenever the device has internet."
-                                      : "When disabled, readings stay on the device until Manual Sync is tapped."
+                                      ? "When enabled, pending readings sync automatically whenever the Backend API is reachable."
+                                      : "When disabled, readings stay on this device until Sync Now is tapped."
                                 color: "#526176"
                                 font.family: "Montserrat"
                                 font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
@@ -293,7 +294,7 @@ Rectangle {
                         columnSpacing: settingsRoot.compactScreen ? 10 : 12
                         rowSpacing: settingsRoot.compactScreen ? 10 : 12
                         ActionButton {
-                            text: "Manual Sync"
+                            text: "Sync Now"
                             Layout.fillWidth: true
                             onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                         }
@@ -305,11 +306,11 @@ Rectangle {
                             onClicked: logsDialog.open()
                         }
                         ActionButton {
-                            text: "Cloud Logs"
+                            text: "Backend Logs"
                             buttonColor: "#0F766E"
                             hoverColor: "#115E59"
                             Layout.fillWidth: true
-                            onClicked: supabaseLogsDialog.open()
+                            onClicked: backendLogsDialog.open()
                         }
                     }
                 }

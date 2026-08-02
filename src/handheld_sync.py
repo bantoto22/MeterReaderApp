@@ -2,7 +2,7 @@
 Handheld sync layer for online/offline meter reading operations.
 
 Online:
-- Reads/writes via Supabase REST.
+- Reads/writes through the Node backend HTTPS API.
 
 Offline:
 - Writes are queued in local SQLite on the Pi.
@@ -14,8 +14,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import hashlib
-import hmac
 import json
 import os
 import sqlite3
@@ -26,7 +24,6 @@ from urllib import error, parse, request
 
 sqlite3.register_adapter(Decimal, float)
 
-SYNC_BATCH_SIZE = 100
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
 
 try:
@@ -125,33 +122,6 @@ def _device_schedule_window(today: date | None = None) -> tuple[str, str]:
     following_start = date(following_year, following_month, 1)
     end = following_start - timedelta(days=1)
     return start.isoformat(), end.isoformat()
-
-
-def _verify_password(candidate_password: str, stored_password: str | None) -> bool:
-    candidate = str(candidate_password or "")
-    stored = str(stored_password or "")
-    if not stored:
-        return False
-    if stored == candidate:
-        return True
-    if stored.startswith("scrypt$"):
-        parts = stored.split("$", 2)
-        if len(parts) != 3:
-            return False
-        _, salt_hex, expected_hex = parts
-        try:
-            derived = hashlib.scrypt(
-                candidate.encode("utf-8"),
-                salt=bytes.fromhex(salt_hex),
-                n=16384,
-                r=8,
-                p=1,
-                dklen=len(bytes.fromhex(expected_hex)),
-            )
-            return hmac.compare_digest(derived.hex(), expected_hex.lower())
-        except Exception:
-            return False
-    return False
 
 
 def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_per_cubic) -> float:
@@ -268,15 +238,7 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
 
 @dataclass
 class SyncConfig:
-    supabase_url: str
-    supabase_anon_key: str
-    supabase_service_role_key: str
-    main_pg_host: str
-    main_pg_port: int
-    main_pg_db: str
-    main_pg_user: str
-    main_pg_password: str
-    supabase_db_schema: str = "public"
+    backend_api_base_url: str = ""
     sync_enabled: bool = False
 
     @classmethod
@@ -288,11 +250,7 @@ class SyncConfig:
             _load_env_fallback(env_path)
 
         sync_enabled = os.getenv("HANDHELD_SYNC_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
-        required = [
-            "SUPABASE_URL",
-            "SUPABASE_ANON_KEY",
-            "SUPABASE_SERVICE_ROLE_KEY",
-        ]
+        required = ["BACKEND_API_BASE_URL"]
 
         missing = [k for k in required if not os.getenv(k)]
         if (fail_fast or sync_enabled) and missing:
@@ -302,18 +260,8 @@ class SyncConfig:
                 + ". Update .env from .env.example."
             )
 
-        supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-        supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "") or supabase_service_role_key
         return cls(
-            supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
-            supabase_anon_key=supabase_anon_key,
-            supabase_service_role_key=supabase_service_role_key,
-            main_pg_host=os.getenv("MAIN_PG_HOST", ""),
-            main_pg_port=int(os.getenv("MAIN_PG_PORT", "5432")),
-            main_pg_db=os.getenv("MAIN_PG_DB", ""),
-            main_pg_user=os.getenv("MAIN_PG_USER", ""),
-            main_pg_password=os.getenv("MAIN_PG_PASSWORD", ""),
-            supabase_db_schema=os.getenv("SUPABASE_DB_SCHEMA", "public"),
+            backend_api_base_url=os.getenv("BACKEND_API_BASE_URL", "").rstrip("/"),
             sync_enabled=sync_enabled,
         )
 
@@ -342,8 +290,7 @@ class LocalSyncStore:
         operation: str,
         payload: dict,
         *,
-        supabase_status: str = "pending",
-        main_pg_status: str = "pending",
+        backend_status: str = "pending",
     ) -> dict:
         raise NotImplementedError
 
@@ -375,7 +322,6 @@ class LocalSyncStore:
 
 class SQLiteLocalSyncStore(LocalSyncStore):
     def __init__(self, cfg: SyncConfig):
-        self._has_main_pg = bool(cfg.main_pg_host and cfg.main_pg_db and cfg.main_pg_user)
         self._db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "meter.db"))
 
     def _connect(self):
@@ -454,18 +400,14 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
 
     @staticmethod
-    def _combined_status(supabase_status: str, main_pg_status: str) -> str:
-        states = {str(supabase_status or "").lower(), str(main_pg_status or "").lower()}
-        if states & {"pending", "failed"}:
-            return "failed" if "failed" in states else "pending"
-        if "conflict" in states:
-            return "conflict"
-        return "synced"
+    def _combined_status(backend_status: str) -> str:
+        state = str(backend_status or "pending").lower()
+        return state if state in {"pending", "failed", "conflict", "synced"} else "pending"
 
     def _refresh_queue_status(self, conn: sqlite3.Connection, queue_id: int) -> None:
         row = conn.execute(
             """
-            SELECT supabase_status, main_pg_status, supabase_synced_at, main_pg_synced_at
+            SELECT backend_status, backend_synced_at
             FROM sync_queue_meter_readings
             WHERE id = ?
             """,
@@ -473,10 +415,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         ).fetchone()
         if not row:
             return
-        status = self._combined_status(row["supabase_status"], row["main_pg_status"])
+        status = self._combined_status(row["backend_status"])
         synced_at = None
         if status == "synced":
-            synced_at = row["main_pg_synced_at"] or row["supabase_synced_at"] or datetime.now().isoformat()
+            synced_at = row["backend_synced_at"] or datetime.now().isoformat()
         conn.execute(
             """
             UPDATE sync_queue_meter_readings
@@ -497,8 +439,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             reading_date TEXT NOT NULL,
             payload TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            supabase_status TEXT NOT NULL DEFAULT 'pending',
-            main_pg_status TEXT NOT NULL DEFAULT 'pending',
+            backend_status TEXT NOT NULL DEFAULT 'pending',
             retries INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             conflict_reason TEXT,
@@ -506,8 +447,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             synced_at TEXT,
-            supabase_synced_at TEXT,
-            main_pg_synced_at TEXT
+            backend_synced_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_sync_queue_status_created_at
@@ -572,12 +512,25 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 conn,
                 "sync_queue_meter_readings",
                 {
-                    "supabase_status": "TEXT NOT NULL DEFAULT 'pending'",
-                    "main_pg_status": "TEXT NOT NULL DEFAULT 'pending'",
-                    "supabase_synced_at": "TEXT",
-                    "main_pg_synced_at": "TEXT",
+                    "backend_status": "TEXT NOT NULL DEFAULT 'pending'",
+                    "backend_synced_at": "TEXT",
                 },
             )
+            existing_queue_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(sync_queue_meter_readings)").fetchall()
+            }
+            legacy_status_column = "supa" + "base_status"
+            legacy_synced_column = "supa" + "base_synced_at"
+            if legacy_status_column in existing_queue_columns:
+                conn.execute(
+                    f"UPDATE sync_queue_meter_readings SET backend_status = {legacy_status_column} "
+                    "WHERE backend_status = 'pending'"
+                )
+            if legacy_synced_column in existing_queue_columns:
+                conn.execute(
+                    f"UPDATE sync_queue_meter_readings SET backend_synced_at = {legacy_synced_column} "
+                    "WHERE backend_synced_at IS NULL"
+                )
             self._ensure_columns(
                 conn,
                 "handheld_consumers_cache",
@@ -752,8 +705,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         operation: str,
         payload: dict,
         *,
-        supabase_status: str = "pending",
-        main_pg_status: str = "pending",
+        backend_status: str = "pending",
     ) -> dict:
         operation_id = payload.get("operation_id") or str(uuid.uuid4())
         reading_id = payload.get("reading_id") or str(uuid.uuid4())
@@ -761,10 +713,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         payload["reading_id"] = reading_id
         sql = """
         INSERT INTO sync_queue_meter_readings (
-            operation, operation_id, reading_id, consumer_id, reading_date, payload, status, supabase_status, main_pg_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            operation, operation_id, reading_id, consumer_id, reading_date, payload, status, backend_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        overall_status = self._combined_status(supabase_status, main_pg_status)
+        overall_status = self._combined_status(backend_status)
         with self._connect() as conn:
             cur = conn.execute(
                 sql,
@@ -776,13 +728,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     payload["reading_date"],
                     json.dumps(payload),
                     overall_status,
-                    supabase_status,
-                    main_pg_status,
+                    backend_status,
                 ),
             )
             row = conn.execute(
                 """
-                SELECT id, operation_id, reading_id, status, supabase_status, main_pg_status, created_at
+                SELECT id, operation_id, reading_id, status, backend_status, created_at
                 FROM sync_queue_meter_readings
                 WHERE id = ?
                 """,
@@ -792,34 +743,23 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         return dict(row) if row else {}
 
     def list_pending(self, target: str | None = None) -> list[dict]:
-        target_column = None
-        if target == "supabase":
-            target_column = "supabase_status"
-        elif target == "main_pg":
-            target_column = "main_pg_status"
-
         sql = """
         SELECT id, operation, operation_id, reading_id, consumer_id, reading_date, payload, status,
-               supabase_status, main_pg_status, retries, last_error, created_at
+               backend_status, retries, last_error, created_at
         FROM sync_queue_meter_readings
+        WHERE backend_status IN ('pending', 'failed')
         """
-        if target_column:
-            sql += f" WHERE {target_column} IN ('pending', 'failed')"
-        else:
-            sql += " WHERE supabase_status IN ('pending', 'failed') OR main_pg_status IN ('pending', 'failed')"
         sql += " ORDER BY id ASC"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [self._deserialize_row(row) for row in rows]
 
     def mark_target_synced(self, queue_id: int, target: str) -> None:
-        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
-        synced_at_column = "main_pg_synced_at" if target == "main_pg" else "supabase_synced_at"
         with self._connect() as conn:
             conn.execute(
-                f"""
+                """
                 UPDATE sync_queue_meter_readings
-                SET {status_column}='synced', {synced_at_column}=CURRENT_TIMESTAMP, last_error=NULL
+                SET backend_status='synced', backend_synced_at=CURRENT_TIMESTAMP, last_error=NULL
                 WHERE id = ?
                 """,
                 (queue_id,),
@@ -828,13 +768,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             conn.commit()
 
     def mark_target_failed(self, queue_id: int, target: str, reason: str) -> None:
-        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
-        scoped_reason = f"{target}: {reason}"[:1000]
+        scoped_reason = f"backend: {reason}"[:1000]
         with self._connect() as conn:
             conn.execute(
-                f"""
+                """
                 UPDATE sync_queue_meter_readings
-                SET {status_column}='failed', retries=retries+1, last_error=?
+                SET backend_status='failed', retries=retries+1, last_error=?
                 WHERE id=?
                 """,
                 (scoped_reason, queue_id),
@@ -850,13 +789,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         *,
         target: str | None = None,
     ) -> None:
-        status_column = "main_pg_status" if target == "main_pg" else "supabase_status"
-        scoped_reason = f"{target or 'supabase'}: {reason}"[:1000]
+        scoped_reason = f"backend: {reason}"[:1000]
         with self._connect() as conn:
             conn.execute(
-                f"""
+                """
                 UPDATE sync_queue_meter_readings
-                SET {status_column}='conflict', conflict_reason=?, server_payload=?
+                SET backend_status='conflict', conflict_reason=?, server_payload=?
                 WHERE id=?
                 """,
                 (scoped_reason, json.dumps(server_payload or {}, default=str), queue_id),
@@ -887,67 +825,76 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         return [self._deserialize_row(row) for row in rows]
 
 
-class SupabaseRestClient:
-    _ACCOUNT_CONTACT_SELECTS = (
-        "account_id,username,password,role_id,account_status,full_name,contact_number",
-        "account_id,username,password,role_id,account_status,full_name,phone_number",
-        "account_id,username,password,role_id,account_status,full_name",
-    )
+class BackendApiClient:
+    """HTTPS client for the Node backend exposed through Tailscale Funnel."""
 
     def __init__(self, cfg: SyncConfig):
-        self._url = cfg.supabase_url
-        self._anon_key = cfg.supabase_anon_key
-        self._service_key = cfg.supabase_service_role_key
-        self._schema = cfg.supabase_db_schema or "public"
-        self._table_columns_cache: dict[str, set[str]] = {}
+        self._url = cfg.backend_api_base_url.rstrip("/")
+        self._meter_reader_id: int | None = None
 
-    def _req(self, method: str, table_or_path: str, *, query: dict | list | tuple | None = None, payload: dict | list | None = None,
-             use_service_key: bool = False, extra_headers: dict | None = None) -> tuple[int, object]:
-        base = table_or_path if table_or_path.startswith("/") else f"/rest/v1/{table_or_path}"
-        url = f"{self._url}{base}"
+    def _req(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict | None = None,
+        payload: dict | list | None = None,
+    ) -> tuple[int, object]:
+        url = f"{self._url}{path}"
         if query:
-            url += "?" + parse.urlencode(query, doseq=True)
-        body = None
-        headers = {
-            "apikey": self._service_key if use_service_key else self._anon_key,
-            "Authorization": f"Bearer {self._service_key if use_service_key else self._anon_key}",
-            "Content-Type": "application/json",
-            "Accept-Profile": self._schema,
-            "Content-Profile": self._schema,
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        if payload is not None:
-            body = json.dumps(payload).encode("utf-8")
-        req = request.Request(url, data=body, method=method, headers=headers)
+            clean_query = {key: value for key, value in query.items() if value not in (None, "")}
+            if clean_query:
+                url += "?" + parse.urlencode(clean_query)
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
         try:
-            with request.urlopen(req, timeout=3) as resp:
+            with request.urlopen(req, timeout=5) as resp:
                 raw = resp.read().decode("utf-8").strip()
                 return resp.getcode(), json.loads(raw) if raw else {}
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8").strip() if exc.fp else ""
             try:
-                return exc.code, json.loads(raw) if raw else {"error": raw or str(exc)}
+                return exc.code, json.loads(raw) if raw else {"error": str(exc)}
             except Exception:
                 return exc.code, {"error": raw or str(exc)}
         except Exception as exc:
             return 0, {"error": str(exc)}
 
-    def is_online(self) -> bool:
-        status, _ = self._req("GET", "/rest/v1/", use_service_key=False)
-        return 200 <= status < 500 and status != 0
+    @staticmethod
+    def _message(data: object, fallback: str) -> str:
+        if isinstance(data, dict):
+            return str(data.get("message") or data.get("error") or fallback)
+        return fallback
 
-    def _load_latest_admin_settings(self) -> dict:
-        status, data = self._req(
-            "GET",
-            "admin_settings",
-            query={"select": "late_fee", "limit": "1"},
-            use_service_key=True,
-        )
-        if status >= 400 or not isinstance(data, list) or not data:
-            return {}
-        row = data[0]
-        return row if isinstance(row, dict) else {}
+    def is_online(self) -> bool:
+        status, _ = self._req("GET", "/health")
+        return 200 <= status < 300
+
+    def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        status, data = self._req("POST", "/api/login", payload={"username": username, "password": password})
+        if status >= 400 or status == 0 or not isinstance(data, dict) or not data.get("success"):
+            raise ValueError(self._message(data, "Invalid username or password."))
+        user = data.get("user") if isinstance(data.get("user"), dict) else {}
+        if int(user.get("role_id") or 0) != 3:
+            raise PermissionError("This account is not an active Meter Reader.")
+        account_id = user.get("id") or user.get("account_id")
+        self._meter_reader_id = int(account_id) if account_id not in (None, "") else None
+        return {
+            "id": account_id,
+            "account_id": account_id,
+            "username": user.get("username"),
+            "name": user.get("fullName") or user.get("full_name") or user.get("username"),
+            "full_name": user.get("fullName") or user.get("full_name") or user.get("username"),
+            "contact_number": str(user.get("contact_number") or "").strip(),
+            "role_id": user.get("role_id"),
+            "account_status": "Active",
+            "reader_id": str(account_id or ""),
+        }
 
     def load_reading_schedules(
         self,
@@ -956,319 +903,19 @@ class SupabaseRestClient:
         date_to: str,
         status: str = "Scheduled",
     ) -> list[dict]:
-        query = {
-            "meter_reader_id": str(meter_reader_id),
-            "date_from": str(date_from),
-            "date_to": str(date_to),
-            "status": str(status or "Scheduled"),
-        }
-        http_status, data = self._req("GET", "/api/reading-schedules", query=query, use_service_key=True)
-        if http_status < 400 and isinstance(data, list):
-            return [row for row in data if isinstance(row, dict)]
-
-        fallback_query = [
-            ("select", "schedule_id,schedule_date,zone_id,meter_reader_id,status,zone:zone_id(zone_name)"),
-            ("meter_reader_id", f"eq.{meter_reader_id}"),
-            ("schedule_date", f"gte.{date_from}"),
-            ("schedule_date", f"lte.{date_to}"),
-            ("status", f"eq.{status or 'Scheduled'}"),
-            ("order", "schedule_date.asc,schedule_id.asc"),
-        ]
-        fallback_status, fallback_data = self._req("GET", "reading_schedule", query=fallback_query, use_service_key=True)
-        if fallback_status >= 400:
-            raise RuntimeError(f"Supabase reading schedule lookup failed: {data}; fallback failed: {fallback_data}")
-        if not isinstance(fallback_data, list):
-            return []
-        normalized: list[dict] = []
-        for row in fallback_data:
-            if not isinstance(row, dict):
-                continue
-            zone_obj = row.get("zone") if isinstance(row.get("zone"), dict) else {}
-            normalized.append(
-                {
-                    "Schedule_ID": row.get("schedule_id"),
-                    "Schedule_Date": row.get("schedule_date"),
-                    "Zone_ID": row.get("zone_id"),
-                    "Zone_Name": zone_obj.get("zone_name") or row.get("zone_name"),
-                    "Meter_Reader_ID": row.get("meter_reader_id"),
-                    "Meter_Reader_Name": None,
-                    "Meter_Reader_Contact": None,
-                    "Status": row.get("status"),
-                }
-            )
-        return normalized
-
-    def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        data = None
-        last_error = None
-        for select_clause in self._ACCOUNT_CONTACT_SELECTS:
-            query = {
-                "select": select_clause,
-                "username": f"eq.{username}",
-                "deleted_at": "is.null",
-                "limit": "1",
-            }
-            status, data = self._req("GET", "accounts", query=query, use_service_key=True)
-            if status < 400:
-                break
-            error_text = json.dumps(data).lower() if isinstance(data, dict) else str(data).lower()
-            last_error = data
-            if "column" not in error_text or "does not exist" not in error_text:
-                raise RuntimeError(f"Supabase account lookup failed: {data}")
-        else:
-            raise RuntimeError(f"Supabase account lookup failed: {last_error}")
-        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-            raise ValueError("Invalid username or password.")
-        row = data[0]
-        if not _verify_password(password, row.get("password")):
-            raise ValueError("Invalid username or password.")
-        if int(row.get("role_id") or 0) != 3 or str(row.get("account_status") or "").strip() != "Active":
-            raise PermissionError("This account is not an active Meter Reader.")
-        contact_number = row.get("contact_number") or row.get("phone_number") or ""
-        return {
-            "id": row.get("account_id"),
-            "account_id": row.get("account_id"),
-            "username": row.get("username"),
-            "name": row.get("full_name") or row.get("username"),
-            "full_name": row.get("full_name") or row.get("username"),
-            "contact_number": str(contact_number or "").strip(),
-            "role_id": row.get("role_id"),
-            "account_status": row.get("account_status"),
-            "reader_id": str(row.get("account_id") or ""),
-        }
-
-    def _load_latest_billing_settings(self) -> dict:
-        status, data = self._req(
+        http_status, data = self._req(
             "GET",
-            "billing_settings",
-            query={"select": "due_days", "order": "setting_id.desc", "limit": "1"},
-            use_service_key=True,
-        )
-        if status >= 400 or not isinstance(data, list) or not data:
-            return {}
-        row = data[0]
-        return row if isinstance(row, dict) else {}
-
-    def _load_waterrates_by_classification(self) -> dict[int, dict]:
-        status, data = self._req(
-            "GET",
-            "waterrates",
+            "/api/reading-schedules",
             query={
-                "select": "classification_id,rate_id,minimum_cubic,minimum_rate,excess_rate_per_cubic",
-                "order": "classification_id.asc,rate_id.desc",
+                "meter_reader_id": meter_reader_id,
+                "date_from": date_from,
+                "date_to": date_to,
+                "status": status or "Scheduled",
             },
-            use_service_key=True,
         )
-        if status >= 400 or not isinstance(data, list):
-            return {}
-        rates: dict[int, dict] = {}
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            classification_id = row.get("classification_id")
-            if classification_id is None:
-                continue
-            try:
-                key = int(classification_id)
-            except (TypeError, ValueError):
-                continue
-            if key not in rates:
-                rates[key] = row
-        return rates
-
-    def _batched_consumer_ids(self, consumer_ids: list[int]) -> list[list[int]]:
-        normalized = sorted({int(cid) for cid in consumer_ids if cid is not None})
-        return [normalized[idx: idx + SYNC_BATCH_SIZE] for idx in range(0, len(normalized), SYNC_BATCH_SIZE)]
-
-    def _fetch_rows_for_consumer_ids(
-        self,
-        table_name: str,
-        select_clause: str,
-        consumer_ids: list[int],
-        *,
-        order_clause: str | None = None,
-    ) -> list[dict]:
-        rows: list[dict] = []
-        for consumer_batch in self._batched_consumer_ids(consumer_ids):
-            if not consumer_batch:
-                continue
-            in_filter = ",".join(str(cid) for cid in consumer_batch)
-            query = {
-                "select": select_clause,
-                "consumer_id": f"in.({in_filter})",
-                "limit": str(SYNC_BATCH_SIZE),
-            }
-            if order_clause:
-                query["order"] = order_clause
-            status, data = self._req(
-                "GET",
-                table_name,
-                query=query,
-                use_service_key=True,
-            )
-            if status >= 400 or not isinstance(data, list):
-                continue
-            rows.extend(row for row in data if isinstance(row, dict))
-        return rows
-
-    def _bill_select_clause(self) -> str:
-        preferred = [
-            "bill_id",
-            "consumer_id",
-            "reading_id",
-            "billing_month",
-            "date_covered_from",
-            "date_covered_to",
-            "bill_date",
-            "amount_due",
-            "due_date",
-            "previous_balance",
-            "penalty",
-            "previous_penalty",
-            "total_after_due_date",
-            "status",
-            "sync_id",
-        ]
-        allowed = self._get_table_columns("bills")
-        if not allowed:
-            return ",".join(field for field in preferred if field != "bill_date")
-        selected = [field for field in preferred if field in allowed]
-        required = {"bill_id", "consumer_id"}
-        if not required.issubset(set(selected)):
-            return ",".join(field for field in preferred if field != "bill_date")
-        return ",".join(selected)
-
-    def _load_latest_bills_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
-        if not consumer_ids:
-            return {}
-        data = self._fetch_rows_for_consumer_ids(
-            "bills",
-            self._bill_select_clause(),
-            consumer_ids,
-            order_clause="consumer_id.asc,bill_id.desc",
-        )
-        bills: dict[int, dict] = {}
-        for row in data:
-            consumer_id = row.get("consumer_id")
-            if consumer_id is None:
-                continue
-            try:
-                key = int(consumer_id)
-            except (TypeError, ValueError):
-                continue
-            normalized_row = dict(row)
-            fallback_bill_date = normalized_row.get("bill_date")
-            if not normalized_row.get("date_covered_from") and fallback_bill_date not in (None, ""):
-                normalized_row["date_covered_from"] = fallback_bill_date
-            if not normalized_row.get("date_covered_to") and fallback_bill_date not in (None, ""):
-                normalized_row["date_covered_to"] = fallback_bill_date
-            selected = bills.get(key)
-            row_status = str(normalized_row.get("status") or "").strip().lower()
-            selected_status = str((selected or {}).get("status") or "").strip().lower()
-            if selected is None:
-                bills[key] = normalized_row
-            elif selected_status == "paid" and row_status != "paid":
-                bills[key] = normalized_row
-        return bills
-
-    def _load_latest_meterreadings_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
-        if not consumer_ids:
-            return {}
-        for reading_column in ("current_reading", "present_reading"):
-            data = self._fetch_rows_for_consumer_ids(
-                "meterreadings",
-                f"consumer_id,reading_id,reading_date,updated_at,{reading_column}",
-                consumer_ids,
-                order_clause="consumer_id.asc,reading_date.desc,updated_at.desc,reading_id.desc",
-            )
-            latest: dict[int, dict] = {}
-            for row in data:
-                consumer_id = row.get("consumer_id")
-                try:
-                    key = int(consumer_id)
-                except (TypeError, ValueError):
-                    continue
-                if key in latest:
-                    continue
-                value = row.get(reading_column)
-                if value is None:
-                    continue
-                normalized = dict(row)
-                normalized["latest_reading"] = value
-                latest[key] = normalized
-            if latest:
-                return latest
-        return {}
-    def _consumer_select_variants(self, include_reading_fields: bool = True, inner_zone: bool = False) -> list[str]:
-        reading_fields = ",previous_reading,last_reading" if include_reading_fields else ""
-        zone_select = "zone:zone_id!inner(zone_name)" if inner_zone else "zone:zone_id(zone_name)"
-        base_suffix = (
-            f",first_name,middle_name,last_name,zone_id,classification_id{reading_fields},status,"
-            f"{zone_select},classification:classification_id(classification_id,classification_name)"
-        )
-        return [
-            f"consumer_id,account_number,meter_no,address,consumer_address,service_address{base_suffix}",
-            f"consumer_id,account_number,meter_number,address,consumer_address,service_address{base_suffix}",
-            f"consumer_id,account_number,address,consumer_address,service_address{base_suffix}",
-            f"consumer_id,account_number,meter_no,address{base_suffix}",
-            f"consumer_id,account_number,meter_number,address{base_suffix}",
-            f"consumer_id,account_number,address{base_suffix}",
-            f"consumer_id,account_number,meter_no,consumer_address{base_suffix}",
-            f"consumer_id,account_number,meter_number,consumer_address{base_suffix}",
-            f"consumer_id,account_number,consumer_address{base_suffix}",
-            f"consumer_id,account_number,meter_no,service_address{base_suffix}",
-            f"consumer_id,account_number,meter_number,service_address{base_suffix}",
-            f"consumer_id,account_number,service_address{base_suffix}",
-            f"consumer_id,account_number,meter_no{base_suffix}",
-            f"consumer_id,account_number,meter_number{base_suffix}",
-            f"consumer_id,account_number{base_suffix}",
-        ]
-
-    def _fetch_consumer_rows(
-        self,
-        zone_name: str | None = None,
-        consumer_id: int | None = None,
-        zone_id: int | str | None = None,
-    ) -> list[dict]:
-        last_error: object = {"error": "No consumer query variant attempted."}
-        for include_reading_fields in (True, False):
-            for select in self._consumer_select_variants(
-                include_reading_fields=include_reading_fields,
-                inner_zone=bool(zone_name and zone_id in (None, "")),
-            ):
-                query = {"select": select}
-                if zone_id not in (None, ""):
-                    query["zone_id"] = f"eq.{zone_id}"
-                elif zone_name:
-                    query["zone.zone_name"] = f"eq.{zone_name}"
-                if consumer_id is not None:
-                    query["consumer_id"] = f"eq.{consumer_id}"
-                    query["limit"] = "1"
-                status, data = self._req("GET", "consumer", query=query, use_service_key=True)
-                if status < 400 and isinstance(data, list):
-                    return data
-                last_error = data
-        raise RuntimeError(f"Supabase read failed: {last_error}")
-
-    def _load_meters_by_consumer(self, consumer_ids: list[int]) -> dict[int, dict]:
-        if not consumer_ids:
-            return {}
-        data = self._fetch_rows_for_consumer_ids(
-            "meter",
-            "meter_id,meter_serial_number,consumer_id",
-            consumer_ids,
-            order_clause="consumer_id.asc,meter_id.desc",
-        )
-        meters: dict[int, dict] = {}
-        for row in data:
-            consumer_id = row.get("consumer_id")
-            try:
-                key = int(consumer_id)
-            except (TypeError, ValueError):
-                continue
-            if key not in meters:
-                meters[key] = row
-        return meters
+        if http_status >= 400 or http_status == 0:
+            raise RuntimeError(self._message(data, "Backend reading schedule lookup failed."))
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def load_assigned_consumers(
         self,
@@ -1277,965 +924,68 @@ class SupabaseRestClient:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> list[dict]:
-        zone_filters: list[tuple[int | None, str]] = []
-        if meter_reader_id not in (None, ""):
-            start_date = date_from or _device_schedule_window()[0]
-            end_date = date_to or _device_schedule_window()[1]
-            schedules: list[dict] = []
-            for schedule_status in ("Scheduled", "In Progress"):
-                schedules.extend(self.load_reading_schedules(meter_reader_id, start_date, end_date, schedule_status))
-            seen_zones: set[tuple[int | None, str]] = set()
-            for row in schedules:
-                raw_zone_id = row.get("Zone_ID", row.get("zone_id"))
-                try:
-                    parsed_zone_id = int(raw_zone_id) if raw_zone_id not in (None, "") else None
-                except (TypeError, ValueError):
-                    parsed_zone_id = None
-                scheduled_zone_name = str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
-                if parsed_zone_id is None and not scheduled_zone_name:
-                    continue
-                key = (parsed_zone_id, scheduled_zone_name)
-                if key not in seen_zones:
-                    seen_zones.add(key)
-                    zone_filters.append(key)
-            zone_filters.sort(key=lambda item: (item[1].lower(), item[0] or 0))
-            if zone_name:
-                zone_filters = [item for item in zone_filters if item[1] == zone_name]
-            if not zone_filters:
-                return []
-            data: list[dict] = []
-            seen_consumer_ids: set[int] = set()
-            for scheduled_zone_id, scheduled_zone in zone_filters:
-                zone_rows = self._fetch_consumer_rows(zone_name=scheduled_zone, zone_id=scheduled_zone_id)
-                for row in zone_rows:
-                    if not isinstance(row, dict):
-                        continue
-                    cid = row.get("consumer_id") or row.get("id")
-                    try:
-                        cid_int = int(cid)
-                    except (TypeError, ValueError):
-                        cid_int = None
-                    if cid_int is not None and cid_int in seen_consumer_ids:
-                        continue
-                    if cid_int is not None:
-                        seen_consumer_ids.add(cid_int)
-                    data.append(row)
-        else:
-            data = self._fetch_consumer_rows(zone_name=zone_name)
-        if not isinstance(data, list):
-            return []
-        consumer_ids: list[int] = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            cid = row.get("consumer_id") or row.get("id")
-            try:
-                consumer_ids.append(int(cid))
-            except (TypeError, ValueError):
-                continue
-        admin_settings = self._load_latest_admin_settings()
-        billing_settings = self._load_latest_billing_settings()
-        rates_by_classification = self._load_waterrates_by_classification()
-        bills_by_consumer = self._load_latest_bills_by_consumer(consumer_ids)
-        meters_by_consumer = self._load_meters_by_consumer(consumer_ids)
-        latest_readings_by_consumer = self._load_latest_meterreadings_by_consumer(consumer_ids)
-        normalized: list[dict] = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            # Normalize across possible consumer schemas.
-            cid = row.get("consumer_id") or row.get("id")
-            meter_row = {}
-            try:
-                meter_row = meters_by_consumer.get(int(cid), {}) if cid is not None else {}
-            except (TypeError, ValueError):
-                meter_row = {}
-            meter_no = row.get("meter_no") or row.get("meter_number") or row.get("meterid") or meter_row.get("meter_serial_number")
-            meter_no = str(meter_no or "").strip() or None
-            acct_no = row.get("account_number") or row.get("acct_no") or row.get("account_no")
-            first = (row.get("first_name") or "").strip()
-            middle = (row.get("middle_name") or "").strip()
-            last = (row.get("last_name") or "").strip()
-            full_from_parts = " ".join([p for p in [first, middle, last] if p]).strip()
-            name = row.get("name") or row.get("consumer_name") or row.get("fullname") or full_from_parts
-            address = (
-                row.get("address")
-                or row.get("consumer_address")
-                or row.get("service_address")
-            )
-            zone_obj = row.get("zone")
-            if isinstance(zone_obj, dict):
-                zone_val = zone_obj.get("zone_name")
-            else:
-                zone_val = row.get("zone_name") or row.get("zone") or row.get("zone_code")
-            classification_id = row.get("classification_id")
-            classification_obj = row.get("classification")
-            classification_name = None
-            if isinstance(classification_obj, dict):
-                classification_name = classification_obj.get("classification_name")
-            try:
-                rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else None
-            except (TypeError, ValueError):
-                rate_row = None
-            try:
-                bill_row = bills_by_consumer.get(int(cid)) if cid is not None else None
-            except (TypeError, ValueError):
-                bill_row = None
-            latest_reading_row = {}
-            try:
-                latest_reading_row = latest_readings_by_consumer.get(int(cid), {}) if cid is not None else {}
-            except (TypeError, ValueError):
-                latest_reading_row = {}
-            latest_reading = latest_reading_row.get("latest_reading")
-            prev = latest_reading
-            if prev is None:
-                prev = row.get("previous_reading") if row.get("previous_reading") is not None else row.get("last_reading")
-            normalized.append(
-                {
-                    "id": cid,
-                    "meter_no": meter_no,
-                    "acct_no": acct_no,
-                    "name": name,
-                    "address": address,
-                    "zone_name": zone_val,
-                    "classification_id": classification_id,
-                    "classification_name": classification_name,
-                    "minimum_cubic": (rate_row or {}).get("minimum_cubic"),
-                    "minimum_rate": (rate_row or {}).get("minimum_rate"),
-                    "excess_rate_per_cubic": (rate_row or {}).get("excess_rate_per_cubic"),
-                    "due_days": billing_settings.get("due_days"),
-                    "billing_month": (bill_row or {}).get("billing_month"),
-                    "date_covered_from": (bill_row or {}).get("date_covered_from"),
-                    "date_covered_to": (bill_row or {}).get("date_covered_to"),
-                    "amount_due": (bill_row or {}).get("amount_due"),
-                    "previous_balance": (bill_row or {}).get("previous_balance"),
-                    "due_date": (bill_row or {}).get("due_date"),
-                    "penalty": (bill_row or {}).get("penalty"),
-                    "previous_penalty": (bill_row or {}).get("previous_penalty"),
-                    "total_after_due_date": (bill_row or {}).get("total_after_due_date"),
-                    "bill_status": (bill_row or {}).get("status"),
-                    "late_fee": admin_settings.get("late_fee"),
-                    "previous_reading": prev if prev is not None else 0,
-                    "latest_reading": latest_reading,
-                    "latest_reading_id": latest_reading_row.get("reading_id"),
-                    "latest_reading_date": latest_reading_row.get("reading_date"),
-                    "latest_reading_updated_at": latest_reading_row.get("updated_at"),
-                }
-            )
-        return normalized
-
-    def _get_table_columns(self, table_name: str) -> set[str]:
-        cached = self._table_columns_cache.get(table_name)
-        if cached is not None:
-            return cached
-        status, data = self._req("GET", "/rest/v1/", use_service_key=True)
-        cols: set[str] = set()
-        if status == 200 and isinstance(data, dict):
-            path_obj = data.get("paths", {}).get(f"/{table_name}", {})
-            # Try to collect insert-able/readable params from OpenAPI shape.
-            for method in ("post", "patch", "get"):
-                m = path_obj.get(method, {})
-                for prm in m.get("parameters", []):
-                    schema = prm.get("schema", {})
-                    props = schema.get("properties", {})
-                    if isinstance(props, dict):
-                        cols.update(props.keys())
-        # Fallback: probe one row and use keys from response.
-        if not cols:
-            st2, d2 = self._req("GET", table_name, query={"select": "*", "limit": "1"}, use_service_key=True)
-            if st2 < 400 and isinstance(d2, list) and d2 and isinstance(d2[0], dict):
-                cols.update(d2[0].keys())
-        self._table_columns_cache[table_name] = cols
-        return cols
-
-    def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
-        query = {
-            "select": "reading_id,consumer_id,reading_date,updated_at,present_reading",
-            "consumer_id": f"eq.{consumer_id}",
-            "reading_date": f"eq.{reading_date}",
-            "order": "updated_at.desc",
-            "limit": "1",
-        }
-        status, data = self._req("GET", "meterreadings", query=query, use_service_key=True)
-        if status >= 400:
-            return None
-        if isinstance(data, list) and data:
-            return data[0]
-        return None
-
-    def get_consumer_context(self, consumer_id: int) -> dict:
-        data = self._fetch_consumer_rows(consumer_id=consumer_id)
-        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-            return {}
-        consumer_row = data[0]
-        classification_id = consumer_row.get("classification_id")
-        rates_by_classification = self._load_waterrates_by_classification()
-        admin_settings = self._load_latest_admin_settings()
-        billing_settings = self._load_latest_billing_settings()
-        bills_by_consumer = self._load_latest_bills_by_consumer([int(consumer_id)])
-        meter_status, meter_data = self._req(
+        status, data = self._req(
             "GET",
-            "meter",
-            query={"select": "meter_id,meter_serial_number,consumer_id", "consumer_id": f"eq.{consumer_id}", "limit": "1"},
-            use_service_key=True,
+            "/api/handheld/consumers",
+            query={
+                "meter_reader_id": meter_reader_id,
+                "zone_name": zone_name,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
         )
-        meter_row = meter_data[0] if meter_status < 400 and isinstance(meter_data, list) and meter_data and isinstance(meter_data[0], dict) else {}
-        latest_bill = bills_by_consumer.get(int(consumer_id), {})
-        try:
-            rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else {}
-        except (TypeError, ValueError):
-            rate_row = {}
-        zone_obj = consumer_row.get("zone")
-        classification_obj = consumer_row.get("classification")
-        latest_reading = self._load_latest_meterreadings_by_consumer([int(consumer_id)]).get(int(consumer_id), {}).get("latest_reading")
-        return {
-            "consumer_id": consumer_id,
-            "acct_no": consumer_row.get("account_number"),
-            "meter_no": (str(consumer_row.get("meter_no") or consumer_row.get("meter_number") or meter_row.get("meter_serial_number") or "").strip() or None),
-            "address": consumer_row.get("address") or consumer_row.get("consumer_address") or consumer_row.get("service_address"),
-            "zone_name": zone_obj.get("zone_name") if isinstance(zone_obj, dict) else None,
-            "classification_id": classification_id,
-            "classification_name": classification_obj.get("classification_name") if isinstance(classification_obj, dict) else None,
-            "minimum_cubic": rate_row.get("minimum_cubic"),
-            "minimum_rate": rate_row.get("minimum_rate"),
-            "excess_rate_per_cubic": rate_row.get("excess_rate_per_cubic"),
-            "due_days": billing_settings.get("due_days"),
-            "late_fee": admin_settings.get("late_fee"),
-            "previous_reading": latest_reading if latest_reading is not None else (consumer_row.get("previous_reading") if consumer_row.get("previous_reading") is not None else consumer_row.get("last_reading")),
-            "billing_month": latest_bill.get("billing_month"),
-            "date_covered_from": latest_bill.get("date_covered_from"),
-            "date_covered_to": latest_bill.get("date_covered_to"),
-            "amount_due": latest_bill.get("amount_due"),
-            "due_date": latest_bill.get("due_date"),
-            "penalty": latest_bill.get("penalty"),
-            "previous_penalty": latest_bill.get("previous_penalty"),
-            "previous_balance": latest_bill.get("previous_balance"),
-            "total_after_due_date": latest_bill.get("total_after_due_date"),
-            "bill_status": latest_bill.get("status"),
-            "bill_sync_id": latest_bill.get("sync_id"),
-            "bill_reading_id": latest_bill.get("reading_id"),
-            "meter_id": meter_row.get("meter_id"),
-        }
-
-    def _build_remote_payload(self, payload: dict) -> dict:
-        rid = payload.get("reading_id")
-        rid_int = None
-        try:
-            if rid is not None and str(rid).isdigit():
-                rid_int = int(str(rid))
-        except Exception:
-            rid_int = None
-
-        candidate_payload = {
-            # Send reading_id only if numeric and compatible with remote integer column.
-            "reading_id": rid_int,
-            "consumer_id": payload.get("consumer_id"),
-            # Remote schema uses current_reading instead of present_reading.
-            "sync_id": payload.get("reading_id"),
-            "current_reading": payload.get("present_reading"),
-            "previous_reading": payload.get("previous_reading"),
-            "consumption": payload.get("consumption"),
-            "excess_consumption": max(0, _safe_int(payload.get("consumption")) - _safe_int(payload.get("minimum_cubic"))),
-            # Remote schema uses notes instead of exception.
-            "notes": payload.get("exception"),
-            "reading_date": _parse_datetime(payload.get("reading_date")).isoformat(sep=" ") if _parse_datetime(payload.get("reading_date")) else None,
-            "source_site_id": "meter-reader-device",
-            "sync_status": "synced",
-            "last_synced_at": datetime.now().replace(tzinfo=None).isoformat(sep=" "),
-            "created_by_device": "meter-reader-device",
-            "updated_by_device": "meter-reader-device",
-        }
-
-        consumer_id = payload.get("consumer_id")
-        ctx = self.get_consumer_context(int(consumer_id)) if consumer_id is not None else {}
-        if ctx:
-            candidate_payload.setdefault("route_id", ctx.get("route_id"))
-            candidate_payload.setdefault("meter_id", ctx.get("meter_id"))
-            candidate_payload.setdefault("meter_reader_id", ctx.get("meter_reader_id"))
-
-        candidate_payload = {k: v for k, v in candidate_payload.items() if v is not None}
-        allowed = self._get_table_columns("meterreadings")
-        remote_payload = {k: v for k, v in candidate_payload.items() if (not allowed or k in allowed)}
-        if not remote_payload:
-            raise RuntimeError("No compatible columns found for meterreadings payload.")
-
-        # Preflight only core fields that should always exist for a reading row.
-        required_if_available = ("consumer_id", "reading_date")
-        missing_required = [k for k in required_if_available if ((not allowed or k in allowed) and k not in remote_payload)]
-        if missing_required:
-            raise ValueError(
-                f"Missing required fields for remote meterreadings row: {', '.join(missing_required)}. "
-                "Consumer mapping may be missing."
-            )
-
-        return remote_payload
-
-    def upsert_meter_reading(self, payload: dict) -> dict:
-        remote_payload = self._build_remote_payload(payload)
-
-        headers = {
-            "Prefer": "resolution=merge-duplicates,return=representation",
-        }
-        query = {"on_conflict": "sync_id"} if remote_payload.get("sync_id") else {}
-
-        status, data = self._req(
-            "POST",
-            "meterreadings",
-            payload=remote_payload,
-            use_service_key=True,
-            extra_headers=headers,
-            query=query if query else None,
-        )
-        if status >= 400:
-            raise RuntimeError(f"Supabase write failed: {data}")
-        if isinstance(data, list) and data:
-            return data[0]
-        return remote_payload
-
-    def upsert_bill(self, payload: dict) -> dict:
-        allowed = self._get_table_columns("bills")
-        remote_payload = {k: v for k, v in payload.items() if (not allowed or k in allowed)}
-        headers = {"Prefer": "resolution=merge-duplicates,return=representation"}
-        status, data = self._req(
-            "POST",
-            "bills",
-            payload=remote_payload,
-            use_service_key=True,
-            extra_headers=headers,
-            query={"on_conflict": "sync_id"},
-        )
-        if status >= 400:
-            raise RuntimeError(f"Supabase bill write failed: {data}")
-        if isinstance(data, list) and data:
-            return data[0]
-        return remote_payload
-
-    def save_reading_bundle(self, payload: dict) -> dict:
-        context = self.get_consumer_context(int(payload["consumer_id"]))
-        merged = dict(context)
-        merged.update(payload)
-        remote_reading = self.upsert_meter_reading(merged)
-        remote_reading_id = remote_reading.get("reading_id")
-        if remote_reading_id is None:
-            raise RuntimeError("Supabase did not return a reading_id for billing sync.")
-        bill_payload = _build_bill_payload(merged, context, int(remote_reading_id))
-        remote_bill = self.upsert_bill(bill_payload)
-        return {"meterreading": remote_reading, "bill": remote_bill}
-
-
-class MainPostgresClient:
-    """Direct pull from main PostgreSQL as fallback when Supabase is unreachable."""
-
-    def __init__(self, cfg: SyncConfig):
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        self._psycopg2 = psycopg2
-        self._dict_cursor = RealDictCursor
-        self._cfg = cfg
-        self._schema = cfg.supabase_db_schema or "public"
-
-    def _connect(self):
-        return self._psycopg2.connect(
-            host=self._cfg.main_pg_host,
-            port=self._cfg.main_pg_port,
-            dbname=self._cfg.main_pg_db,
-            user=self._cfg.main_pg_user,
-            password=self._cfg.main_pg_password,
-            connect_timeout=5,
-        )
-
-    def is_online(self) -> bool:
-        try:
-            with self._connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-            return True
-        except Exception:
-            return False
-
-    def load_waterrates_by_classification(self) -> dict[int, dict]:
-        sql = f"""
-        SELECT DISTINCT ON (wr.classification_id)
-            wr.classification_id,
-            wr.rate_id,
-            wr.minimum_cubic,
-            wr.minimum_rate,
-            wr.excess_rate_per_cubic
-        FROM {self._schema}.waterrates wr
-        WHERE wr.classification_id IS NOT NULL
-        ORDER BY wr.classification_id, wr.rate_id DESC
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql)
-                rows = cur.fetchall()
-        rates: dict[int, dict] = {}
-        for row in rows:
-            classification_id = row.get("classification_id") if isinstance(row, dict) else None
-            if classification_id is None:
-                continue
-            try:
-                rates[int(classification_id)] = dict(row)
-            except (TypeError, ValueError):
-                continue
-        return rates
-
-    def authenticate_meter_reader(self, username: str, password: str) -> dict:
-        select_variants = (
-            """
-            SELECT
-                account_id,
-                username,
-                password,
-                role_id,
-                account_status,
-                full_name,
-                contact_number
-            FROM {schema}.accounts
-            WHERE username = %s
-              AND deleted_at IS NULL
-            LIMIT 1
-            """,
-            """
-            SELECT
-                account_id,
-                username,
-                password,
-                role_id,
-                account_status,
-                full_name,
-                phone_number
-            FROM {schema}.accounts
-            WHERE username = %s
-              AND deleted_at IS NULL
-            LIMIT 1
-            """,
-            """
-            SELECT
-                account_id,
-                username,
-                password,
-                role_id,
-                account_status,
-                full_name
-            FROM {schema}.accounts
-            WHERE username = %s
-              AND deleted_at IS NULL
-            LIMIT 1
-            """,
-        )
-        row = None
-        last_error = None
-        for sql_template in select_variants:
-            sql = sql_template.format(schema=self._schema)
-            try:
-                with self._connect() as conn:
-                    with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                        cur.execute(sql, (username,))
-                        row = cur.fetchone()
-                break
-            except Exception as exc:
-                error_text = str(exc).lower()
-                last_error = exc
-                if "column" not in error_text or "does not exist" not in error_text:
-                    raise
-        else:
-            if last_error is not None:
-                raise last_error
-        if not row:
-            raise ValueError("Invalid username or password.")
-        record = dict(row)
-        if not _verify_password(password, record.get("password")):
-            raise ValueError("Invalid username or password.")
-        if int(record.get("role_id") or 0) != 3 or str(record.get("account_status") or "").strip() != "Active":
-            raise PermissionError("This account is not an active Meter Reader.")
-        contact_number = record.get("contact_number") or record.get("phone_number") or ""
-        return {
-            "id": record.get("account_id"),
-            "account_id": record.get("account_id"),
-            "username": record.get("username"),
-            "name": record.get("full_name") or record.get("username"),
-            "full_name": record.get("full_name") or record.get("username"),
-            "contact_number": str(contact_number or "").strip(),
-            "role_id": record.get("role_id"),
-            "account_status": record.get("account_status"),
-            "reader_id": str(record.get("account_id") or ""),
-        }
-
-    def load_reading_schedules(
-        self,
-        meter_reader_id: int | str,
-        date_from: str,
-        date_to: str,
-        status: str = "Scheduled",
-    ) -> list[dict]:
-        query_variants = (
-            """
-            SELECT
-                rs.schedule_id AS "Schedule_ID",
-                rs.schedule_date::date AS "Schedule_Date",
-                rs.zone_id AS "Zone_ID",
-                z.zone_name AS "Zone_Name",
-                rs.meter_reader_id AS "Meter_Reader_ID",
-                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
-                COALESCE(a.contact_number, '') AS "Meter_Reader_Contact",
-                rs.status AS "Status"
-            FROM {schema}.reading_schedule rs
-            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
-            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
-            WHERE rs.meter_reader_id = %s
-              AND rs.schedule_date::date >= %s
-              AND rs.schedule_date::date <= %s
-              AND rs.status = %s
-            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
-            """,
-            """
-            SELECT
-                rs.schedule_id AS "Schedule_ID",
-                rs.schedule_date::date AS "Schedule_Date",
-                rs.zone_id AS "Zone_ID",
-                z.zone_name AS "Zone_Name",
-                rs.meter_reader_id AS "Meter_Reader_ID",
-                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
-                COALESCE(a.phone_number, '') AS "Meter_Reader_Contact",
-                rs.status AS "Status"
-            FROM {schema}.reading_schedule rs
-            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
-            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
-            WHERE rs.meter_reader_id = %s
-              AND rs.schedule_date::date >= %s
-              AND rs.schedule_date::date <= %s
-              AND rs.status = %s
-            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
-            """,
-            """
-            SELECT
-                rs.schedule_id AS "Schedule_ID",
-                rs.schedule_date::date AS "Schedule_Date",
-                rs.zone_id AS "Zone_ID",
-                z.zone_name AS "Zone_Name",
-                rs.meter_reader_id AS "Meter_Reader_ID",
-                COALESCE(a.full_name, a.username) AS "Meter_Reader_Name",
-                '' AS "Meter_Reader_Contact",
-                rs.status AS "Status"
-            FROM {schema}.reading_schedule rs
-            JOIN {schema}.zone z ON z.zone_id = rs.zone_id
-            LEFT JOIN {schema}.accounts a ON a.account_id = rs.meter_reader_id
-            WHERE rs.meter_reader_id = %s
-              AND rs.schedule_date::date >= %s
-              AND rs.schedule_date::date <= %s
-              AND rs.status = %s
-            ORDER BY rs.schedule_date ASC, rs.schedule_id ASC
-            """,
-        )
-        rows = []
-        last_error = None
-        for sql_template in query_variants:
-            sql = sql_template.format(schema=self._schema)
-            try:
-                with self._connect() as conn:
-                    with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                        cur.execute(sql, (int(meter_reader_id), date_from, date_to, status or "Scheduled"))
-                        rows = cur.fetchall()
-                break
-            except Exception as exc:
-                error_text = str(exc).lower()
-                last_error = exc
-                if "column" not in error_text or "does not exist" not in error_text:
-                    raise
-        else:
-            if last_error is not None:
-                raise last_error
-        return [dict(r) for r in rows]
-
-    def _load_active_consumers_for_zone(self, zone_name: str) -> list[dict]:
-        sql = f"""
-        SELECT
-            c.consumer_id AS id,
-            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
-            c.account_number AS acct_no,
-            CONCAT_WS(' ', c.first_name, c.middle_name, c.last_name) AS name,
-            c.address AS address,
-            z.zone_name AS zone_name,
-            c.classification_id,
-            cls.classification_name,
-            wr.minimum_cubic,
-            wr.minimum_rate,
-            wr.excess_rate_per_cubic,
-            bs.due_days,
-            lb.billing_month,
-            lb.date_covered_from,
-            lb.date_covered_to,
-            lb.amount_due,
-            lb.due_date,
-            lb.penalty,
-            lb.previous_penalty,
-            lb.total_after_due_date,
-            lb.status AS bill_status,
-            adm.late_fee,
-            COALESCE(prev.last_reading, 0)::int AS previous_reading,
-            prev.last_reading::int AS latest_reading,
-            prev.last_reading_date AS latest_reading_date
-        FROM {self._schema}.consumer c
-        JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
-        LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-        LEFT JOIN LATERAL (
-            SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
-            FROM {self._schema}.waterrates wr
-            WHERE wr.classification_id = c.classification_id
-            ORDER BY wr.rate_id DESC
-            LIMIT 1
-        ) wr ON TRUE
-        LEFT JOIN (
-            SELECT due_days
-            FROM {self._schema}.billing_settings
-            ORDER BY setting_id DESC
-            LIMIT 1
-        ) bs ON TRUE
-        LEFT JOIN (
-            SELECT late_fee
-            FROM {self._schema}.admin_settings
-            LIMIT 1
-        ) adm ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT billing_month, date_covered_from, date_covered_to,
-                   amount_due, due_date, penalty, previous_penalty, total_after_due_date, status
-            FROM {self._schema}.bills b
-            WHERE b.consumer_id = c.consumer_id
-            ORDER BY b.bill_id DESC
-            LIMIT 1
-        ) lb ON TRUE
-        LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN LATERAL (
-            SELECT mr.current_reading AS last_reading,
-                   mr.reading_date AS last_reading_date
-            FROM {self._schema}.meterreadings mr
-            WHERE mr.consumer_id = c.consumer_id
-            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
-            LIMIT 1
-        ) prev ON TRUE
-        WHERE c.status = 'Active'
-          AND z.zone_name = %s
-        ORDER BY c.consumer_id
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (zone_name,))
-                rows = cur.fetchall()
-        return [dict(r) for r in rows]
-
-    def load_assigned_consumers(
-        self,
-        meter_reader_id: int | str | None = None,
-        zone_name: str | None = None,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ) -> list[dict]:
-        if meter_reader_id in (None, ""):
-            zone_filters = [zone_name] if zone_name else []
-        else:
-            start_date = date_from or _device_schedule_window()[0]
-            end_date = date_to or _device_schedule_window()[1]
-            schedules: list[dict] = []
-            for schedule_status in ("Scheduled", "In Progress"):
-                schedules.extend(self.load_reading_schedules(meter_reader_id, start_date, end_date, schedule_status))
-            zone_filters = sorted(
-                {
-                    str(row.get("Zone_Name") or "").strip()
-                    for row in schedules
-                    if str(row.get("Zone_Name") or "").strip()
-                }
-            )
-            if zone_name:
-                zone_filters = [name for name in zone_filters if name == zone_name]
-        if not zone_filters:
-            return []
-        rows: list[dict] = []
-        seen: set[int] = set()
-        for scheduled_zone in zone_filters:
-            for row in self._load_active_consumers_for_zone(scheduled_zone):
-                cid = row.get("id")
-                try:
-                    cid_int = int(cid)
-                except (TypeError, ValueError):
-                    cid_int = None
-                if cid_int is not None and cid_int in seen:
-                    continue
-                if cid_int is not None:
-                    seen.add(cid_int)
-                rows.append(row)
-        return rows
+        if status >= 400 or status == 0:
+            raise RuntimeError(self._message(data, "Backend assigned-consumer lookup failed."))
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def get_consumer_context(self, consumer_id: int) -> dict:
-        sql = f"""
-        SELECT
-            c.consumer_id,
-            c.account_number AS acct_no,
-            COALESCE(NULLIF(c.meter_number, ''), NULLIF(m.meter_serial_number, '')) AS meter_no,
-            c.address AS address,
-            z.zone_name,
-            c.classification_id,
-            cls.classification_name,
-            wr.minimum_cubic,
-            wr.minimum_rate,
-            wr.excess_rate_per_cubic,
-            bs.setting_id,
-            bs.due_days,
-            adm.late_fee,
-            m.meter_id,
-            COALESCE(prev.last_reading, 0)::int AS previous_reading,
-            prev.last_reading::int AS latest_reading,
-            prev.last_reading_date AS latest_reading_date,
-            lb.billing_month,
-            lb.date_covered_from,
-            lb.date_covered_to,
-            lb.amount_due,
-            lb.due_date,
-            lb.previous_balance,
-            lb.penalty,
-            lb.previous_penalty,
-            lb.total_after_due_date,
-            lb.status AS bill_status,
-            lb.sync_id AS bill_sync_id,
-            lb.reading_id AS bill_reading_id
-        FROM {self._schema}.consumer c
-        JOIN {self._schema}.zone z ON z.zone_id = c.zone_id
-        LEFT JOIN {self._schema}.classification cls ON cls.classification_id = c.classification_id
-        LEFT JOIN LATERAL (
-            SELECT minimum_cubic, minimum_rate, excess_rate_per_cubic
-            FROM {self._schema}.waterrates wr
-            WHERE wr.classification_id = c.classification_id
-            ORDER BY wr.rate_id DESC
-            LIMIT 1
-        ) wr ON TRUE
-        LEFT JOIN (
-            SELECT setting_id, due_days
-            FROM {self._schema}.billing_settings
-            ORDER BY setting_id DESC
-            LIMIT 1
-        ) bs ON TRUE
-        LEFT JOIN (
-            SELECT late_fee
-            FROM {self._schema}.admin_settings
-            ORDER BY settings_id DESC
-            LIMIT 1
-        ) adm ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT billing_month, date_covered_from, date_covered_to,
-                   amount_due, due_date, previous_balance, penalty, previous_penalty, total_after_due_date, status, sync_id, reading_id
-            FROM {self._schema}.bills b
-            WHERE b.consumer_id = c.consumer_id
-            ORDER BY b.bill_id DESC
-            LIMIT 1
-        ) lb ON TRUE
-        LEFT JOIN {self._schema}.meter m ON m.consumer_id = c.consumer_id
-        LEFT JOIN LATERAL (
-            SELECT mr.current_reading AS last_reading,
-                   mr.reading_date AS last_reading_date
-            FROM {self._schema}.meterreadings mr
-            WHERE mr.consumer_id = c.consumer_id
-            ORDER BY mr.reading_date DESC NULLS LAST, mr.updated_at DESC NULLS LAST, mr.reading_id DESC
-            LIMIT 1
-        ) prev ON TRUE
-        WHERE c.consumer_id = %s
-        LIMIT 1
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (consumer_id,))
-                row = cur.fetchone()
-        return dict(row) if row else {}
+        status, data = self._req("GET", f"/api/handheld/consumers/{int(consumer_id)}/context")
+        if status == 404:
+            return {}
+        if status >= 400 or status == 0 or not isinstance(data, dict):
+            raise RuntimeError(self._message(data, "Backend consumer-context lookup failed."))
+        return data
 
     def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
-        reading_dt = _parse_datetime(reading_date)
-        if reading_dt is None:
+        status, data = self._req(
+            "GET",
+            "/api/handheld/readings/existing",
+            query={"consumer_id": int(consumer_id), "reading_date": reading_date},
+        )
+        if status == 404:
             return None
-        sql = f"""
-        SELECT reading_id, consumer_id, reading_date, updated_at, current_reading AS present_reading, sync_id
-        FROM {self._schema}.meterreadings
-        WHERE consumer_id = %s
-          AND DATE(reading_date) = %s
-          AND deleted_at IS NULL
-        ORDER BY updated_at DESC, reading_id DESC
-        LIMIT 1
-        """
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, (consumer_id, reading_dt.date()))
-                row = cur.fetchone()
-        return dict(row) if row else None
-
-    def upsert_meter_reading(self, payload: dict) -> dict:
-        context = self.get_consumer_context(int(payload["consumer_id"]))
-        merged = dict(context)
-        merged.update(payload)
-        reading_dt = _parse_datetime(merged.get("reading_date")) or datetime.now().replace(tzinfo=None)
-        previous_reading = _safe_int(merged.get("previous_reading"), _safe_int(merged.get("present_reading")) - _safe_int(merged.get("consumption")))
-        sql = f"""
-        INSERT INTO {self._schema}.meterreadings (
-            route_id, consumer_id, meter_id, meter_reader_id, created_date, reading_status,
-            previous_reading, current_reading, consumption, excess_consumption, notes,
-            status, reading_date, sync_id, created_at, updated_at, source_site_id,
-            sync_status, last_synced_at, created_by_device, updated_by_device, deleted_at
-        ) VALUES (
-            %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s,
-            %s, CURRENT_TIMESTAMP, %s, %s, NULL
-        )
-        ON CONFLICT (sync_id) DO UPDATE SET
-            route_id = EXCLUDED.route_id,
-            meter_id = EXCLUDED.meter_id,
-            meter_reader_id = EXCLUDED.meter_reader_id,
-            previous_reading = EXCLUDED.previous_reading,
-            current_reading = EXCLUDED.current_reading,
-            consumption = EXCLUDED.consumption,
-            excess_consumption = EXCLUDED.excess_consumption,
-            notes = EXCLUDED.notes,
-            reading_status = EXCLUDED.reading_status,
-            status = EXCLUDED.status,
-            reading_date = EXCLUDED.reading_date,
-            source_site_id = EXCLUDED.source_site_id,
-            sync_status = EXCLUDED.sync_status,
-            last_synced_at = EXCLUDED.last_synced_at,
-            updated_by_device = EXCLUDED.updated_by_device
-        RETURNING *
-        """
-        params = (
-            merged.get("route_id"),
-            int(merged["consumer_id"]),
-            merged.get("meter_id"),
-            merged.get("meter_reader_id"),
-            "Flagged" if merged.get("is_flagged") else "Pending",
-            previous_reading,
-            _safe_float(merged.get("present_reading")),
-            _safe_float(merged.get("consumption")),
-            max(0, _safe_float(merged.get("consumption")) - _safe_float(merged.get("minimum_cubic"))),
-            merged.get("exception"),
-            "Active",
-            reading_dt,
-            str(merged.get("reading_id") or uuid.uuid4()),
-            "meter-reader-device",
-            "synced",
-            "meter-reader-device",
-            "meter-reader-device",
-        )
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
-                conn.commit()
-        return dict(row) if row else {}
-
-    def upsert_bill(self, payload: dict) -> dict:
-        sql = f"""
-        INSERT INTO {self._schema}.bills (
-            consumer_id, reading_id, billing_officer_id, billing_month, date_covered_from,
-            date_covered_to, bill_date, due_date, disconnection_date, class_cost, water_charge,
-            meter_maintenance_fee, connection_fee, amount_due, previous_balance, previous_penalty,
-            penalty, total_amount, total_after_due_date, status, setting_id, sync_id,
-            created_at, updated_at, source_site_id, sync_status, last_synced_at,
-            created_by_device, updated_by_device, deleted_at
-        ) VALUES (
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
-            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s, %s, %s,
-            %s, %s, NULL
-        )
-        ON CONFLICT (sync_id) DO UPDATE SET
-            consumer_id = EXCLUDED.consumer_id,
-            reading_id = EXCLUDED.reading_id,
-            billing_officer_id = EXCLUDED.billing_officer_id,
-            billing_month = EXCLUDED.billing_month,
-            date_covered_from = EXCLUDED.date_covered_from,
-            date_covered_to = EXCLUDED.date_covered_to,
-            bill_date = EXCLUDED.bill_date,
-            due_date = EXCLUDED.due_date,
-            disconnection_date = EXCLUDED.disconnection_date,
-            class_cost = EXCLUDED.class_cost,
-            water_charge = EXCLUDED.water_charge,
-            meter_maintenance_fee = EXCLUDED.meter_maintenance_fee,
-            connection_fee = EXCLUDED.connection_fee,
-            amount_due = EXCLUDED.amount_due,
-            previous_balance = EXCLUDED.previous_balance,
-            previous_penalty = EXCLUDED.previous_penalty,
-            penalty = EXCLUDED.penalty,
-            total_amount = EXCLUDED.total_amount,
-            total_after_due_date = EXCLUDED.total_after_due_date,
-            status = EXCLUDED.status,
-            setting_id = EXCLUDED.setting_id,
-            source_site_id = EXCLUDED.source_site_id,
-            sync_status = EXCLUDED.sync_status,
-            last_synced_at = EXCLUDED.last_synced_at,
-            updated_by_device = EXCLUDED.updated_by_device
-        RETURNING *
-        """
-        params = (
-            payload.get("consumer_id"),
-            payload.get("reading_id"),
-            payload.get("billing_officer_id"),
-            _safe_int(payload.get("billing_month"), 0) if False else payload.get("billing_month"),
-            _parse_datetime(payload.get("date_covered_from")),
-            _parse_datetime(payload.get("date_covered_to")),
-            _parse_datetime(payload.get("bill_date")),
-            _parse_datetime(payload.get("due_date")),
-            _parse_datetime(payload.get("disconnection_date")),
-            _safe_float(payload.get("class_cost")),
-            _safe_float(payload.get("water_charge")),
-            _safe_float(payload.get("meter_maintenance_fee")),
-            _safe_float(payload.get("connection_fee")),
-            _safe_float(payload.get("amount_due")),
-            _safe_float(payload.get("previous_balance")),
-            _safe_float(payload.get("previous_penalty")),
-            _safe_float(payload.get("penalty")),
-            _safe_float(payload.get("total_amount")),
-            _safe_float(payload.get("total_after_due_date")),
-            payload.get("status") or "Unpaid",
-            payload.get("setting_id"),
-            payload.get("sync_id"),
-            payload.get("source_site_id") or "meter-reader-device",
-            payload.get("sync_status") or "synced",
-            _parse_datetime(payload.get("last_synced_at")) or datetime.now().replace(tzinfo=None),
-            payload.get("created_by_device") or "meter-reader-device",
-            payload.get("updated_by_device") or "meter-reader-device",
-        )
-        with self._connect() as conn:
-            with conn.cursor(cursor_factory=self._dict_cursor) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
-                conn.commit()
-        return dict(row) if row else {}
+        if status >= 400 or status == 0:
+            raise RuntimeError(self._message(data, "Backend reading lookup failed."))
+        return data if isinstance(data, dict) and data else None
 
     def save_reading_bundle(self, payload: dict) -> dict:
         context = self.get_consumer_context(int(payload["consumer_id"]))
         merged = dict(context)
         merged.update(payload)
-        reading_row = self.upsert_meter_reading(merged)
-        reading_id = reading_row.get("reading_id")
-        if reading_id is None:
-            raise RuntimeError("MAIN_PG did not return a reading_id for billing sync.")
-        bill_payload = _build_bill_payload(merged, context, int(reading_id))
-        bill_row = self.upsert_bill(bill_payload)
-        return {"meterreading": reading_row, "bill": bill_row}
+        if self._meter_reader_id is not None:
+            merged.setdefault("meter_reader_id", self._meter_reader_id)
+        bill = _build_bill_payload(merged, context, 0)
+        status, data = self._req(
+            "POST",
+            "/api/handheld/reading-bundles",
+            payload={"reading": merged, "bill": bill},
+        )
+        if status >= 400 or status == 0 or not isinstance(data, dict):
+            raise RuntimeError(self._message(data, "Backend reading sync failed."))
+        return data
+
+    def upsert_meter_reading(self, payload: dict) -> dict:
+        result = self.save_reading_bundle(payload)
+        row = result.get("meterreading") if isinstance(result, dict) else None
+        return row if isinstance(row, dict) else {}
 
 
 class HandheldSyncDataAccess:
-    """
-    Required handheld DAL methods:
-    - loadAssignedConsumers
-    - saveMeterReading
-    - updateMeterReading
-    - listPendingSyncReadings
-    - syncPendingReadings
-    """
+    """Online/offline data access through the backend API and local SQLite queue."""
 
-    def __init__(self, local_store: LocalSyncStore, remote_store: SupabaseRestClient, main_pg_client=None):
+    def __init__(self, local_store: LocalSyncStore, remote_store):
         self.local = local_store
         self.remote = remote_store
-        self.main_pg = main_pg_client
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -2243,543 +993,241 @@ class HandheldSyncDataAccess:
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "HandheldSyncDataAccess":
         cfg = SyncConfig.from_env(fail_fast=fail_fast)
-        main_pg_client = None
-        try:
-            if cfg.main_pg_host and cfg.main_pg_db and cfg.main_pg_user:
-                main_pg_client = MainPostgresClient(cfg)
-        except Exception:
-            main_pg_client = None
-        return cls(SQLiteLocalSyncStore(cfg), SupabaseRestClient(cfg), main_pg_client=main_pg_client)
+        return cls(SQLiteLocalSyncStore(cfg), BackendApiClient(cfg))
 
     def is_online(self) -> bool:
         return bool(self.remote and self.remote.is_online())
 
-    def _main_pg_online(self) -> bool:
-        return bool(self.main_pg and self.main_pg.is_online())
-
-    def _available_targets(
-        self,
-        *,
-        include_supabase: bool = True,
-        include_main_pg: bool = False,
-        availability: dict[str, bool] | None = None,
-    ) -> list[tuple[str, str, object]]:
-        targets: list[tuple[str, str, object]] = []
-        supabase_online = availability.get("supabase") if availability is not None else None
-        main_pg_online = availability.get("main_pg") if availability is not None else None
-        if supabase_online is None:
-            supabase_online = bool(self.remote and self.remote.is_online())
-        if main_pg_online is None:
-            main_pg_online = bool(self.main_pg and self.main_pg.is_online())
-        if include_supabase and self.remote and supabase_online:
-            targets.append(("Supabase", "supabase", self.remote))
-        if include_main_pg and self.main_pg and main_pg_online:
-            targets.append(("MAIN_PG", "main_pg", self.main_pg))
-        return targets
-
-    def _sync_reading_to_targets(
-        self,
-        reading: dict,
-        *,
-        include_supabase: bool = True,
-        include_main_pg: bool = False,
-        availability: dict[str, bool] | None = None,
-    ) -> tuple[dict[str, dict], list[str]]:
-        results: dict[str, dict] = {}
-        errors: list[str] = []
-        for label, _target_key, target in self._available_targets(
-            include_supabase=include_supabase,
-            include_main_pg=include_main_pg,
-            availability=availability,
-        ):
-            try:
-                bundle_writer = getattr(target, "save_reading_bundle", None)
-                if callable(bundle_writer):
-                    results[label] = bundle_writer(reading)
-                else:
-                    results[label] = {"meterreading": target.upsert_meter_reading(reading)}
-            except Exception as exc:
-                errors.append(f"{label}: {exc}")
-        return results, errors
-
-    def _overlay_main_pg_rates_for_consumers(self, consumers: list[dict]) -> list[dict]:
-        if not consumers or not self.main_pg:
-            return consumers
-        try:
-            rates_by_classification = self.main_pg.load_waterrates_by_classification()
-        except Exception:
-            return consumers
-
-        overlaid: list[dict] = []
-        for item in consumers:
-            row = dict(item)
-            classification_id = row.get("classification_id")
-            try:
-                rate_row = rates_by_classification.get(int(classification_id)) if classification_id is not None else None
-            except (TypeError, ValueError):
-                rate_row = None
-            if rate_row:
-                row["minimum_cubic"] = rate_row.get("minimum_cubic")
-                row["minimum_rate"] = rate_row.get("minimum_rate")
-                row["excess_rate_per_cubic"] = rate_row.get("excess_rate_per_cubic")
-            overlaid.append(row)
-        return overlaid
-
-    def _overlay_main_pg_rates_for_reading(self, reading: dict) -> dict:
-        if not self.main_pg:
-            return reading
-        consumer_id = reading.get("consumer_id")
-        if consumer_id in (None, ""):
-            return reading
-        try:
-            context = self.main_pg.get_consumer_context(int(consumer_id))
-        except Exception:
-            return reading
-        merged = dict(reading)
-        for field_name in ("minimum_cubic", "minimum_rate", "excess_rate_per_cubic"):
-            value = context.get(field_name)
-            if value is not None and value != "":
-                merged[field_name] = value
-        return merged
-
-    def _find_existing_reading_with_fallback(
-        self,
-        payload: dict,
-        *,
-        include_supabase: bool = True,
-        include_main_pg: bool = False,
-        availability: dict[str, bool] | None = None,
-    ) -> tuple[dict | None, list[str]]:
-        errors: list[str] = []
-        online_targets = self._available_targets(
-            include_supabase=include_supabase,
-            include_main_pg=include_main_pg,
-            availability=availability,
-        )
-        for label, _target_key, target in online_targets:
-            try:
-                existing = target.find_existing_reading(payload["consumer_id"], payload["reading_date"])
-                if existing:
-                    return existing, errors
-            except Exception as exc:
-                errors.append(f"{label}: {exc}")
-
-        return None, errors
-
     def getConsumerContext(self, consumer_id: int) -> dict:
-        errors: list[str] = []
-        if self.remote and self.remote.is_online():
+        if self.is_online():
             try:
                 context = self.remote.get_consumer_context(int(consumer_id))
                 if context:
-                    context = self._overlay_main_pg_rates_for_consumers([context])[0]
                     self.local.cache_consumers([context])
                     return context
             except Exception as exc:
-                errors.append(f"Supabase: {exc}")
-        if self.main_pg and self.main_pg.is_online():
-            try:
-                context = self.main_pg.get_consumer_context(int(consumer_id))
-                if context:
-                    self.local.cache_consumers([context])
-                    return context
-            except Exception as exc:
-                errors.append(f"MAIN_PG: {exc}")
-        cached = self.local.load_cached_consumers(None)
-        for row in cached:
+                self.local.log_audit(None, "failed", f"Backend API context lookup failed: {exc}")
+        for row in self.local.load_cached_consumers(None):
             try:
                 if int(row.get("id")) == int(consumer_id):
                     return row
             except (TypeError, ValueError):
                 continue
-        if errors:
-            raise RuntimeError("; ".join(errors))
         return {}
 
     def loadAssignedConsumers(
         self,
-        meter_reader_id: object | None = None,
+        meter_reader_id: int | str | None = None,
         zone_name: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        **kwargs,
     ) -> list[dict]:
-        effective_zone_name = zone_name
-        if zone_name is None and isinstance(meter_reader_id, str) and not meter_reader_id.isdigit():
-            effective_zone_name = meter_reader_id
-        effective_meter_reader_id = None if (isinstance(meter_reader_id, str) and not meter_reader_id.isdigit()) else meter_reader_id
+        effective_reader_id = meter_reader_id or kwargs.get("meterReaderId") or kwargs.get("reader_id")
+        effective_zone_name = zone_name or kwargs.get("zoneName")
         if not date_from or not date_to:
-            date_from, date_to = _device_schedule_window()
+            default_from, default_to = _device_schedule_window()
+            date_from = date_from or default_from
+            date_to = date_to or default_to
 
-        def _scheduled_zone_names(rows: list[dict]) -> set[str]:
-            return {
-                str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
-                for row in rows or []
-                if str(row.get("Zone_Name") or row.get("zone_name") or "").strip()
-            }
-
-        def _consumer_zone_names(rows: list[dict]) -> set[str]:
-            return {
-                str(row.get("zone_name") or "").strip()
-                for row in rows or []
-                if str(row.get("zone_name") or "").strip()
-            }
-
-        def _merge_consumers(primary: list[dict], secondary: list[dict]) -> list[dict]:
-            merged: list[dict] = []
-            seen: set[object] = set()
-            for row in [*(primary or []), *(secondary or [])]:
-                if not isinstance(row, dict):
-                    continue
-                key = row.get("id") or row.get("consumer_id") or row.get("meter_no") or row.get("acct_no")
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(row)
-            return merged
-
-        errors: list[str] = []
-        main_pg_data: list[dict] = []
-        main_pg_schedule_zones: set[str] = set()
-        if self.main_pg and self.main_pg.is_online():
+        if self.is_online():
             try:
-                schedules = []
-                if effective_meter_reader_id not in (None, ""):
+                schedules: list[dict] = []
+                if effective_reader_id not in (None, ""):
                     for schedule_status in ("Scheduled", "In Progress"):
-                        schedules.extend(self.main_pg.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
-                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
-                    main_pg_schedule_zones = _scheduled_zone_names(schedules)
-                data = self.main_pg.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
-                main_pg_data = data
-                self.local.cache_consumers(data)
-                self.local.log_audit(None, "success", "Loaded assigned consumers from MAIN_PG", {"count": len(data), "schedule_count": len(schedules)})
-                if data:
-                    if effective_zone_name or not main_pg_schedule_zones or main_pg_schedule_zones.issubset(_consumer_zone_names(data)):
-                        return data
+                        schedules.extend(
+                            self.remote.load_reading_schedules(
+                                effective_reader_id,
+                                date_from,
+                                date_to,
+                                schedule_status,
+                            )
+                        )
+                    self.local.cache_reading_schedules(schedules, effective_reader_id, date_from, date_to)
+
+                consumers = self.remote.load_assigned_consumers(
+                    effective_reader_id,
+                    effective_zone_name,
+                    date_from,
+                    date_to,
+                )
+                if consumers:
+                    self.local.cache_consumers(consumers)
                     self.local.log_audit(
                         None,
-                        "failed",
-                        "MAIN_PG returned only part of the assigned zones; trying Supabase for missing consumers",
-                        {
-                            "main_pg_zones": sorted(_consumer_zone_names(data)),
-                            "scheduled_zones": sorted(main_pg_schedule_zones),
-                        },
+                        "success",
+                        "Loaded assigned consumers from Backend API",
+                        {"count": len(consumers), "schedule_count": len(schedules)},
                     )
-            except Exception as exc:
-                errors.append(f"MAIN_PG: {exc}")
-                self.local.log_audit(None, "failed", f"MAIN_PG load failed, trying Supabase/cache fallback: {exc}")
-        if self.remote and self.remote.is_online():
-            try:
-                schedules = []
-                supabase_schedule_zones: set[str] = set()
-                if effective_meter_reader_id not in (None, ""):
-                    for schedule_status in ("Scheduled", "In Progress"):
-                        schedules.extend(self.remote.load_reading_schedules(effective_meter_reader_id, date_from, date_to, schedule_status))
-                    self.local.cache_reading_schedules(schedules, effective_meter_reader_id, date_from, date_to)
-                    supabase_schedule_zones = _scheduled_zone_names(schedules)
-                data = self.remote.load_assigned_consumers(effective_meter_reader_id, effective_zone_name, date_from, date_to)
-                if data:
-                    data = self._overlay_main_pg_rates_for_consumers(data)
-                    data = _merge_consumers(main_pg_data, data)
-                    if not effective_zone_name and supabase_schedule_zones and not supabase_schedule_zones.issubset(_consumer_zone_names(data)):
-                        cached = self.local.load_cached_consumers(None)
-                        data = _merge_consumers(data, cached)
-                        self.local.log_audit(
-                            None,
-                            "failed",
-                            "Supabase returned only part of the assigned zones; merged available local cache",
-                            {
-                                "supabase_zones": sorted(_consumer_zone_names(data)),
-                                "scheduled_zones": sorted(supabase_schedule_zones),
-                            },
-                        )
-                    self.local.cache_consumers(data)
-                    self.local.log_audit(None, "success", "Loaded assigned consumers from Supabase", {"count": len(data), "schedule_count": len(schedules)})
-                    return data
+                    return consumers
                 self.local.log_audit(
                     None,
                     "failed",
-                    "Supabase returned no assigned consumers; trying MAIN_PG before cache fallback",
-                    {"schedule_count": len(schedules), "meter_reader_id": effective_meter_reader_id, "date_from": date_from, "date_to": date_to},
+                    "Backend API returned no assigned consumers; using local cache",
+                    {"schedule_count": len(schedules)},
                 )
             except Exception as exc:
-                errors.append(f"Supabase: {exc}")
-                self.local.log_audit(None, "failed", f"Supabase load failed, fallback to cache: {exc}")
+                self.local.log_audit(None, "failed", f"Backend API load failed; using local cache: {exc}")
+
         cached = self.local.load_cached_consumers(effective_zone_name)
-        if main_pg_data:
-            cached = _merge_consumers(main_pg_data, cached)
-        self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached), "errors": errors})
+        self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})
         return cached
 
     def authenticateMeterReader(self, username: str, password: str) -> dict:
-        auth_errors: list[tuple[str, Exception]] = []
-        for label, client in (("Supabase", self.remote), ("MAIN_PG", self.main_pg)):
-            if not client:
-                continue
-            try:
-                if hasattr(client, "is_online") and not client.is_online():
-                    continue
-                return client.authenticate_meter_reader(username, password)
-            except (ValueError, PermissionError) as exc:
-                auth_errors.append((label, exc))
-            except Exception as exc:
-                auth_errors.append((label, exc))
+        if not self.remote or not self.remote.is_online():
+            raise RuntimeError("Backend API is unavailable for meter reader login.")
+        return self.remote.authenticate_meter_reader(username, password)
 
-        for _label, exc in auth_errors:
-            if isinstance(exc, PermissionError):
-                raise exc
-        for _label, exc in auth_errors:
-            if isinstance(exc, ValueError):
-                raise exc
-        if auth_errors:
-            raise RuntimeError("; ".join(f"{label}: {exc}" for label, exc in auth_errors))
-        raise RuntimeError("No central account source is available for meter reader login.")
-
-    def _normalize_reading(self, payload: dict) -> dict:
+    @staticmethod
+    def _normalize_reading(payload: dict) -> dict:
         reading = dict(payload)
         reading.setdefault("reading_id", str(uuid.uuid4()))
         reading.setdefault("operation_id", str(uuid.uuid4()))
         reading.setdefault("created_at", _utc_now_iso())
         reading.setdefault("updated_at", _utc_now_iso())
-        if "reading_date" not in reading:
-            reading["reading_date"] = datetime.now(timezone.utc).date().isoformat()
+        reading.setdefault("reading_date", datetime.now(timezone.utc).date().isoformat())
         return reading
 
     def _queue_for_sync(self, operation: str, reading: dict) -> dict:
-        return self.local.enqueue_operation(
-            operation,
-            reading,
-            supabase_status="pending",
-            main_pg_status="pending" if self.main_pg else "skipped",
-        )
+        return self.local.enqueue_operation(operation, reading, backend_status="pending")
 
     def queueMeterReading(self, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
-        reading = self._overlay_main_pg_rates_for_reading(reading)
         queued = self._queue_for_sync("create", reading)
         self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
         return {"status": "queued", "queue": queued, "reading": reading}
 
-    def saveMeterReading(self, payload: dict) -> dict:
+    def _save_or_queue(self, operation: str, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
-        reading = self._overlay_main_pg_rates_for_reading(reading)
-        queued = self._queue_for_sync("create", reading)
-        results, errors = self._sync_reading_to_targets(reading, include_supabase=True, include_main_pg=False)
-        if results:
-            self.local.mark_target_synced(queued["id"], "supabase")
-            if errors:
-                self.local.log_audit(queued["id"], "success", f"Reading synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            else:
-                self.local.log_audit(queued["id"], "success", "Reading synced to Supabase; MAIN_PG waits for manual sync", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            return {"status": "synced", "remote": results, "reading": reading, "errors": errors, "queue": queued}
-        if errors:
-            self.local.mark_target_failed(queued["id"], "supabase", "; ".join(errors))
-            self.local.log_audit(queued["id"], "failed", f"Supabase save failed, queued for retry: {'; '.join(errors)}", reading)
-        self.local.log_audit(queued["id"], "pending", "Queued offline create operation", reading)
-        return {"status": "queued", "queue": queued, "reading": reading}
+        queued = self._queue_for_sync(operation, reading)
+        if not self.is_online():
+            self.local.log_audit(queued["id"], "pending", f"Queued offline {operation} operation", reading)
+            return {"status": "queued", "queue": queued, "reading": reading}
+        try:
+            remote = self.remote.save_reading_bundle(reading)
+            self.local.mark_target_synced(queued["id"], "backend")
+            self.local.log_audit(
+                queued["id"],
+                "success",
+                "Reading synced to Backend API",
+                {"reading_id": reading["reading_id"]},
+            )
+            return {
+                "status": "synced",
+                "remote": {"Backend API": remote},
+                "reading": reading,
+                "errors": [],
+                "queue": queued,
+            }
+        except Exception as exc:
+            self.local.mark_target_failed(queued["id"], "backend", str(exc))
+            self.local.log_audit(queued["id"], "failed", f"Backend API save failed, queued for retry: {exc}", reading)
+            return {"status": "queued", "queue": queued, "reading": reading}
+
+    def saveMeterReading(self, payload: dict) -> dict:
+        return self._save_or_queue("create", payload)
 
     def updateMeterReading(self, payload: dict) -> dict:
-        reading = self._normalize_reading(payload)
-        reading = self._overlay_main_pg_rates_for_reading(reading)
-        queued = self._queue_for_sync("update", reading)
-        results, errors = self._sync_reading_to_targets(reading, include_supabase=True, include_main_pg=False)
-        if results:
-            self.local.mark_target_synced(queued["id"], "supabase")
-            if errors:
-                self.local.log_audit(queued["id"], "success", f"Reading update synced with partial target failures: {'; '.join(errors)}", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            else:
-                self.local.log_audit(queued["id"], "success", "Reading update synced to Supabase; MAIN_PG waits for manual sync", {"reading_id": reading["reading_id"], "targets": list(results.keys())})
-            return {"status": "synced", "remote": results, "reading": reading, "errors": errors, "queue": queued}
-        if errors:
-            self.local.mark_target_failed(queued["id"], "supabase", "; ".join(errors))
-            self.local.log_audit(queued["id"], "failed", f"Supabase update failed, queued for retry: {'; '.join(errors)}", reading)
-        self.local.log_audit(queued["id"], "pending", "Queued offline update operation", reading)
-        return {"status": "queued", "queue": queued, "reading": reading}
+        return self._save_or_queue("update", payload)
 
     def listPendingSyncReadings(self) -> list[dict]:
-        return self.local.list_pending()
+        return self.local.list_pending("backend")
 
-    def listPendingSupabaseReadings(self) -> list[dict]:
-        return self.local.list_pending("supabase")
+    def listPendingBackendReadings(self) -> list[dict]:
+        return self.listPendingSyncReadings()
 
     def get_recent_audit_entries(self, limit: int = 20) -> list[dict]:
         return self.local.get_recent_audit(limit=limit)
 
     def get_last_successful_sync_time(self) -> str | None:
-        entries = self.local.get_recent_audit(limit=100)
-        for row in entries:
-            status = str(row.get("status", "")).lower()
-            msg = str(row.get("message", "")).lower()
-            if status == "success" and "synced" in msg:
-                created = row.get("created_at")
-                return str(created) if created else None
+        for row in self.local.get_recent_audit(limit=100):
+            if str(row.get("status", "")).lower() == "success" and "synced" in str(row.get("message", "")).lower():
+                return str(row.get("created_at")) if row.get("created_at") else None
         return None
 
     def get_sync_snapshot(self) -> dict:
         pending = self.listPendingSyncReadings()
-        remote_online = self.is_online()
-        pg_online = self._main_pg_online()
-        if remote_online:
-            status = "Online"
-        elif pg_online:
-            status = "Partial"
-        else:
-            status = "Offline"
-        has_failed = any(row.get("status") == "failed" for row in pending)
-        supabase_pending = [
-            row for row in pending
-            if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}
-        ]
-        main_pg_pending = [
-            row for row in pending
-            if str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}
-        ]
-        main_pg_conflicts = [
-            row for row in self.local.get_recent_audit(limit=100)
-            if str(row.get("status", "")).lower() == "conflict"
-            and "main_pg" in str(row.get("message", "")).lower()
-        ]
-        if supabase_pending:
-            save_target = "Local SQLite Queue (Supabase retry pending)"
-        elif status == "Online":
-            save_target = "Supabase auto-sync on change"
-        elif status == "Partial":
-            save_target = "MAIN_PG available, Supabase offline"
-        else:
-            save_target = "Local SQLite Queue (offline)"
-        if not self.main_pg:
-            backup_state = "Manual MAIN_PG sync not configured"
-        elif main_pg_conflicts:
-            backup_state = "MAIN_PG conflicts need review"
-        elif main_pg_pending:
-            backup_state = "MAIN_PG manual sync needed"
-        elif pg_online:
-            backup_state = "Backed up to MAIN_PG"
-        else:
-            backup_state = "MAIN_PG unavailable"
+        online = self.is_online()
         last_sync = self.get_last_successful_sync_time()
-        supabase_last_sync = None
-        for row in self.local.get_recent_audit(limit=100):
-            msg = str(row.get("message", "")).lower()
-            status_text = str(row.get("status", "")).lower()
-            if status_text == "success" and "supabase" in msg:
-                supabase_last_sync = str(row.get("created_at")) if row.get("created_at") else None
-                break
         return {
-            "status": status,
+            "status": "Online" if online else "Offline",
             "pending_count": len(pending),
-            "has_failed": has_failed,
-            "save_target": save_target,
-            "backup_state": backup_state,
+            "has_failed": any(row.get("status") == "failed" for row in pending),
+            "save_target": (
+                "Local SQLite Queue (Backend API retry pending)"
+                if pending
+                else "Backend API auto-sync on change"
+                if online
+                else "Local SQLite Queue (offline)"
+            ),
+            "backup_state": "PostgreSQL managed by Backend API",
             "last_sync_time": last_sync,
-            "supabase_online": remote_online,
-            "supabase_pending_count": len(supabase_pending),
-            "supabase_last_sync_time": supabase_last_sync,
-            "main_pg_online": pg_online,
-            "main_pg_pending_count": len(main_pg_pending),
+            "backend_online": online,
+            "backend_pending_count": len(pending),
+            "backend_last_sync_time": last_sync,
         }
 
-    def syncPendingReadings(self, include_main_pg: bool = False) -> dict:
-        availability = {
-            "supabase": bool(self.remote and self.remote.is_online()),
-            "main_pg": bool(include_main_pg and self.main_pg and self.main_pg.is_online()),
-        }
-        if not availability["supabase"] and not availability["main_pg"]:
-            self.local.log_audit(None, "failed", "Sync skipped, offline")
+    def syncPendingReadings(self, **_ignored) -> dict:
+        if not self.is_online():
+            self.local.log_audit(None, "failed", "Sync skipped, Backend API offline")
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
 
-        pending = self.local.list_pending(None if include_main_pg else "supabase")
-        self.local.log_audit(
-            None,
-            "pending",
-            "Starting sync cycle",
-            {
-                "include_main_pg": include_main_pg,
-                "internet_online": availability["supabase"],
-                "main_pg_online": availability["main_pg"],
-                "pending_count": len(pending),
-            },
-        )
+        pending = self.listPendingSyncReadings()
+        self.local.log_audit(None, "pending", "Starting Backend API sync cycle", {"pending_count": len(pending)})
         synced = 0
         failed = 0
         conflicts = 0
-
         for row in pending:
             queue_id = row["id"]
             payload = dict(row["payload"])
-            if include_main_pg:
-                payload = self._overlay_main_pg_rates_for_reading(payload)
             try:
-                row_synced = False
-                requested_targets = []
-                if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}:
-                    requested_targets.append(("Supabase", "supabase", True, False))
-                if include_main_pg and str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}:
-                    requested_targets.append(("MAIN_PG", "main_pg", False, True))
+                existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
+                same_sync_id = bool(
+                    existing
+                    and str(existing.get("sync_id") or "") == str(payload.get("reading_id") or "")
+                )
+                if (
+                    existing
+                    and not same_sync_id
+                    and existing.get("updated_at")
+                    and payload.get("updated_at")
+                    and str(existing["updated_at"]) > str(payload["updated_at"])
+                ):
+                    reason = "Server has a newer reading for the same consumer and date."
+                    self.local.mark_conflict(queue_id, reason, existing, target="backend")
+                    self.local.log_audit(queue_id, "conflict", f"Backend API: {reason}", {"local": payload, "server": existing})
+                    conflicts += 1
+                    continue
 
-                for label, target_key, wants_supabase, wants_main_pg in requested_targets:
-                    existing, lookup_errors = self._find_existing_reading_with_fallback(
-                        payload,
-                        include_supabase=wants_supabase,
-                        include_main_pg=wants_main_pg,
-                        availability=availability,
-                    )
-                    if existing and existing.get("updated_at") and payload.get("updated_at"):
-                        if str(existing["updated_at"]) > str(payload["updated_at"]):
-                            reason = "Server has newer reading for same consumer/date."
-                            self.local.mark_conflict(queue_id, reason, existing, target=target_key)
-                            self.local.log_audit(queue_id, "conflict", f"{label}: {reason}", {"local": payload, "server": existing})
-                            conflicts += 1
-                            continue
-
-                    results, errors = self._sync_reading_to_targets(
-                        payload,
-                        include_supabase=wants_supabase,
-                        include_main_pg=wants_main_pg,
-                        availability=availability,
-                    )
-                    errors = [*lookup_errors, *errors]
-                    if not results:
-                        raise RuntimeError("; ".join(errors) if errors else f"{label} did not accept the queue row.")
-                    self.local.mark_target_synced(queue_id, target_key)
-                    message = f"{label} synced"
-                    if errors:
-                        message += f" with partial target failures: {'; '.join(errors)}"
-                    self.local.log_audit(queue_id, "success", message, {"payload": payload, "targets": list(results.keys())})
-                    row_synced = True
-                if row_synced:
-                    synced += 1
+                self.remote.save_reading_bundle(payload)
+                self.local.mark_target_synced(queue_id, "backend")
+                self.local.log_audit(queue_id, "success", "Backend API synced", {"reading_id": payload.get("reading_id")})
+                synced += 1
             except ValueError as exc:
-                self.local.mark_conflict(queue_id, str(exc))
-                self.local.log_audit(queue_id, "conflict", f"Queue row invalid for remote sync: {exc}", payload)
+                self.local.mark_conflict(queue_id, str(exc), target="backend")
+                self.local.log_audit(queue_id, "conflict", f"Queue row invalid for Backend API sync: {exc}", payload)
                 conflicts += 1
             except Exception as exc:
-                failed_targets = []
-                if str(row.get("supabase_status", "")).lower() in {"pending", "failed"}:
-                    failed_targets.append("supabase")
-                if include_main_pg and str(row.get("main_pg_status", "")).lower() in {"pending", "failed"}:
-                    failed_targets.append("main_pg")
-                for target_key in failed_targets:
-                    self.local.mark_target_failed(queue_id, target_key, str(exc))
-                self.local.log_audit(queue_id, "failed", f"Queue row sync failed: {exc}", payload)
+                self.local.mark_target_failed(queue_id, "backend", str(exc))
+                self.local.log_audit(queue_id, "failed", f"Backend API queue sync failed: {exc}", payload)
                 failed += 1
 
         result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts}
-        self.local.log_audit(None, "success", "Finished sync cycle", result)
+        self.local.log_audit(None, "success", "Finished Backend API sync cycle", result)
         return result
 
     def start_sync_worker(self, interval_seconds: int = BACKGROUND_SYNC_INTERVAL_SECONDS) -> None:
         if self._worker and self._worker.is_alive():
             return
-
         self._worker_stop.clear()
 
         def _run():
             while not self._worker_stop.is_set():
                 try:
-                    self.syncPendingReadings(include_main_pg=False)
+                    self.syncPendingReadings()
                 except Exception as exc:
                     self.local.log_audit(None, "failed", f"Background sync worker error: {exc}")
-                time.sleep(max(60, interval_seconds))
+                self._worker_stop.wait(max(60, interval_seconds))
 
         self._worker = threading.Thread(target=_run, daemon=True, name="handheld-sync-worker")
         self._worker.start()

@@ -78,17 +78,15 @@ python3 main.py
 ## Handheld Sync Flow + Environment Setup
 
 The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
-- Online mode: Supabase read/write on every reading change.
+- Online mode: HTTPS requests to the Node backend through Tailscale Funnel.
 - Offline mode: local SQLite cache + `sync_queue_meter_readings`.
-- Manual backup: PostgreSQL sync runs only when the operator triggers `Manual Sync`.
-- Reconnect: Supabase queue flush with conflict detection and audit logs.
+- PostgreSQL access: the Node backend is the only process that holds database credentials.
+- Reconnect: the backend API queue flushes with conflict detection and audit logs.
 
 ### Environment
 
 1. Copy `.env.example` to `.env`.
-2. Fill in:
-   - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
-   - `MAIN_PG_HOST`, `MAIN_PG_PORT`, `MAIN_PG_DB`, `MAIN_PG_USER`, `MAIN_PG_PASSWORD`
+2. Set `BACKEND_API_BASE_URL=https://aspire.tail3de291.ts.net`.
 3. Enable sync by setting `HANDHELD_SYNC_ENABLED=1`.
 
 If sync is enabled and required env vars are missing, the sync layer raises a clear startup/config error.
@@ -96,7 +94,22 @@ If sync is enabled and required env vars are missing, the sync layer raises a cl
 ### Local Storage
 
 The handheld queue, sync audit log, and consumer cache are stored in the Pi's local SQLite database.
-`MAIN_PG_*` is only used as a remote LAN fallback source for consumer pulls when Supabase is unavailable.
+The device does not store third-party cloud keys or PostgreSQL credentials.
+
+### Offline Operation
+
+- Each meter reader must sign in online at least once so the device can cache a salted password hash and assigned route data.
+- While offline, the reader can sign in, browse cached schedules and consumers, record readings, and print receipts.
+- Offline readings remain in the local SQLite queue and upload automatically or through `Sync Now` when the backend API becomes reachable.
+- An invalid or inactive account response from the backend is never bypassed with stale cached credentials.
+
+### Tailscale Funnel
+
+The device uses the same public HTTPS Funnel as the web app:
+
+```text
+Device -> https://aspire.tail3de291.ts.net/api -> Node backend:3001 -> PostgreSQL:5432
+```
 
 ### Handheld UI
 

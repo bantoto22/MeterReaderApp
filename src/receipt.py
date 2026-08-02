@@ -92,9 +92,9 @@ def _require_int(consumer: dict, field_name: str) -> int:
 
 def _require_billing_profile(consumer: dict) -> None:
     if not consumer.get("classification_id"):
-        raise ValueError("Billing data is not synced for this consumer yet. Sync from PostgreSQL/Supabase before printing.")
+        raise ValueError("Billing data is not synced for this consumer yet. Sync from the backend API before printing.")
     if not (consumer.get("classification_name") or "").strip():
-        raise ValueError("Billing data is not synced for this consumer yet. Sync from PostgreSQL/Supabase before printing.")
+        raise ValueError("Billing data is not synced for this consumer yet. Sync from the backend API before printing.")
     for field_name in (
         "minimum_cubic",
         "minimum_rate",

@@ -209,9 +209,9 @@ def _normalize_shutdown_error(detail: str) -> str:
 def _friendly_save_target_text(value: str) -> str:
     normalized = (value or "").strip()
     mapping = {
-        "Local SQLite Queue (Supabase retry pending)": "Saved on device, waiting to retry upload",
-        "Supabase auto-sync on change": "Automatic cloud upload is on",
-        "MAIN_PG available, Supabase offline": "Saved on device, cloud unavailable",
+        "Local SQLite Queue (Backend API retry pending)": "Saved on device, waiting to retry upload",
+        "Backend API auto-sync on change": "Automatic backend sync is on",
+        "Backend API unavailable": "Saved on device, backend unavailable",
         "Local SQLite Queue (offline)": "Saved on device while offline",
         "Local SQLite only": "Saved on device",
     }
@@ -221,11 +221,6 @@ def _friendly_save_target_text(value: str) -> str:
 def _friendly_backup_state_text(value: str) -> str:
     normalized = (value or "").strip()
     mapping = {
-        "Manual MAIN_PG sync not configured": "Secondary backup not configured",
-        "MAIN_PG conflicts need review": "Backup needs review",
-        "MAIN_PG manual sync needed": "Secondary backup waiting for manual sync",
-        "Backed up to MAIN_PG": "Secondary backup complete",
-        "MAIN_PG unavailable": "Secondary backup unavailable",
         "Not configured": "Not configured",
     }
     return mapping.get(normalized, normalized or "Not configured")
@@ -287,13 +282,6 @@ class LoginBridge(QObject):
         self.errorMessageChanged.emit()
 
         def _task() -> None:
-            cached_user = authenticate_user(username, password)
-            if cached_user:
-                save_current_meter_reader(cached_user)
-                self.loginAttemptFinished.emit(True, cached_user, "")
-                return
-
-            offline_error = None
             try:
                 if HandheldSyncDataAccess is None or SyncConfig is None:
                     raise RuntimeError("Sync module is unavailable.")
@@ -313,7 +301,16 @@ class LoginBridge(QObject):
             except Exception as exc:
                 offline_error = str(exc) or "Unable to verify this account right now."
 
-            self.loginAttemptFinished.emit(False, None, offline_error)
+            cached_user = authenticate_user(username, password)
+            if cached_user:
+                save_current_meter_reader(cached_user)
+                self.loginAttemptFinished.emit(True, cached_user, "")
+                return
+            self.loginAttemptFinished.emit(
+                False,
+                None,
+                f"{offline_error} Connect once with this account before using offline login.",
+            )
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -378,9 +375,9 @@ class AppBridge(QObject):
     syncStatusChanged = Signal()
     syncStatusColorChanged = Signal()
     syncPendingCountChanged = Signal()
-    supabaseStatusChanged = Signal()
-    supabasePendingCountChanged = Signal()
-    supabaseLastSyncChanged = Signal()
+    backendStatusChanged = Signal()
+    backendPendingCountChanged = Signal()
+    backendLastSyncChanged = Signal()
     saveTargetChanged = Signal()
     backupStateChanged = Signal()
     lastSyncChanged = Signal()
@@ -391,7 +388,7 @@ class AppBridge(QObject):
     autoSyncEnabledChanged = Signal()
     pullIntervalChanged = Signal()
     syncLogsChanged = Signal()
-    supabaseLogsChanged = Signal()
+    backendLogsChanged = Signal()
     wifiStatusChanged = Signal()
     wifiStatusColorChanged = Signal()
     wifiNetworksChanged = Signal()
@@ -461,9 +458,10 @@ class AppBridge(QObject):
         self._sync_status = "Offline"
         self._sync_status_color = "#475569"
         self._sync_pending_count = 0
-        self._supabase_status = "Offline"
-        self._supabase_pending_count = 0
-        self._supabase_last_sync = "Never"
+        self._backend_status = "Offline"
+        self._backend_pending_count = 0
+        self._backend_last_sync = "Never"
+        self._backend_endpoint = os.getenv("BACKEND_API_BASE_URL", "").rstrip("/") or "Not configured"
         self._save_target = "Local SQLite only"
         self._backup_state = "Not configured"
         self._last_sync = "Never"
@@ -472,9 +470,9 @@ class AppBridge(QObject):
         self._auto_pull_enabled = False
         self._auto_push_enabled = False
         self._auto_sync_enabled = self._load_auto_sync_enabled()
-        self._pull_interval = max(300, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "300000")) // 1000)
+        self._pull_interval = max(300, int(os.getenv("BACKEND_SYNC_INTERVAL_MS", "300000")) // 1000)
         self._sync_logs = "No sync activity yet."
-        self._supabase_logs = "No Supabase activity yet."
+        self._backend_logs = "No Backend API activity yet."
         self._sync_dal = None
         self._wifi_status = "Status: Checking..."
         self._wifi_status_color = "#526176"
@@ -851,17 +849,21 @@ class AppBridge(QObject):
     def syncPendingCount(self) -> int:
         return self._sync_pending_count
 
-    @Property(str, notify=supabaseStatusChanged)
-    def supabaseStatus(self) -> str:
-        return self._supabase_status
+    @Property(str, notify=backendStatusChanged)
+    def backendStatus(self) -> str:
+        return self._backend_status
 
-    @Property(int, notify=supabasePendingCountChanged)
-    def supabasePendingCount(self) -> int:
-        return self._supabase_pending_count
+    @Property(int, notify=backendPendingCountChanged)
+    def backendPendingCount(self) -> int:
+        return self._backend_pending_count
 
-    @Property(str, notify=supabaseLastSyncChanged)
-    def supabaseLastSync(self) -> str:
-        return self._supabase_last_sync
+    @Property(str, notify=backendLastSyncChanged)
+    def backendLastSync(self) -> str:
+        return self._backend_last_sync
+
+    @Property(str, constant=True)
+    def backendEndpoint(self) -> str:
+        return self._backend_endpoint
 
     @Property(str, notify=saveTargetChanged)
     def saveTarget(self) -> str:
@@ -936,9 +938,9 @@ class AppBridge(QObject):
     def syncLogs(self) -> str:
         return self._sync_logs
 
-    @Property(str, notify=supabaseLogsChanged)
-    def supabaseLogs(self) -> str:
-        return self._supabase_logs
+    @Property(str, notify=backendLogsChanged)
+    def backendLogs(self) -> str:
+        return self._backend_logs
 
     @Property(str, notify=wifiStatusChanged)
     def wifiStatus(self) -> str:
@@ -1009,9 +1011,9 @@ class AppBridge(QObject):
         self.syncStatusChanged.emit()
         self.syncStatusColorChanged.emit()
         self.syncPendingCountChanged.emit()
-        self.supabaseStatusChanged.emit()
-        self.supabasePendingCountChanged.emit()
-        self.supabaseLastSyncChanged.emit()
+        self.backendStatusChanged.emit()
+        self.backendPendingCountChanged.emit()
+        self.backendLastSyncChanged.emit()
         self.saveTargetChanged.emit()
         self.backupStateChanged.emit()
         self.lastSyncChanged.emit()
@@ -1037,10 +1039,10 @@ class AppBridge(QObject):
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
             self._sync_logs = "Sync module is unavailable."
-            self._supabase_status = "Unavailable"
-            self._supabase_logs = self._sync_logs
+            self._backend_status = "Unavailable"
+            self._backend_logs = self._sync_logs
             self.syncLogsChanged.emit()
-            self.supabaseLogsChanged.emit()
+            self.backendLogsChanged.emit()
             self._emit_sync_state()
             return
         try:
@@ -1049,10 +1051,10 @@ class AppBridge(QObject):
                 self._sync_status = "Offline"
                 self._sync_status_color = "#526176"
                 self._sync_logs = "Handheld sync is disabled in the environment."
-                self._supabase_status = "Disabled"
-                self._supabase_logs = self._sync_logs
+                self._backend_status = "Disabled"
+                self._backend_logs = self._sync_logs
                 self.syncLogsChanged.emit()
-                self.supabaseLogsChanged.emit()
+                self.backendLogsChanged.emit()
                 self._reset_auto_pull_timer()
                 self._emit_sync_state()
                 return
@@ -1063,10 +1065,10 @@ class AppBridge(QObject):
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
             self._sync_logs = str(exc)
-            self._supabase_status = "Sync Failed"
-            self._supabase_logs = str(exc)
+            self._backend_status = "Sync Failed"
+            self._backend_logs = str(exc)
             self.syncLogsChanged.emit()
-            self.supabaseLogsChanged.emit()
+            self.backendLogsChanged.emit()
             self._emit_sync_state()
 
     def _refresh_sync_snapshot(self) -> None:
@@ -1081,9 +1083,9 @@ class AppBridge(QObject):
                 self._sync_status = "Sync Failed"
                 self._sync_status_color = "#EF4444"
             self._sync_pending_count = int(snapshot.get("pending_count", 0))
-            self._supabase_status = "Online" if snapshot.get("supabase_online") else "Offline"
-            self._supabase_pending_count = int(snapshot.get("supabase_pending_count", 0))
-            self._supabase_last_sync = str(snapshot.get("supabase_last_sync_time") or "Never")
+            self._backend_status = "Online" if snapshot.get("backend_online") else "Offline"
+            self._backend_pending_count = int(snapshot.get("backend_pending_count", 0))
+            self._backend_last_sync = str(snapshot.get("backend_last_sync_time") or "Never")
             self._save_target = _friendly_save_target_text(str(snapshot.get("save_target", "Local SQLite only")))
             self._backup_state = _friendly_backup_state_text(str(snapshot.get("backup_state", "Not configured")))
             self._last_sync = str(snapshot.get("last_sync_time") or "Never")
@@ -1092,24 +1094,24 @@ class AppBridge(QObject):
                 f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
                 for row in entries
             ) or "No sync activity yet."
-            supabase_entries = [
+            backend_entries = [
                 row for row in entries
-                if "supabase" in str(row.get("message", "")).lower()
+                if "backend api" in str(row.get("message", "")).lower()
             ]
-            self._supabase_logs = "\n\n".join(
+            self._backend_logs = "\n\n".join(
                 f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
-                for row in supabase_entries
-            ) or "No Supabase activity yet."
+                for row in backend_entries
+            ) or "No Backend API activity yet."
             self.syncLogsChanged.emit()
-            self.supabaseLogsChanged.emit()
+            self.backendLogsChanged.emit()
         except Exception as exc:
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
             self._sync_logs = str(exc)
-            self._supabase_status = "Sync Failed"
-            self._supabase_logs = str(exc)
+            self._backend_status = "Sync Failed"
+            self._backend_logs = str(exc)
             self.syncLogsChanged.emit()
-            self.supabaseLogsChanged.emit()
+            self.backendLogsChanged.emit()
         self._emit_sync_state()
 
     def _reset_auto_pull_timer(self) -> None:
@@ -1135,7 +1137,7 @@ class AppBridge(QObject):
         if not self._sync_dal or not self._meter_reader_account_id:
             return 0
         schedules: list[dict] = []
-        for client in (getattr(self._sync_dal, "main_pg", None), getattr(self._sync_dal, "remote", None)):
+        for client in (getattr(self._sync_dal, "remote", None),):
             if not client:
                 continue
             try:
@@ -1410,11 +1412,11 @@ class AppBridge(QObject):
                 self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
                 self._sync_logs = f"Queue save failed: {exc}"
-                self._supabase_status = "Sync Failed"
-                self._supabase_logs = f"Local queue failed: {exc}"
+                self._backend_status = "Sync Failed"
+                self._backend_logs = f"Local queue failed: {exc}"
                 self.syncLogsChanged.emit()
-                self.supabaseStatusChanged.emit()
-                self.supabaseLogsChanged.emit()
+                self.backendStatusChanged.emit()
+                self.backendLogsChanged.emit()
             self._refresh_sync_snapshot()
 
         threading.Thread(target=_task, daemon=True).start()
@@ -1951,7 +1953,7 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                result = self._sync_dal.syncPendingReadings(include_main_pg=True)
+                result = self._sync_dal.syncPendingReadings()
                 pulled = 0
                 mirrored = 0
                 try:
@@ -2262,16 +2264,16 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 if self._sync_dal:
-                    result = self._sync_dal.syncPendingReadings(include_main_pg=False)
+                    result = self._sync_dal.syncPendingReadings()
                     if result.get("status") != "done":
                         detail = str(result.get("error") or result.get("status") or "Sync failed before shutdown.")
                         self.powerOffFailed.emit(f"Shutdown cancelled because sync did not complete cleanly.\n\n{detail}")
                         return
 
-                    pending_after_sync = len(self._sync_dal.listPendingSupabaseReadings())
+                    pending_after_sync = len(self._sync_dal.listPendingBackendReadings())
                     if pending_after_sync > 0:
                         self.powerOffFailed.emit(
-                            f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending Supabase sync."
+                            f"Shutdown cancelled because {pending_after_sync} reading(s) are still pending Backend API sync."
                         )
                         return
                     self.syncTaskFinished.emit(

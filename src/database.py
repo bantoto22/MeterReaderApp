@@ -4,6 +4,8 @@ Uses Python's built-in sqlite3 module (no extra install needed).
 """
 
 import os
+import hashlib
+import hmac
 import re
 import sqlite3
 from datetime import date
@@ -12,6 +14,38 @@ from decimal import Decimal
 sqlite3.register_adapter(Decimal, float)
 
 DB_NAME = "meter.db"
+
+
+def _hash_cached_password(password: str) -> str:
+    salt = os.urandom(16)
+    derived = hashlib.scrypt(
+        str(password).encode("utf-8"),
+        salt=salt,
+        n=16384,
+        r=8,
+        p=1,
+        dklen=32,
+    )
+    return f"scrypt${salt.hex()}${derived.hex()}"
+
+
+def _verify_cached_password(password: str, stored: str) -> bool:
+    stored_text = str(stored or "")
+    if not stored_text.startswith("scrypt$"):
+        return hmac.compare_digest(stored_text, str(password))
+    try:
+        _, salt_hex, expected_hex = stored_text.split("$", 2)
+        derived = hashlib.scrypt(
+            str(password).encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=16384,
+            r=8,
+            p=1,
+            dklen=len(bytes.fromhex(expected_hex)),
+        )
+        return hmac.compare_digest(derived.hex(), expected_hex.lower())
+    except (TypeError, ValueError):
+        return False
 
 
 def _db_path():
@@ -270,41 +304,27 @@ def init_db():
             consumers
         )
 
-    # Seed default users if table is empty (separate from zones check)
-    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        users = [
-            ("reader1", "pass123", "Juan Santos", "MR-001"),
-            ("reader2", "pass456", "Maria Cruz", "MR-002"),
-        ]
-        cur.executemany(
-            "INSERT INTO users (username, password, name, reader_id) VALUES (?, ?, ?, ?)",
-            users
-        )
+    # Remove legacy demo credentials; offline users must first authenticate online.
+    cur.execute(
+        """
+        DELETE FROM users
+        WHERE account_id IS NULL
+          AND ((username = 'reader1' AND reader_id = 'MR-001')
+            OR (username = 'reader2' AND reader_id = 'MR-002'))
+        """
+    )
 
     conn.commit()
     conn.close()
 
 
 def seed_default_users():
-    """Seed default users if users table is empty. Call this to fix empty user table."""
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        users = [
-            ("reader1", "pass123", "Juan Santos", "MR-001"),
-            ("reader2", "pass456", "Maria Cruz", "MR-002"),
-        ]
-        cur.executemany(
-            "INSERT INTO users (username, password, name, reader_id) VALUES (?, ?, ?, ?)",
-            users
-        )
-        conn.commit()
-    conn.close()
+    """Retained for compatibility; real users are cached after online login."""
+    return None
 
 
 def authenticate_user(username: str, password: str) -> dict | None:
-    """Validate user credentials. Returns user dict or None if invalid."""
+    """Validate cached credentials for offline login."""
     conn = get_connection()
     row = conn.execute(
         """
@@ -314,10 +334,14 @@ def authenticate_user(username: str, password: str) -> dict | None:
         """,
         (username,)
     ).fetchone()
-    conn.close()
-    
-    if row and row['password'] == password:
-        return {
+    if row and _verify_cached_password(password, row['password']):
+        if not str(row['password'] or '').startswith('scrypt$'):
+            conn.execute(
+                "UPDATE users SET password = ? WHERE username = ?",
+                (_hash_cached_password(password), username),
+            )
+            conn.commit()
+        user = {
             'username': row['username'],
             'name': row['full_name'] or row['name'],
             'full_name': row['full_name'] or row['name'],
@@ -328,6 +352,9 @@ def authenticate_user(username: str, password: str) -> dict | None:
             'role_id': row['role_id'],
             'account_status': row['account_status'] or "Offline Cached",
         }
+        conn.close()
+        return user
+    conn.close()
     return None
 
 
@@ -369,7 +396,7 @@ def cache_meter_reader_credentials(user: dict, password: str) -> None:
         """,
         (
             username,
-            str(password),
+            _hash_cached_password(str(password)),
             full_name,
             reader_id,
             account_id,
@@ -1300,7 +1327,7 @@ def get_zone_consumers_with_status(
 
 def replace_consumers_from_sync(consumers: list[dict]) -> int:
     """
-    Mirror consumer records from sync source (Supabase/cache) into local SQLite.
+    Mirror consumer records from the backend API/cache into local SQLite.
     Returns number of consumer rows upserted.
     """
     if not consumers:

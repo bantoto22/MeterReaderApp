@@ -1,9 +1,17 @@
 import os
+import gc
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 
-from src.handheld_sync import HandheldSyncDataAccess, SupabaseRestClient, SyncConfig, _build_bill_payload
+from src.handheld_sync import (
+    BackendApiClient,
+    HandheldSyncDataAccess,
+    SQLiteLocalSyncStore,
+    SyncConfig,
+    _build_bill_payload,
+)
 from src.receipt import build_receipt_text
 import src.database as database
 
@@ -35,18 +43,13 @@ class FakeLocalStore:
         return [c for c in self.cached if c.get("zone_name") == zone_name]
 
     @staticmethod
-    def _combined_status(supabase_status, main_pg_status):
-        states = {str(supabase_status or "").lower(), str(main_pg_status or "").lower()}
-        if states & {"pending", "failed"}:
-            return "failed" if "failed" in states else "pending"
-        if "conflict" in states:
-            return "conflict"
-        return "synced"
+    def _combined_status(backend_status):
+        return str(backend_status or "pending").lower()
 
     def _refresh_status(self, row):
-        row["status"] = self._combined_status(row.get("supabase_status"), row.get("main_pg_status"))
+        row["status"] = self._combined_status(row.get("backend_status"))
 
-    def enqueue_operation(self, operation, payload, *, supabase_status="pending", main_pg_status="pending"):
+    def enqueue_operation(self, operation, payload, *, backend_status="pending"):
         row = {
             "id": self._id,
             "operation": operation,
@@ -55,9 +58,8 @@ class FakeLocalStore:
             "consumer_id": payload["consumer_id"],
             "reading_date": payload["reading_date"],
             "payload": dict(payload),
-            "status": self._combined_status(supabase_status, main_pg_status),
-            "supabase_status": supabase_status,
-            "main_pg_status": main_pg_status,
+            "status": self._combined_status(backend_status),
+            "backend_status": backend_status,
             "retries": 0,
         }
         self._id += 1
@@ -65,14 +67,7 @@ class FakeLocalStore:
         return row
 
     def list_pending(self, target=None):
-        if target == "supabase":
-            return [q for q in self.queue if q["supabase_status"] in ("pending", "failed")]
-        if target == "main_pg":
-            return [q for q in self.queue if q["main_pg_status"] in ("pending", "failed")]
-        return [
-            q for q in self.queue
-            if q["supabase_status"] in ("pending", "failed") or q["main_pg_status"] in ("pending", "failed")
-        ]
+        return [q for q in self.queue if q["backend_status"] in ("pending", "failed")]
 
     def mark_target_synced(self, queue_id, target):
         for q in self.queue:
@@ -91,7 +86,7 @@ class FakeLocalStore:
     def mark_conflict(self, queue_id, reason, server_payload=None, *, target=None):
         for q in self.queue:
             if q["id"] == queue_id:
-                q[f"{target or 'supabase'}_status"] = "conflict"
+                q[f"{target or 'backend'}_status"] = "conflict"
                 q["conflict_reason"] = reason
                 q["server_payload"] = server_payload
                 self._refresh_status(q)
@@ -137,6 +132,10 @@ class FakeRemoteStore:
         key = self._key(payload["consumer_id"], payload["reading_date"])
         self.remote_rows[key] = dict(payload)
         return dict(payload)
+
+    def save_reading_bundle(self, payload):
+        reading = self.upsert_meter_reading(payload)
+        return {"meterreading": reading, "bill": {"sync_id": payload.get("reading_id")}}
 
     def get_consumer_context(self, consumer_id):
         return dict(self.context_by_consumer.get(consumer_id, {}))
@@ -204,184 +203,142 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["conflicts"], 1)
         self.assertEqual(self.local.queue[0]["status"], "conflict")
 
-    def test_manual_sync_sends_pending_rows_to_main_pg(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            pass
-
-        main_pg = FakeMainPgStore()
-        main_pg.online = True
-        self.remote.online = True
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        self.dal.saveMeterReading({"consumer_id": 5, "present_reading": 99, "reading_date": "2026-05-08"})
-
-        result = self.dal.syncPendingReadings(include_main_pg=True)
-
-        self.assertEqual(result["synced"], 1)
-        self.assertEqual(result["failed"], 0)
-        self.assertEqual(len(self.local.list_pending()), 0)
-        self.assertEqual(len(main_pg.remote_rows), 1)
-        self.assertEqual(len(self.remote.remote_rows), 1)
-
-    def test_supabase_authenticate_meter_reader_falls_back_when_phone_number_column_missing(self):
-        class FakeSupabaseClient(SupabaseRestClient):
+    def test_backend_api_login_and_bundle_use_authenticated_reader(self):
+        class FakeBackendApiClient(BackendApiClient):
             def __init__(self):
-                super().__init__(
-                    SyncConfig(
-                        supabase_url="https://example.test",
-                        supabase_anon_key="anon",
-                        supabase_service_role_key="service",
-                        main_pg_host="",
-                        main_pg_port=5432,
-                        main_pg_db="",
-                        main_pg_user="",
-                        main_pg_password="",
-                    )
-                )
-                self.select_attempts = []
+                super().__init__(SyncConfig(backend_api_base_url="https://device.example.test"))
+                self.calls = []
 
-            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
-                if table_or_path == "accounts":
-                    self.select_attempts.append(query.get("select"))
-                    if query.get("select", "").endswith("contact_number"):
-                        return 200, [
-                            {
-                                "account_id": 12,
-                                "username": "juan.delacruz",
-                                "password": "secret123",
-                                "role_id": 3,
-                                "account_status": "Active",
-                                "full_name": "Juan Dela Cruz",
-                                "contact_number": "09123456789",
-                            }
-                        ]
-                    return 400, {"code": "42703", "message": "column accounts.phone_number does not exist"}
-                return 200, []
+            def _req(self, method, path, *, query=None, payload=None):
+                self.calls.append((method, path, query, payload))
+                if path == "/api/login":
+                    return 200, {
+                        "success": True,
+                        "user": {"id": 12, "username": "reader", "fullName": "Meter Reader", "role_id": 3},
+                    }
+                if path.endswith("/context"):
+                    return 200, {
+                        "consumer_id": 8,
+                        "minimum_cubic": 10,
+                        "minimum_rate": 100,
+                        "excess_rate_per_cubic": 15,
+                        "due_days": 15,
+                        "late_fee": 10,
+                    }
+                if path == "/api/handheld/reading-bundles":
+                    return 200, {"meterreading": {"reading_id": 44}, "bill": {"bill_id": 55}}
+                return 404, {"message": "not found"}
 
-        client = FakeSupabaseClient()
-        user = client.authenticate_meter_reader("juan.delacruz", "secret123")
+        client = FakeBackendApiClient()
+        user = client.authenticate_meter_reader("reader", "secret")
+        result = client.save_reading_bundle(
+            {
+                "reading_id": "stable-sync-id",
+                "consumer_id": 8,
+                "previous_reading": 100,
+                "present_reading": 112,
+                "consumption": 12,
+                "reading_date": "2026-08-02",
+            }
+        )
 
         self.assertEqual(user["account_id"], 12)
-        self.assertEqual(user["contact_number"], "09123456789")
-        self.assertEqual(client.select_attempts[0], "account_id,username,password,role_id,account_status,full_name,contact_number")
+        self.assertEqual(result["meterreading"]["reading_id"], 44)
+        bundle_call = next(call for call in client.calls if call[1] == "/api/handheld/reading-bundles")
+        self.assertEqual(bundle_call[3]["reading"]["meter_reader_id"], 12)
+        self.assertEqual(bundle_call[3]["bill"]["sync_id"], "stable-sync-id")
 
-    def test_supabase_pull_prefers_unpaid_bill_for_previous_balance(self):
-        class FakeSupabaseClient(SupabaseRestClient):
-            def __init__(self):
-                super().__init__(
-                    SyncConfig(
-                        supabase_url="https://example.test",
-                        supabase_anon_key="anon",
-                        supabase_service_role_key="service",
-                        main_pg_host="",
-                        main_pg_port=5432,
-                        main_pg_db="",
-                        main_pg_user="",
-                        main_pg_password="",
+    def test_queue_schema_migrates_legacy_pending_status_to_backend(self):
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        legacy_status = "supa" + "base_status"
+        legacy_synced = "supa" + "base_synced_at"
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    f"""
+                    CREATE TABLE sync_queue_meter_readings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        operation TEXT NOT NULL,
+                        operation_id TEXT NOT NULL UNIQUE,
+                        reading_id TEXT NOT NULL,
+                        consumer_id INTEGER NOT NULL,
+                        reading_date TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        {legacy_status} TEXT NOT NULL DEFAULT 'pending',
+                        retries INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        {legacy_synced} TEXT
                     )
+                    """
+                )
+                conn.execute(
+                    f"""INSERT INTO sync_queue_meter_readings
+                    (operation, operation_id, reading_id, consumer_id, reading_date, payload, {legacy_status})
+                    VALUES ('create', 'op-1', 'reading-1', 1, '2026-08-02', '{{}}', 'failed')"""
                 )
 
-            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
-                if table_or_path == "consumer":
-                    return 200, [
-                        {
-                            "consumer_id": 8,
-                            "account_number": "04-11-123",
-                            "meter_no": "09-23-2233",
-                            "first_name": "Charles",
-                            "last_name": "De Vera",
-                            "zone": {"zone_name": "Zone 1"},
-                            "classification_id": 1,
-                            "classification": {"classification_name": "Residential"},
-                        }
-                    ]
-                if table_or_path == "bills":
-                    return 200, [
-                        {
-                            "bill_id": 11,
-                            "consumer_id": 8,
-                            "billing_month": "July 2026",
-                            "date_covered_from": "2026-06-09 00:00:00",
-                            "date_covered_to": "2026-07-09 00:00:00",
-                            "amount_due": 0,
-                            "previous_balance": 0,
-                            "penalty": 0,
-                            "total_after_due_date": 0,
-                            "status": "Paid",
-                        },
-                        {
-                            "bill_id": 10,
-                            "consumer_id": 8,
-                            "billing_month": "July 2026",
-                            "date_covered_from": "2026-06-09 00:00:00",
-                            "date_covered_to": "2026-07-09 00:00:00",
-                            "amount_due": 100,
-                            "previous_balance": 25,
-                            "penalty": 10,
-                            "total_after_due_date": 110,
-                            "status": "Unpaid",
-                        },
-                    ]
-                return 200, []
+            store = SQLiteLocalSyncStore(SyncConfig(backend_api_base_url="https://example.test"))
+            store._db_path = db_path
+            store.ensure_schema()
 
-        rows = FakeSupabaseClient().load_assigned_consumers()
+            with sqlite3.connect(db_path) as conn:
+                migrated_status = conn.execute(
+                    "SELECT backend_status FROM sync_queue_meter_readings WHERE operation_id = 'op-1'"
+                ).fetchone()[0]
+            self.assertEqual(migrated_status, "failed")
+        finally:
+            if "store" in locals():
+                del store
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
 
-        self.assertEqual(rows[0]["bill_status"], "Unpaid")
-        self.assertEqual(rows[0]["amount_due"], 100)
-        self.assertEqual(rows[0]["previous_balance"], 25)
-        self.assertEqual(rows[0]["total_after_due_date"], 110)
-        self.assertEqual(rows[0]["billing_month"], "July 2026")
-        self.assertEqual(rows[0]["date_covered_from"], "2026-06-09 00:00:00")
-        self.assertEqual(rows[0]["date_covered_to"], "2026-07-09 00:00:00")
-    def test_supabase_pull_uses_latest_meterreading_as_previous_reading(self):
-        class FakeSupabaseClient(SupabaseRestClient):
-            def __init__(self):
-                super().__init__(
-                    SyncConfig(
-                        supabase_url="https://example.test",
-                        supabase_anon_key="anon",
-                        supabase_service_role_key="service",
-                        main_pg_host="",
-                        main_pg_port=5432,
-                        main_pg_db="",
-                        main_pg_user="",
-                        main_pg_password="",
-                    )
-                )
+    def test_cached_meter_reader_credentials_support_hashed_offline_login(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.cache_meter_reader_credentials(
+                {
+                    "id": 12,
+                    "account_id": 12,
+                    "reader_id": "12",
+                    "username": "field.reader",
+                    "name": "Field Reader",
+                    "full_name": "Field Reader",
+                    "role_id": 3,
+                    "account_status": "Active",
+                },
+                "offline-secret",
+            )
 
-            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
-                if table_or_path == "consumer":
-                    return 200, [
-                        {
-                            "consumer_id": 8,
-                            "account_number": "04-11-123",
-                            "meter_no": "09-23-2233",
-                            "first_name": "Charles",
-                            "middle_name": "Ivan",
-                            "last_name": "De Vera",
-                            "zone": {"zone_name": "Zone 1"},
-                            "classification_id": 1,
-                            "classification": {"classification_name": "Residential"},
-                            "previous_reading": 0,
-                        }
-                    ]
-                if table_or_path == "meterreadings":
-                    return 200, [
-                        {
-                            "consumer_id": 8,
-                            "reading_id": 99,
-                            "reading_date": "2026-07-09",
-                            "updated_at": "2026-07-09T08:00:00",
-                            "current_reading": 77,
-                        }
-                    ]
-                return 200, []
+            with sqlite3.connect(db_path) as conn:
+                stored_password = conn.execute(
+                    "SELECT password FROM users WHERE username = 'field.reader'"
+                ).fetchone()[0]
 
-        rows = FakeSupabaseClient().load_assigned_consumers()
+            self.assertTrue(stored_password.startswith("scrypt$"))
+            self.assertNotIn("offline-secret", stored_password)
+            self.assertEqual(database.authenticate_user("field.reader", "offline-secret")["account_id"], 12)
+            self.assertIsNone(database.authenticate_user("field.reader", "wrong-password"))
+        finally:
+            database._db_path = original_db_path
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
 
-        self.assertEqual(rows[0]["previous_reading"], 77)
-
-    def test_replace_consumers_from_sync_marks_pulled_supabase_reading_as_read(self):
+    def test_replace_consumers_from_sync_marks_pulled_backend_reading_as_read(self):
         original_db_path = database._db_path
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
         db_path = handle.name
@@ -628,269 +585,6 @@ class HandheldSyncTests(unittest.TestCase):
                 os.remove(db_path)
             except OSError:
                 pass
-
-    def test_load_assigned_consumers_overlays_rates_from_main_pg(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            def load_waterrates_by_classification(self):
-                return {
-                    1: {
-                        "classification_id": 1,
-                        "rate_id": 7,
-                        "minimum_cubic": 10,
-                        "minimum_rate": 150.0,
-                        "excess_rate_per_cubic": 15.0,
-                    }
-                }
-
-        main_pg = FakeMainPgStore()
-        self.remote.online = True
-        self.remote.assigned_consumers = [
-            {
-                "id": 8,
-                "meter_no": "09-23-2233",
-                "acct_no": "04-11-123",
-                "name": "Charles Ivan Ornales De Vera",
-                "classification_id": 1,
-                "classification_name": "Residential",
-                "minimum_cubic": 0,
-                "minimum_rate": 50.0,
-                "excess_rate_per_cubic": 10.0,
-            }
-        ]
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        rows = self.dal.loadAssignedConsumers()
-
-        self.assertEqual(rows[0]["minimum_cubic"], 10)
-        self.assertEqual(rows[0]["minimum_rate"], 150.0)
-        self.assertEqual(rows[0]["excess_rate_per_cubic"], 15.0)
-
-    def test_load_assigned_consumers_merges_supabase_when_main_pg_is_partial(self):
-        main_pg = FakeRemoteStore()
-        main_pg.online = True
-        main_pg.assigned_schedules = [
-            {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
-            {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
-        ]
-        main_pg.assigned_consumers = [
-            {
-                "id": 101,
-                "meter_no": "MTR-Z1-101",
-                "acct_no": "A-101",
-                "name": "Zone One",
-                "zone_name": "Zone 1",
-            }
-        ]
-        self.remote.online = True
-        self.remote.assigned_schedules = list(main_pg.assigned_schedules)
-        self.remote.assigned_consumers = [
-            {
-                "id": 101,
-                "meter_no": "MTR-Z1-101",
-                "acct_no": "A-101",
-                "name": "Zone One",
-                "zone_name": "Zone 1",
-            },
-            {
-                "id": 301,
-                "meter_no": "MTR-Z3-301",
-                "acct_no": "A-301",
-                "name": "Zone Three",
-                "zone_name": "Zone 3",
-            },
-        ]
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        rows = self.dal.loadAssignedConsumers(12, None, "2026-07-01", "2026-07-31")
-
-        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
-        self.assertEqual([row["id"] for row in rows], [101, 301])
-
-    def test_load_assigned_consumers_merges_cache_when_supabase_is_partial(self):
-        self.local.cached = [
-            {
-                "id": 301,
-                "meter_no": "MTR-Z3-301",
-                "acct_no": "A-301",
-                "name": "Cached Zone Three",
-                "zone_name": "Zone 3",
-            }
-        ]
-        self.remote.online = True
-        self.remote.assigned_schedules = [
-            {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
-            {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
-        ]
-        self.remote.assigned_consumers = [
-            {
-                "id": 101,
-                "meter_no": "MTR-Z1-101",
-                "acct_no": "A-101",
-                "name": "Zone One",
-                "zone_name": "Zone 1",
-            }
-        ]
-
-        rows = self.dal.loadAssignedConsumers(12, None, "2026-07-01", "2026-07-31")
-
-        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
-        self.assertEqual([row["id"] for row in rows], [101, 301])
-
-    def test_supabase_assigned_consumer_pull_fetches_each_scheduled_zone_by_id(self):
-        class FakeSupabaseClient(SupabaseRestClient):
-            def __init__(self):
-                super().__init__(
-                    SyncConfig(
-                        supabase_url="https://example.invalid",
-                        supabase_anon_key="anon",
-                        supabase_service_role_key="service",
-                        main_pg_host="",
-                        main_pg_port=5432,
-                        main_pg_db="",
-                        main_pg_user="",
-                        main_pg_password="",
-                    )
-                )
-                self.consumer_zone_queries = []
-
-            def load_reading_schedules(self, meter_reader_id, date_from, date_to, status="Scheduled"):
-                if status != "Scheduled":
-                    return []
-                return [
-                    {"Schedule_ID": 1, "Schedule_Date": "2026-07-12", "Zone_ID": 1, "Zone_Name": "Zone 1", "Meter_Reader_ID": 12},
-                    {"Schedule_ID": 3, "Schedule_Date": "2026-07-12", "Zone_ID": 3, "Zone_Name": "Zone 3", "Meter_Reader_ID": 12},
-                ]
-
-            def _req(self, method, table_or_path, *, query=None, payload=None, use_service_key=False, extra_headers=None):
-                if table_or_path == "consumer":
-                    self.consumer_zone_queries.append(query.get("zone_id"))
-                    if query.get("zone_id") == "eq.1":
-                        return 200, [
-                            {
-                                "consumer_id": 101,
-                                "account_number": "A-101",
-                                "meter_no": "MTR-Z1-101",
-                                "first_name": "Zone",
-                                "last_name": "One",
-                                "zone_id": 1,
-                                "zone": {"zone_name": "Zone 1"},
-                            }
-                        ]
-                    if query.get("zone_id") == "eq.3":
-                        return 200, [
-                            {
-                                "consumer_id": 301,
-                                "account_number": "A-301",
-                                "meter_no": "MTR-Z3-301",
-                                "first_name": "Zone",
-                                "last_name": "Three",
-                                "zone_id": 3,
-                                "zone": {"zone_name": "Zone 3"},
-                            }
-                        ]
-                    return 200, []
-                return 200, []
-
-        client = FakeSupabaseClient()
-        rows = client.load_assigned_consumers(12, None, "2026-07-01", "2026-07-31")
-
-        self.assertEqual(client.consumer_zone_queries, ["eq.1", "eq.3"])
-        self.assertEqual([row["zone_name"] for row in rows], ["Zone 1", "Zone 3"])
-        self.assertEqual([row["id"] for row in rows], [101, 301])
-
-    def test_save_reading_overlays_rates_from_main_pg(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            pass
-
-        main_pg = FakeMainPgStore()
-        main_pg.context_by_consumer = {
-            8: {
-                "consumer_id": 8,
-                "minimum_cubic": 10,
-                "minimum_rate": 150.0,
-                "excess_rate_per_cubic": 15.0,
-            }
-        }
-        self.remote.online = True
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        self.dal.saveMeterReading({"consumer_id": 8, "present_reading": 3, "reading_date": "2026-05-08"})
-
-        saved = next(iter(self.remote.remote_rows.values()))
-        self.assertEqual(saved["minimum_cubic"], 10)
-        self.assertEqual(saved["minimum_rate"], 150.0)
-        self.assertEqual(saved["excess_rate_per_cubic"], 15.0)
-
-    def test_save_reading_skips_main_pg_until_manual_sync(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            def save_reading_bundle(self, payload):
-                return {"meterreading": self.upsert_meter_reading(payload)}
-
-        main_pg = FakeMainPgStore()
-        main_pg.online = True
-        self.remote.online = True
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        result = self.dal.saveMeterReading({"consumer_id": 9, "present_reading": 12, "reading_date": "2026-05-08"})
-
-        self.assertEqual(result["status"], "synced")
-        self.assertEqual(list(result["remote"].keys()), ["Supabase"])
-        self.assertEqual(len(main_pg.remote_rows), 0)
-        self.assertEqual(len(self.remote.remote_rows), 1)
-        self.assertEqual(len(self.local.list_pending("main_pg")), 1)
-
-    def test_offline_supabase_does_not_auto_sync_to_main_pg(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            def save_reading_bundle(self, payload):
-                return {"meterreading": self.upsert_meter_reading(payload)}
-
-        main_pg = FakeMainPgStore()
-        main_pg.online = True
-        self.remote.online = False
-        self.remote.fail_writes = True
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        result = self.dal.saveMeterReading({"consumer_id": 10, "present_reading": 15, "reading_date": "2026-05-08"})
-
-        self.assertEqual(result["status"], "queued")
-        self.assertEqual(len(main_pg.remote_rows), 0)
-        self.assertEqual(len(self.local.list_pending("supabase")), 1)
-
-    def test_background_sync_leaves_main_pg_pending_until_manual(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            def save_reading_bundle(self, payload):
-                return {"meterreading": self.upsert_meter_reading(payload)}
-
-        main_pg = FakeMainPgStore()
-        main_pg.online = True
-        self.remote.online = False
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        self.dal.saveMeterReading({"consumer_id": 11, "present_reading": 77, "reading_date": "2026-05-08"})
-        self.remote.online = True
-
-        result = self.dal.syncPendingReadings()
-
-        self.assertEqual(result["synced"], 1)
-        self.assertEqual(len(self.local.list_pending("supabase")), 0)
-        self.assertEqual(len(self.local.list_pending("main_pg")), 1)
-        self.assertEqual(len(main_pg.remote_rows), 0)
-
-    def test_supabase_pending_helper_ignores_manual_main_pg_pending(self):
-        class FakeMainPgStore(FakeRemoteStore):
-            pass
-
-        main_pg = FakeMainPgStore()
-        main_pg.online = False
-        self.remote.online = True
-        self.dal = HandheldSyncDataAccess(self.local, self.remote, main_pg_client=main_pg)
-
-        self.dal.saveMeterReading({"consumer_id": 12, "present_reading": 88, "reading_date": "2026-05-08"})
-
-        self.assertEqual(len(self.dal.listPendingSupabaseReadings()), 0)
-        self.assertEqual(len(self.dal.listPendingSyncReadings()), 1)
-        self.assertEqual(self.local.queue[0]["supabase_status"], "synced")
-        self.assertEqual(self.local.queue[0]["main_pg_status"], "pending")
 
     def test_bill_payload_defaults_after_due_penalty_to_ten_percent(self):
         payload = _build_bill_payload(

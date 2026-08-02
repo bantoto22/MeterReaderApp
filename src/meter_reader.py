@@ -896,7 +896,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         self._sync_pending_count = 0
         self._auto_pull_enabled = tk.BooleanVar(value=True)
         self._auto_push_enabled = tk.BooleanVar(value=True)
-        self._auto_pull_interval_sec = tk.IntVar(value=max(15, int(os.getenv("SUPABASE_SYNC_INTERVAL_MS", "20000")) // 1000))
+        self._auto_pull_interval_sec = tk.IntVar(value=max(15, int(os.getenv("BACKEND_SYNC_INTERVAL_MS", "20000")) // 1000))
         self._auto_pull_after_id = None
         self._search_unread_only = tk.BooleanVar(value=True)
 
@@ -940,7 +940,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
 
     def _hydrate_local_consumers_from_sync(self):
         """
-        Pull assigned consumers from sync layer (online Supabase or local sync cache)
+        Pull assigned consumers from sync layer (online Backend API or local sync cache)
         and mirror them to local SQLite so UI always reads from fresh local data.
         """
         if not self._sync_dal:
@@ -2728,7 +2728,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _do_sync(self):
         if self._sync_dal:
             try:
-                result = self._sync_dal.syncPendingReadings(include_main_pg=True)
+                result = self._sync_dal.syncPendingReadings()
                 self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
                 self._sync_sync_result = result
             except Exception as exc:
@@ -2775,7 +2775,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         pending = 0
         if self._sync_dal:
             try:
-                pending = len(self._sync_dal.listPendingSupabaseReadings())
+                pending = len(self._sync_dal.listPendingBackendReadings())
             except Exception:
                 pending = int(getattr(self, "_sync_pending_count", 0) or 0)
         warning = (
@@ -2784,7 +2784,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "Only remove external power after the screen and Pi have fully shut down."
         )
         if pending > 0:
-            warning += f"\n\nWarning: {pending} reading(s) are still pending Supabase sync."
+            warning += f"\n\nWarning: {pending} reading(s) are still pending Backend API sync."
 
         if not messagebox.askyesno("Power Off Device", warning):
             return
@@ -2806,7 +2806,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
     def _sync_then_power_off_task(self):
         try:
             if self._sync_dal:
-                result = self._sync_dal.syncPendingReadings(include_main_pg=False)
+                result = self._sync_dal.syncPendingReadings()
                 self._sync_state = "Online" if self._sync_dal.is_online() else "Offline"
                 self._sync_sync_result = result
 
@@ -2815,13 +2815,13 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                     self.after(0, lambda msg=detail: self._on_power_off_blocked(msg))
                     return
 
-                pending_after_sync = len(self._sync_dal.listPendingSupabaseReadings())
+                pending_after_sync = len(self._sync_dal.listPendingBackendReadings())
                 self._sync_pending_count = pending_after_sync
                 if pending_after_sync > 0:
                     self.after(
                         0,
                         lambda count=pending_after_sync: self._on_power_off_blocked(
-                            f"{count} reading(s) are still pending Supabase sync. Shutdown was cancelled."
+                            f"{count} reading(s) are still pending Backend API sync. Shutdown was cancelled."
                         ),
                     )
                     return
