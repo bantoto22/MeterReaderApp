@@ -227,6 +227,33 @@ def _billing_month_date(value, fallback: str = "") -> str:
     return _normalize_iso_date(fallback) or ""
 
 
+def _route_reading_date(
+    billing_date: str,
+    start_date: str = "",
+    due_date: str = "",
+    today: datetime.date | None = None,
+) -> datetime.date | None:
+    """Choose a persisted reading date inside the route's billing month/window."""
+    normalized_month = _normalize_iso_date(billing_date)
+    if not normalized_month:
+        return None
+    month_anchor = datetime.fromisoformat(normalized_month).date().replace(day=1)
+    reference = today or datetime.now().date()
+    if month_anchor.month == 12:
+        next_month = month_anchor.replace(year=month_anchor.year + 1, month=1)
+    else:
+        next_month = month_anchor.replace(month=month_anchor.month + 1)
+    last_day = (next_month - timedelta(days=1)).day
+    reading_date = month_anchor.replace(day=min(reference.day, last_day))
+    normalized_start = _normalize_iso_date(start_date)
+    normalized_due = _normalize_iso_date(due_date)
+    if normalized_start:
+        reading_date = max(reading_date, datetime.fromisoformat(normalized_start).date())
+    if normalized_due:
+        reading_date = min(reading_date, datetime.fromisoformat(normalized_due).date())
+    return reading_date
+
+
 def _normalize_shutdown_error(detail: str) -> str:
     lowered = (detail or "").lower()
     if "a password is required" in lowered or "password" in lowered or "interactive authentication required" in lowered:
@@ -1480,6 +1507,14 @@ class AppBridge(QObject):
         self.dueDateChanged.emit()
 
     def _selected_reading_date(self) -> datetime.date:
+        route = self._selected_route()
+        reading_date = _route_reading_date(
+            self._selected_route_billing_date,
+            str(route.get("startDate") or ""),
+            str(route.get("dueDate") or ""),
+        )
+        if reading_date:
+            return reading_date
         return _add_months(datetime.now(), self._selected_billing_month_offset).date()
 
     def _default_due_date_for_consumer(self, consumer: dict | None = None) -> str:

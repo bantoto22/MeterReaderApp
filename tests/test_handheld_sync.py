@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from src.handheld_sync import (
     BackendApiClient,
@@ -691,6 +691,18 @@ class HandheldSyncTests(unittest.TestCase):
                 os.remove(db_path)
             except OSError:
                 pass
+
+    def test_route_reading_date_stays_in_selected_billing_window(self):
+        from src.qt_hybrid_app import _route_reading_date
+
+        selected = _route_reading_date(
+            "2026-07-01",
+            "2026-07-15",
+            "2026-07-20",
+            today=date(2026, 8, 6),
+        )
+
+        self.assertEqual(selected, date(2026, 7, 15))
 
     def test_local_schedule_queries_do_not_expose_cached_routes_without_assignment(self):
         original_db_path = database._db_path
