@@ -13,6 +13,7 @@ from src.handheld_sync import (
     SQLiteLocalSyncStore,
     SyncConfig,
     _build_bill_payload,
+    format_sync_error,
 )
 from src.receipt import build_receipt_text
 import src.database as database
@@ -154,6 +155,21 @@ class HandheldSyncTests(unittest.TestCase):
         result = self.dal.saveMeterReading({"consumer_id": 1, "present_reading": 100, "reading_date": "2026-05-08"})
         self.assertEqual(result["status"], "queued")
         self.assertEqual(len(self.local.list_pending()), 1)
+
+    def test_sync_error_explains_database_lock(self):
+        diagnostic = format_sync_error("Updating the device cache", sqlite3.OperationalError("database is locked"))
+        self.assertIn("Stage: Updating the device cache", diagnostic)
+        self.assertIn("local SQLite database is busy", diagnostic)
+        self.assertIn("Recommended action:", diagnostic)
+
+    def test_backend_error_includes_http_status_and_route(self):
+        class MissingRouteClient(BackendApiClient):
+            def _req(self, method, path, *, query=None, payload=None):
+                return 404, {"error": "Cannot GET /api/handheld/consumers"}
+
+        client = MissingRouteClient(SyncConfig(backend_api_base_url="https://device.example.test"))
+        with self.assertRaisesRegex(RuntimeError, r"HTTP 404 /api/handheld/consumers"):
+            client.load_assigned_consumers()
 
     def test_manual_queue_does_not_upload_until_sync(self):
         self.remote.online = True

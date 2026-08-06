@@ -100,7 +100,7 @@ Rectangle {
 
     Dialog {
         id: logsDialog
-        title: "Recent Sync Activity"
+        title: "Sync Diagnostics"
         anchors.centerIn: parent
         width: Math.min(parent.width - 32, 560)
         height: Math.min(parent.height - 60, 520)
@@ -299,7 +299,7 @@ Rectangle {
                             onClicked: { if (bridgeObj) bridgeObj.syncNow() }
                         }
                         ActionButton {
-                            text: "View Logs"
+                            text: "Diagnostics"
                             buttonColor: "#111827"
                             hoverColor: "#1F2937"
                             Layout.fillWidth: true

@@ -86,6 +86,8 @@ def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: dict
 def init_db():
     """Create the tables if they don't exist and seed only local user accounts."""
     conn = get_connection()
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     cur = conn.cursor()
 
     cur.executescript("""

@@ -109,13 +109,16 @@ except ImportError:
     )
 
 try:
-    from .handheld_sync import HandheldSyncDataAccess, SyncConfig
+    from .handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
 except ImportError:
     try:
-        from handheld_sync import HandheldSyncDataAccess, SyncConfig
+        from handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
     except ImportError:
         HandheldSyncDataAccess = None
         SyncConfig = None
+
+        def format_sync_error(stage: str, exc, endpoint: str = "") -> str:
+            return f"Stage: {stage}\nProblem: {exc}"
 
 try:
     from .receipt import (
@@ -1066,9 +1069,9 @@ class AppBridge(QObject):
             self._sync_dal = None
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
-            self._sync_logs = str(exc)
+            self._sync_logs = format_sync_error("Initializing device sync", exc, self._backend_endpoint)
             self._backend_status = "Sync Failed"
-            self._backend_logs = str(exc)
+            self._backend_logs = self._sync_logs
             self.syncLogsChanged.emit()
             self.backendLogsChanged.emit()
             self._emit_sync_state()
@@ -1092,26 +1095,37 @@ class AppBridge(QObject):
             self._backup_state = _friendly_backup_state_text(str(snapshot.get("backup_state", "Not configured")))
             self._last_sync = str(snapshot.get("last_sync_time") or "Never")
             entries = self._sync_dal.get_recent_audit_entries(limit=25)
-            self._sync_logs = "\n\n".join(
+            diagnostic_header = (
+                f"Endpoint: {self._backend_endpoint}\n"
+                f"Backend status: {self._backend_status}\n"
+                f"Queued readings: {self._backend_pending_count}\n"
+                f"Automatic sync: {'Enabled' if self._auto_sync_enabled else 'Disabled'}"
+            )
+            activity = "\n\n".join(
                 f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
                 for row in entries
             ) or "No sync activity yet."
+            self._sync_logs = diagnostic_header + "\n\n" + activity
             backend_entries = [
                 row for row in entries
-                if "backend api" in str(row.get("message", "")).lower()
+                if any(
+                    marker in str(row.get("message", "")).lower()
+                    for marker in ("backend api", "endpoint:", "uploading reading")
+                )
             ]
-            self._backend_logs = "\n\n".join(
+            backend_activity = "\n\n".join(
                 f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
                 for row in backend_entries
             ) or "No Backend API activity yet."
+            self._backend_logs = diagnostic_header + "\n\n" + backend_activity
             self.syncLogsChanged.emit()
             self.backendLogsChanged.emit()
         except Exception as exc:
             self._sync_status = "Sync Failed"
             self._sync_status_color = "#EF4444"
-            self._sync_logs = str(exc)
+            self._sync_logs = format_sync_error("Refreshing sync diagnostics", exc, self._backend_endpoint)
             self._backend_status = "Sync Failed"
-            self._backend_logs = str(exc)
+            self._backend_logs = self._sync_logs
             self.syncLogsChanged.emit()
             self.backendLogsChanged.emit()
         self._emit_sync_state()
@@ -1361,11 +1375,14 @@ class AppBridge(QObject):
         if result.get("kind") == "sync" and not result.get("silent"):
             sync_result = result.get("result", {})
             pull_error = str(sync_result.get("pull_error") or "").strip()
+            errors = [str(item).strip() for item in sync_result.get("errors", []) if str(item).strip()]
             pull_line = f"\nPulled: {self._last_pull_count}\nMirrored: {self._last_pull_mirror}"
             error_line = f"\nPull warning: {pull_error}" if pull_error else ""
+            first_error_line = f"\n\nFirst problem:\n{errors[0]}" if errors else ""
+            has_problems = bool(pull_error or errors or sync_result.get("failed") or sync_result.get("conflicts"))
             self.alertRequested.emit(
-                "Sync Complete",
-                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{error_line}",
+                "Sync Finished with Problems" if has_problems else "Sync Complete",
+                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{error_line}{first_error_line}",
             )
 
     def _save_to_sync_layer(
@@ -1418,9 +1435,9 @@ class AppBridge(QObject):
                     else:
                         self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
-                self._sync_logs = f"Queue save failed: {exc}"
+                self._sync_logs = format_sync_error("Saving reading to the local retry queue", exc, self._backend_endpoint)
                 self._backend_status = "Sync Failed"
-                self._backend_logs = f"Local queue failed: {exc}"
+                self._backend_logs = self._sync_logs
                 self.syncLogsChanged.emit()
                 self.backendStatusChanged.emit()
                 self.backendLogsChanged.emit()
@@ -1962,14 +1979,18 @@ class AppBridge(QObject):
         self._set_operation_busy(True, "Syncing...")
 
         def _task() -> None:
+            stage = "Starting sync"
             try:
                 with self._sync_dal.operation_lock:
+                    stage = "Uploading queued readings"
                     result = self._sync_dal.syncPendingReadings()
                     pulled = 0
                     mirrored = 0
                     try:
+                        stage = "Downloading assigned schedules"
                         date_from, date_to = _month_window(self._selected_reading_date())
                         self._mirror_assigned_schedules(date_from, date_to)
+                        stage = "Downloading assigned consumers"
                         consumers = self._sync_dal.loadAssignedConsumers(
                             self._meter_reader_account_id or None,
                             None,
@@ -1977,12 +1998,18 @@ class AppBridge(QObject):
                             date_to,
                         )
                         pulled = len(consumers)
+                        stage = "Updating the device consumer cache"
                         mirrored = replace_consumers_from_sync(consumers)
                     except Exception as pull_exc:
-                        result = {**result, "pull_error": str(pull_exc)}
+                        result = {
+                            **result,
+                            "pull_error": format_sync_error(stage, pull_exc, self._backend_endpoint),
+                        }
                 self.syncTaskFinished.emit({"kind": "sync", "result": result, "pulled": pulled, "mirrored": mirrored})
             except Exception as exc:
-                self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})
+                self.syncTaskFinished.emit(
+                    {"kind": "error", "error": format_sync_error(stage, exc, self._backend_endpoint)}
+                )
 
         threading.Thread(target=_task, daemon=True).start()
 

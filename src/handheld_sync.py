@@ -53,6 +53,38 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> str:
+    """Return an operator-friendly diagnostic without discarding the raw error."""
+    detail = str(exc or "Unknown error").strip() or "Unknown error"
+    lowered = detail.lower()
+    problem = "Unexpected sync error"
+    action = "Open Sync Logs and report the full details below."
+    if "database is locked" in lowered or "database table is locked" in lowered:
+        problem = "The device's local SQLite database is busy"
+        action = "Close duplicate device-app instances, restart the app, then run Sync Now once."
+    elif any(method in lowered for method in ("cannot get /api/handheld", "cannot post /api/handheld")) or ("404" in lowered and "/api/handheld" in lowered):
+        problem = "The running backend does not have the handheld API route"
+        action = "Restart the Node backend so the latest /api/handheld routes are loaded."
+    elif "timed out" in lowered or "timeout" in lowered:
+        problem = "The Backend API request timed out"
+        action = "Check internet/Tailscale Funnel connectivity, then retry. The reading remains queued."
+    elif any(token in lowered for token in ("urlopen error", "connection refused", "name or service", "unreachable")):
+        problem = "The Backend API is unreachable"
+        action = "Check device internet, Tailscale Funnel, and that the backend is running on port 3001."
+    elif "401" in lowered or "403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        problem = "The backend rejected device authentication"
+        action = "Log in online again and verify that the meter-reader account is active."
+    elif "500" in lowered or "postgres" in lowered:
+        problem = "The backend could not complete the PostgreSQL operation"
+        action = "Check backend and PostgreSQL logs; the device reading remains queued for retry."
+
+    lines = [f"Stage: {stage}", f"Problem: {problem}"]
+    if endpoint:
+        lines.append(f"Endpoint: {endpoint}")
+    lines.extend((f"Details: {detail}", f"Recommended action: {action}"))
+    return "\n".join(lines)
+
+
 def _safe_float(value, default: float = 0.0) -> float:
     if value in (None, ""):
         return default
@@ -872,6 +904,13 @@ class BackendApiClient:
             return str(data.get("message") or data.get("error") or fallback)
         return fallback
 
+    def _request_failure(self, status: int, path: str, data: object, fallback: str) -> RuntimeError:
+        status_text = "Connection error" if status == 0 else f"HTTP {status}"
+        return RuntimeError(f"{status_text} {path}: {self._message(data, fallback)}")
+
+    def _is_missing_record(self, status: int, data: object) -> bool:
+        return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
+
     def is_online(self) -> bool:
         status, _ = self._req("GET", "/health")
         return 200 <= status < 300
@@ -915,7 +954,7 @@ class BackendApiClient:
             },
         )
         if http_status >= 400 or http_status == 0:
-            raise RuntimeError(self._message(data, "Backend reading schedule lookup failed."))
+            raise self._request_failure(http_status, "/api/reading-schedules", data, "Backend reading schedule lookup failed.")
         return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def load_assigned_consumers(
@@ -936,15 +975,16 @@ class BackendApiClient:
             },
         )
         if status >= 400 or status == 0:
-            raise RuntimeError(self._message(data, "Backend assigned-consumer lookup failed."))
+            raise self._request_failure(status, "/api/handheld/consumers", data, "Backend assigned-consumer lookup failed.")
         return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def get_consumer_context(self, consumer_id: int) -> dict:
         status, data = self._req("GET", f"/api/handheld/consumers/{int(consumer_id)}/context")
-        if status == 404:
+        if self._is_missing_record(status, data):
             return {}
         if status >= 400 or status == 0 or not isinstance(data, dict):
-            raise RuntimeError(self._message(data, "Backend consumer-context lookup failed."))
+            path = f"/api/handheld/consumers/{int(consumer_id)}/context"
+            raise self._request_failure(status, path, data, "Backend consumer-context lookup failed.")
         return data
 
     def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
@@ -953,10 +993,10 @@ class BackendApiClient:
             "/api/handheld/readings/existing",
             query={"consumer_id": int(consumer_id), "reading_date": reading_date},
         )
-        if status == 404:
+        if self._is_missing_record(status, data):
             return None
         if status >= 400 or status == 0:
-            raise RuntimeError(self._message(data, "Backend reading lookup failed."))
+            raise self._request_failure(status, "/api/handheld/readings/existing", data, "Backend reading lookup failed.")
         return data if isinstance(data, dict) and data else None
 
     def save_reading_bundle(self, payload: dict) -> dict:
@@ -972,7 +1012,7 @@ class BackendApiClient:
             payload={"reading": merged, "bill": bill},
         )
         if status >= 400 or status == 0 or not isinstance(data, dict):
-            raise RuntimeError(self._message(data, "Backend reading sync failed."))
+            raise self._request_failure(status, "/api/handheld/reading-bundles", data, "Backend reading sync failed.")
         return data
 
     def upsert_meter_reading(self, payload: dict) -> dict:
@@ -988,9 +1028,27 @@ class HandheldSyncDataAccess:
         self.local = local_store
         self.remote = remote_store
         self.operation_lock = threading.RLock()
+        self._runtime_audit: list[dict] = []
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
+
+    def _endpoint(self) -> str:
+        return str(getattr(self.remote, "_url", "") or "")
+
+    def _audit(self, queue_id: int | None, status: str, message: str, payload: dict | None = None) -> None:
+        try:
+            self.local.log_audit(queue_id, status, message, payload)
+        except Exception as audit_exc:
+            fallback = {
+                "queue_id": queue_id,
+                "status": status,
+                "message": message + "\n\n" + format_sync_error("Writing sync audit log", audit_exc),
+                "payload": payload or {},
+                "created_at": _utc_now_iso(),
+            }
+            self._runtime_audit.insert(0, fallback)
+            del self._runtime_audit[50:]
 
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "HandheldSyncDataAccess":
@@ -1142,10 +1200,18 @@ class HandheldSyncDataAccess:
         return self.listPendingSyncReadings()
 
     def get_recent_audit_entries(self, limit: int = 20) -> list[dict]:
-        return self.local.get_recent_audit(limit=limit)
+        try:
+            stored = self.local.get_recent_audit(limit=limit)
+        except Exception as exc:
+            stored = [{
+                "status": "failed",
+                "message": format_sync_error("Reading sync logs from SQLite", exc),
+                "created_at": _utc_now_iso(),
+            }]
+        return (list(self._runtime_audit) + stored)[:limit]
 
     def get_last_successful_sync_time(self) -> str | None:
-        for row in self.local.get_recent_audit(limit=100):
+        for row in self.get_recent_audit_entries(limit=100):
             if str(row.get("status", "")).lower() == "success" and "synced" in str(row.get("message", "")).lower():
                 return str(row.get("created_at")) if row.get("created_at") else None
         return None
@@ -1178,14 +1244,25 @@ class HandheldSyncDataAccess:
 
     def _sync_pending_readings(self) -> dict:
         if not self.is_online():
-            self.local.log_audit(None, "failed", "Sync skipped, Backend API offline")
-            return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
+            diagnostic = format_sync_error(
+                "Checking Backend API connectivity",
+                "Backend API is unreachable or returned an unsuccessful health response.",
+                self._endpoint(),
+            )
+            self._audit(None, "failed", diagnostic)
+            return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic]}
 
         pending = self.listPendingSyncReadings()
-        self.local.log_audit(None, "pending", "Starting Backend API sync cycle", {"pending_count": len(pending)})
+        self._audit(
+            None,
+            "pending",
+            f"Stage: Preparing upload\nPending readings: {len(pending)}\nEndpoint: {self._endpoint()}",
+            {"pending_count": len(pending), "endpoint": self._endpoint()},
+        )
         synced = 0
         failed = 0
         conflicts = 0
+        errors: list[str] = []
         for row in pending:
             queue_id = row["id"]
             payload = dict(row["payload"])
@@ -1204,25 +1281,47 @@ class HandheldSyncDataAccess:
                 ):
                     reason = "Server has a newer reading for the same consumer and date."
                     self.local.mark_conflict(queue_id, reason, existing, target="backend")
-                    self.local.log_audit(queue_id, "conflict", f"Backend API: {reason}", {"local": payload, "server": existing})
+                    self._audit(queue_id, "conflict", f"Stage: Checking server version\nProblem: {reason}", {"local": payload, "server": existing})
                     conflicts += 1
                     continue
 
                 self.remote.save_reading_bundle(payload)
                 self.local.mark_target_synced(queue_id, "backend")
-                self.local.log_audit(queue_id, "success", "Backend API synced", {"reading_id": payload.get("reading_id")})
+                self._audit(
+                    queue_id,
+                    "success",
+                    f"Stage: Uploading reading\nResult: Backend API and PostgreSQL accepted the reading.\nConsumer ID: {payload.get('consumer_id')}\nReading ID: {payload.get('reading_id')}",
+                    {"reading_id": payload.get("reading_id")},
+                )
                 synced += 1
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc), target="backend")
-                self.local.log_audit(queue_id, "conflict", f"Queue row invalid for Backend API sync: {exc}", payload)
+                diagnostic = format_sync_error("Validating queued reading", exc, self._endpoint())
+                self._audit(queue_id, "conflict", diagnostic, payload)
+                errors.append(diagnostic)
                 conflicts += 1
             except Exception as exc:
-                self.local.mark_target_failed(queue_id, "backend", str(exc))
-                self.local.log_audit(queue_id, "failed", f"Backend API queue sync failed: {exc}", payload)
+                diagnostic = format_sync_error(
+                    f"Uploading reading for consumer {payload.get('consumer_id', 'unknown')}",
+                    exc,
+                    self._endpoint(),
+                )
+                try:
+                    self.local.mark_target_failed(queue_id, "backend", str(exc))
+                except Exception as queue_exc:
+                    diagnostic += "\n\n" + format_sync_error("Updating the local retry queue", queue_exc)
+                self._audit(queue_id, "failed", diagnostic, payload)
+                errors.append(diagnostic)
                 failed += 1
 
-        result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts}
-        self.local.log_audit(None, "success", "Finished Backend API sync cycle", result)
+        result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts, "errors": errors}
+        summary_status = "success" if failed == 0 and conflicts == 0 else "failed"
+        self._audit(
+            None,
+            summary_status,
+            f"Stage: Sync finished\nSynced: {synced}\nFailed: {failed}\nConflicts: {conflicts}\nPending after sync: {len(self.listPendingSyncReadings())}",
+            result,
+        )
         return result
 
     def start_sync_worker(self, interval_seconds: int = BACKGROUND_SYNC_INTERVAL_SECONDS) -> None:
@@ -1235,7 +1334,7 @@ class HandheldSyncDataAccess:
                 try:
                     self.syncPendingReadings()
                 except Exception as exc:
-                    self.local.log_audit(None, "failed", f"Background sync worker error: {exc}")
+                    self._audit(None, "failed", format_sync_error("Background sync worker", exc, self._endpoint()))
                 self._worker_stop.wait(max(60, interval_seconds))
 
         self._worker = threading.Thread(target=_run, daemon=True, name="handheld-sync-worker")
