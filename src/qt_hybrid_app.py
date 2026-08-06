@@ -1047,6 +1047,7 @@ class AppBridge(QObject):
             return
         try:
             cfg = SyncConfig.from_env(fail_fast=False)
+            self._backend_endpoint = cfg.backend_api_base_url or "Not configured"
             if not cfg.sync_enabled:
                 self._sync_status = "Offline"
                 self._sync_status_color = "#526176"
