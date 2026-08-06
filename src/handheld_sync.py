@@ -325,8 +325,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         self._db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "meter.db"))
 
     def _connect(self):
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 

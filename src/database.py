@@ -55,8 +55,9 @@ def _db_path():
 
 def get_connection():
     """Return a new connection to the database with foreign keys enabled."""
-    conn = sqlite3.connect(_db_path())
+    conn = sqlite3.connect(_db_path(), timeout=15.0)
     conn.row_factory = sqlite3.Row          # allows dict-like access on rows
+    conn.execute("PRAGMA busy_timeout = 15000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

@@ -1409,7 +1409,10 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                self._sync_dal.queueMeterReading(payload)
+                if self._auto_sync_enabled:
+                    self._sync_dal.saveMeterReading(payload)
+                else:
+                    self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
                 self._sync_logs = f"Queue save failed: {exc}"
                 self._backend_status = "Sync Failed"
@@ -2047,21 +2050,26 @@ class AppBridge(QObject):
                             update_consumer_due_date(job["consumer_id"], due_date)
                         reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
                         self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date)
-                    saved_receipt_id = save_receipt_print(
-                        job["consumer_id"],
-                        receipt_text,
-                        previous,
-                        present,
-                        consumption,
-                        exception,
-                        job.get("reader_name") or self._reader_name,
-                        reading_id,
-                        "print",
-                        consumer.get("acct_no"),
-                        consumer.get("name"),
-                        consumer.get("meter_no"),
-                        consumer.get("zone_name", self._selected_zone),
-                    )
+                    saved_receipt_id = None
+                    history_error = None
+                    try:
+                        saved_receipt_id = save_receipt_print(
+                            job["consumer_id"],
+                            receipt_text,
+                            previous,
+                            present,
+                            consumption,
+                            exception,
+                            job.get("reader_name") or self._reader_name,
+                            reading_id,
+                            "print",
+                            consumer.get("acct_no"),
+                            consumer.get("name"),
+                            consumer.get("meter_no"),
+                            consumer.get("zone_name", self._selected_zone),
+                        )
+                    except Exception as exc:
+                        history_error = str(exc)
                     print_error = None
                     if can_use_system_printer():
                         try:
@@ -2077,6 +2085,7 @@ class AppBridge(QObject):
                             "printed": print_error is None,
                             "print_error": print_error,
                             "saved_receipt_id": saved_receipt_id,
+                            "history_error": history_error,
                             "reading_id": reading_id,
                             "consumer_snapshot": consumer,
                             "previous": previous,
@@ -2091,26 +2100,32 @@ class AppBridge(QObject):
 
                 send_to_system_printer(receipt_text)
                 source_entry = dict(job["source_entry"])
-                saved_id = save_receipt_print(
-                    source_entry["consumer_id"],
-                    receipt_text,
-                    _to_float(source_entry["previous_reading"]),
-                    _to_float(source_entry["present_reading"]),
-                    _to_float(source_entry["consumption"]),
-                    source_entry.get("exception") or "None",
-                    self._reader_name,
-                    source_entry.get("reading_id"),
-                    "reprint",
-                    source_entry.get("acct_no"),
-                    source_entry.get("consumer_name"),
-                    source_entry.get("meter_no"),
-                    source_entry.get("zone_name"),
-                )
+                saved_id = None
+                history_error = None
+                try:
+                    saved_id = save_receipt_print(
+                        source_entry["consumer_id"],
+                        receipt_text,
+                        _to_float(source_entry["previous_reading"]),
+                        _to_float(source_entry["present_reading"]),
+                        _to_float(source_entry["consumption"]),
+                        source_entry.get("exception") or "None",
+                        self._reader_name,
+                        source_entry.get("reading_id"),
+                        "reprint",
+                        source_entry.get("acct_no"),
+                        source_entry.get("consumer_name"),
+                        source_entry.get("meter_no"),
+                        source_entry.get("zone_name"),
+                    )
+                except Exception as exc:
+                    history_error = str(exc)
                 self.printExecutionFinished.emit(
                     {
                         "success": True,
                         "job_type": "reprint",
                         "saved_receipt_id": saved_id,
+                        "history_error": history_error,
                         "source_entry": source_entry,
                         "receipt_text": receipt_text,
                     }
@@ -2135,7 +2150,11 @@ class AppBridge(QObject):
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
             present = _to_float(result["present"])
-            self._last_receipt_entry = get_latest_receipt_print(consumer["id"]) or {
+            try:
+                latest_receipt = get_latest_receipt_print(consumer["id"])
+            except Exception:
+                latest_receipt = None
+            self._last_receipt_entry = latest_receipt or {
                 "id": result["saved_receipt_id"],
                 "consumer_id": consumer["id"],
                 "reading_id": result["reading_id"],
@@ -2174,7 +2193,10 @@ class AppBridge(QObject):
             self._refresh_zone_consumers()
             self.refreshPrintHistory()
             if result.get("printed", True):
-                self.alertRequested.emit("Print Complete", "Receipt printed successfully.")
+                message = "Receipt printed successfully."
+                if result.get("history_error"):
+                    message += "\n\nThe print-history record could not be saved and will not appear in History."
+                self.alertRequested.emit("Print Complete", message)
             else:
                 self.alertRequested.emit(
                     "Reading Saved",
@@ -2184,11 +2206,15 @@ class AppBridge(QObject):
             return
 
         source_entry = dict(result["source_entry"])
-        self._last_receipt_entry = {**source_entry, "id": result["saved_receipt_id"], "print_action": "reprint", "receipt_text": result["receipt_text"]}
+        saved_receipt_id = result.get("saved_receipt_id") or source_entry.get("id")
+        self._last_receipt_entry = {**source_entry, "id": saved_receipt_id, "print_action": "reprint", "receipt_text": result["receipt_text"]}
         self._last_receipt = result["receipt_text"]
         self.canReprintChanged.emit()
         self.refreshPrintHistory()
-        self.alertRequested.emit("Reprint Complete", "Receipt reprinted successfully.")
+        message = "Receipt reprinted successfully."
+        if result.get("history_error"):
+            message += "\n\nThe reprint-history record could not be saved and will not appear in History."
+        self.alertRequested.emit("Reprint Complete", message)
 
     @Slot()
     def openPrintHistory(self) -> None:
