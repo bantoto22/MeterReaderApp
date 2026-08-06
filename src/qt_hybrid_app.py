@@ -681,14 +681,15 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                date_from, date_to = _month_window(self._selected_reading_date())
-                consumers = self._sync_dal.loadAssignedConsumers(
-                    self._meter_reader_account_id,
-                    zone_name,
-                    date_from,
-                    date_to,
-                )
-                mirrored = replace_consumers_from_sync(consumers)
+                with self._sync_dal.operation_lock:
+                    date_from, date_to = _month_window(self._selected_reading_date())
+                    consumers = self._sync_dal.loadAssignedConsumers(
+                        self._meter_reader_account_id,
+                        zone_name,
+                        date_from,
+                        date_to,
+                    )
+                    mirrored = replace_consumers_from_sync(consumers)
                 self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored, "zone": zone_name})
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
@@ -1165,15 +1166,16 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                date_from, date_to = _month_window(self._selected_reading_date())
-                schedule_count = self._mirror_assigned_schedules(date_from, date_to)
-                consumers = self._sync_dal.loadAssignedConsumers(
-                    self._meter_reader_account_id,
-                    None,
-                    date_from,
-                    date_to,
-                )
-                mirrored = replace_consumers_from_sync(consumers)
+                with self._sync_dal.operation_lock:
+                    date_from, date_to = _month_window(self._selected_reading_date())
+                    schedule_count = self._mirror_assigned_schedules(date_from, date_to)
+                    consumers = self._sync_dal.loadAssignedConsumers(
+                        self._meter_reader_account_id,
+                        None,
+                        date_from,
+                        date_to,
+                    )
+                    mirrored = replace_consumers_from_sync(consumers)
                 pulled_zones = sorted(
                     {
                         str(item.get("zone_name") or "").strip()
@@ -1410,10 +1412,11 @@ class AppBridge(QObject):
 
         def _task() -> None:
             try:
-                if self._auto_sync_enabled:
-                    self._sync_dal.saveMeterReading(payload)
-                else:
-                    self._sync_dal.queueMeterReading(payload)
+                with self._sync_dal.operation_lock:
+                    if self._auto_sync_enabled:
+                        self._sync_dal.saveMeterReading(payload)
+                    else:
+                        self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
                 self._sync_logs = f"Queue save failed: {exc}"
                 self._backend_status = "Sync Failed"
@@ -1953,26 +1956,30 @@ class AppBridge(QObject):
         if not self._sync_dal:
             self.alertRequested.emit("Sync Unavailable", self._sync_logs)
             return
+        if self._operation_busy:
+            self.alertRequested.emit("Sync In Progress", "Please wait for the current operation to finish.")
+            return
         self._set_operation_busy(True, "Syncing...")
 
         def _task() -> None:
             try:
-                result = self._sync_dal.syncPendingReadings()
-                pulled = 0
-                mirrored = 0
-                try:
-                    date_from, date_to = _month_window(self._selected_reading_date())
-                    self._mirror_assigned_schedules(date_from, date_to)
-                    consumers = self._sync_dal.loadAssignedConsumers(
-                        self._meter_reader_account_id or None,
-                        None,
-                        date_from,
-                        date_to,
-                    )
-                    pulled = len(consumers)
-                    mirrored = replace_consumers_from_sync(consumers)
-                except Exception as pull_exc:
-                    result = {**result, "pull_error": str(pull_exc)}
+                with self._sync_dal.operation_lock:
+                    result = self._sync_dal.syncPendingReadings()
+                    pulled = 0
+                    mirrored = 0
+                    try:
+                        date_from, date_to = _month_window(self._selected_reading_date())
+                        self._mirror_assigned_schedules(date_from, date_to)
+                        consumers = self._sync_dal.loadAssignedConsumers(
+                            self._meter_reader_account_id or None,
+                            None,
+                            date_from,
+                            date_to,
+                        )
+                        pulled = len(consumers)
+                        mirrored = replace_consumers_from_sync(consumers)
+                    except Exception as pull_exc:
+                        result = {**result, "pull_error": str(pull_exc)}
                 self.syncTaskFinished.emit({"kind": "sync", "result": result, "pulled": pulled, "mirrored": mirrored})
             except Exception as exc:
                 self.syncTaskFinished.emit({"kind": "error", "error": str(exc)})

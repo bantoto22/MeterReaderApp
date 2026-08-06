@@ -2,6 +2,8 @@ import os
 import gc
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -166,6 +168,41 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "synced")
         self.assertEqual(len(self.remote.remote_rows), 1)
         self.assertEqual(len(self.local.list_pending()), 0)
+
+    def test_concurrent_online_saves_are_serialized(self):
+        self.remote.online = True
+        active_writes = 0
+        max_active_writes = 0
+        counter_lock = threading.Lock()
+        original_save = self.remote.save_reading_bundle
+
+        def slow_save(payload):
+            nonlocal active_writes, max_active_writes
+            with counter_lock:
+                active_writes += 1
+                max_active_writes = max(max_active_writes, active_writes)
+            try:
+                time.sleep(0.05)
+                return original_save(payload)
+            finally:
+                with counter_lock:
+                    active_writes -= 1
+
+        self.remote.save_reading_bundle = slow_save
+        threads = [
+            threading.Thread(
+                target=self.dal.saveMeterReading,
+                args=({"consumer_id": consumer_id, "present_reading": 100, "reading_date": "2026-05-08"},),
+            )
+            for consumer_id in (1, 2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(max_active_writes, 1)
+        self.assertEqual(len(self.remote.remote_rows), 2)
 
     def test_reconnect_sync_flushes_queue(self):
         self.remote.online = False

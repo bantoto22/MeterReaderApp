@@ -987,6 +987,7 @@ class HandheldSyncDataAccess:
     def __init__(self, local_store: LocalSyncStore, remote_store):
         self.local = local_store
         self.remote = remote_store
+        self.operation_lock = threading.RLock()
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -1093,10 +1094,11 @@ class HandheldSyncDataAccess:
         return self.local.enqueue_operation(operation, reading, backend_status="pending")
 
     def queueMeterReading(self, payload: dict) -> dict:
-        reading = self._normalize_reading(payload)
-        queued = self._queue_for_sync("create", reading)
-        self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
-        return {"status": "queued", "queue": queued, "reading": reading}
+        with self.operation_lock:
+            reading = self._normalize_reading(payload)
+            queued = self._queue_for_sync("create", reading)
+            self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
+            return {"status": "queued", "queue": queued, "reading": reading}
 
     def _save_or_queue(self, operation: str, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
@@ -1126,10 +1128,12 @@ class HandheldSyncDataAccess:
             return {"status": "queued", "queue": queued, "reading": reading}
 
     def saveMeterReading(self, payload: dict) -> dict:
-        return self._save_or_queue("create", payload)
+        with self.operation_lock:
+            return self._save_or_queue("create", payload)
 
     def updateMeterReading(self, payload: dict) -> dict:
-        return self._save_or_queue("update", payload)
+        with self.operation_lock:
+            return self._save_or_queue("update", payload)
 
     def listPendingSyncReadings(self) -> list[dict]:
         return self.local.list_pending("backend")
@@ -1169,6 +1173,10 @@ class HandheldSyncDataAccess:
         }
 
     def syncPendingReadings(self, **_ignored) -> dict:
+        with self.operation_lock:
+            return self._sync_pending_readings()
+
+    def _sync_pending_readings(self) -> dict:
         if not self.is_online():
             self.local.log_audit(None, "failed", "Sync skipped, Backend API offline")
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0}
