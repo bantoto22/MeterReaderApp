@@ -86,7 +86,7 @@ The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
 ### Environment
 
 1. Copy `.env.example` to `.env`.
-2. Set `BACKEND_API_BASE_URL=https://aspire.tail3de291.ts.net`.
+2. Set `BACKEND_API_BASE_URL=https://aspire.tail3de291.ts.net/api`.
 3. Enable sync by setting `HANDHELD_SYNC_ENABLED=1`.
 
 If sync is enabled and required env vars are missing, the sync layer raises a clear startup/config error.

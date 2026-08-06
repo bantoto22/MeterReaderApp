@@ -228,6 +228,26 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["synced"], 1)
         self.assertEqual(len(self.local.list_pending()), 0)
 
+    def test_sync_worker_can_restart_after_stop(self):
+        self.remote.online = False
+
+        self.dal.start_sync_worker(interval_seconds=60)
+        first_worker = self.dal._worker
+        self.assertIsNotNone(first_worker)
+        self.assertTrue(first_worker.is_alive())
+
+        self.dal.stop_sync_worker()
+        self.assertIsNone(self.dal._worker)
+
+        self.dal.start_sync_worker(interval_seconds=60)
+        second_worker = self.dal._worker
+        self.assertIsNotNone(second_worker)
+        self.assertIsNot(first_worker, second_worker)
+        self.assertTrue(second_worker.is_alive())
+
+        self.dal.stop_sync_worker()
+        self.assertIsNone(self.dal._worker)
+
     def test_duplicate_prevention_by_reading_id(self):
         self.remote.online = True
         payload = {
@@ -307,6 +327,39 @@ class HandheldSyncTests(unittest.TestCase):
         bundle_call = next(call for call in client.calls if call[1] == "/api/handheld/reading-bundles")
         self.assertEqual(bundle_call[3]["reading"]["meter_reader_id"], 12)
         self.assertEqual(bundle_call[3]["bill"]["sync_id"], "stable-sync-id")
+
+    def test_backend_api_base_url_accepts_api_suffix_without_double_prefix(self):
+        class ApiSuffixedClient(BackendApiClient):
+            def __init__(self):
+                super().__init__(SyncConfig(backend_api_base_url="https://device.example.test/api"))
+                self.urls = []
+
+            def _req(self, method, path, *, query=None, payload=None, api_route=True):
+                base_url = self._api_url if api_route else self._root_url
+                normalized_path = path if path.startswith("/") else f"/{path}"
+                if api_route and normalized_path.startswith("/api/"):
+                    normalized_path = normalized_path[4:]
+                self.urls.append(f"{base_url}{normalized_path}")
+                if path == "/api/login":
+                    return 200, {
+                        "success": True,
+                        "user": {"id": 12, "username": "reader", "fullName": "Meter Reader", "role_id": 3},
+                    }
+                if path == "/api/handheld/consumers":
+                    return 200, []
+                if path == "/health":
+                    return 200, {}
+                return 404, {"message": "not found"}
+
+        client = ApiSuffixedClient()
+        client.authenticate_meter_reader("reader", "secret")
+        client.load_assigned_consumers(meter_reader_id=12)
+        client.is_online()
+
+        self.assertIn("https://device.example.test/api/login", client.urls)
+        self.assertIn("https://device.example.test/api/handheld/consumers", client.urls)
+        self.assertIn("https://device.example.test/health", client.urls)
+        self.assertNotIn("https://device.example.test/api/api/login", client.urls)
 
     def test_queue_schema_migrates_legacy_pending_status_to_backend(self):
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)

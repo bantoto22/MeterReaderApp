@@ -918,10 +918,26 @@ class AppBridge(QObject):
         normalized = bool(val)
         if self._auto_sync_enabled == normalized:
             return
+        previous = self._auto_sync_enabled
         self._auto_sync_enabled = normalized
-        set_app_setting("auto_sync_enabled", "1" if normalized else "0")
-        self.autoSyncEnabledChanged.emit()
-        self._apply_auto_sync_setting()
+        try:
+            if not normalized and self._sync_dal:
+                self._sync_dal.stop_sync_worker()
+            set_app_setting("auto_sync_enabled", "1" if normalized else "0")
+            self.autoSyncEnabledChanged.emit()
+            self._apply_auto_sync_setting()
+        except Exception as exc:
+            self._auto_sync_enabled = previous
+            diagnostic = format_sync_error("Updating automatic sync settings", exc, self._backend_endpoint)
+            self._sync_status = "Sync Failed"
+            self._sync_status_color = "#EF4444"
+            self._backend_status = "Sync Failed"
+            self._sync_logs = diagnostic
+            self._backend_logs = diagnostic
+            self.autoSyncEnabledChanged.emit()
+            self.syncLogsChanged.emit()
+            self.backendLogsChanged.emit()
+            self._emit_sync_state()
 
     @Property(int, notify=pullIntervalChanged)
     def pullInterval(self) -> int:

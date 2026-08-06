@@ -862,7 +862,14 @@ class BackendApiClient:
     """HTTPS client for the Node backend exposed through Tailscale Funnel."""
 
     def __init__(self, cfg: SyncConfig):
-        self._url = cfg.backend_api_base_url.rstrip("/")
+        base_url = cfg.backend_api_base_url.rstrip("/")
+        if base_url.endswith("/api"):
+            self._root_url = base_url[:-4]
+            self._api_url = base_url
+        else:
+            self._root_url = base_url
+            self._api_url = f"{base_url}/api" if base_url else ""
+        self._url = self._api_url or self._root_url
         self._meter_reader_id: int | None = None
 
     def _req(
@@ -872,8 +879,13 @@ class BackendApiClient:
         *,
         query: dict | None = None,
         payload: dict | list | None = None,
+        api_route: bool = True,
     ) -> tuple[int, object]:
-        url = f"{self._url}{path}"
+        base_url = self._api_url if api_route else self._root_url
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        if api_route and normalized_path.startswith("/api/"):
+            normalized_path = normalized_path[4:]
+        url = f"{base_url}{normalized_path}"
         if query:
             clean_query = {key: value for key, value in query.items() if value not in (None, "")}
             if clean_query:
@@ -912,7 +924,7 @@ class BackendApiClient:
         return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
 
     def is_online(self) -> bool:
-        status, _ = self._req("GET", "/health")
+        status, _ = self._req("GET", "/health", api_route=False)
         return 200 <= status < 300
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
@@ -1028,6 +1040,7 @@ class HandheldSyncDataAccess:
         self.local = local_store
         self.remote = remote_store
         self.operation_lock = threading.RLock()
+        self._worker_lock = threading.Lock()
         self._runtime_audit: list[dict] = []
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
@@ -1325,20 +1338,27 @@ class HandheldSyncDataAccess:
         return result
 
     def start_sync_worker(self, interval_seconds: int = BACKGROUND_SYNC_INTERVAL_SECONDS) -> None:
-        if self._worker and self._worker.is_alive():
-            return
-        self._worker_stop.clear()
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                return
+            self._worker_stop.clear()
 
-        def _run():
-            while not self._worker_stop.is_set():
-                try:
-                    self.syncPendingReadings()
-                except Exception as exc:
-                    self._audit(None, "failed", format_sync_error("Background sync worker", exc, self._endpoint()))
-                self._worker_stop.wait(max(60, interval_seconds))
+            def _run():
+                while not self._worker_stop.is_set():
+                    try:
+                        self.syncPendingReadings()
+                    except Exception as exc:
+                        self._audit(None, "failed", format_sync_error("Background sync worker", exc, self._endpoint()))
+                    self._worker_stop.wait(max(60, interval_seconds))
 
-        self._worker = threading.Thread(target=_run, daemon=True, name="handheld-sync-worker")
-        self._worker.start()
+            self._worker = threading.Thread(target=_run, daemon=True, name="handheld-sync-worker")
+            self._worker.start()
 
     def stop_sync_worker(self) -> None:
-        self._worker_stop.set()
+        with self._worker_lock:
+            worker = self._worker
+            self._worker_stop.set()
+            if worker and worker.is_alive() and worker is not threading.current_thread():
+                worker.join(timeout=2.0)
+            if self._worker is worker:
+                self._worker = None
