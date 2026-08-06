@@ -107,6 +107,7 @@ class FakeRemoteStore:
         self.assigned_consumers = []
         self.assigned_schedules = []
         self.context_by_consumer = {}
+        self.assigned_consumer_calls = []
 
     def is_online(self):
         return self.online
@@ -115,6 +116,7 @@ class FakeRemoteStore:
         return list(self.assigned_schedules)
 
     def load_assigned_consumers(self, meter_reader_id=None, zone_name=None, date_from=None, date_to=None):
+        self.assigned_consumer_calls.append((meter_reader_id, zone_name, date_from, date_to))
         return list(self.assigned_consumers)
 
     def _key(self, consumer_id, reading_date):
@@ -247,6 +249,26 @@ class HandheldSyncTests(unittest.TestCase):
 
         self.dal.stop_sync_worker()
         self.assertIsNone(self.dal._worker)
+
+    def test_load_assigned_consumers_never_falls_back_to_an_unfiltered_dataset(self):
+        self.remote.online = True
+
+        def filtered_then_full(meter_reader_id=None, zone_name=None, date_from=None, date_to=None):
+            self.remote.assigned_consumer_calls.append((meter_reader_id, zone_name, date_from, date_to))
+            if meter_reader_id or zone_name or date_from or date_to:
+                return []
+            return [{"id": 9, "consumer_id": 9, "zone_name": "Zone 9"}]
+
+        self.remote.load_assigned_consumers = filtered_then_full
+
+        result = self.dal.loadAssignedConsumers(12, "Zone 1", "2026-08-01", "2026-08-31")
+
+        self.assertEqual(result, [])
+        self.assertEqual(
+            self.remote.assigned_consumer_calls,
+            [(12, "Zone 1", "2026-08-01", "2026-08-31")],
+        )
+        self.assertEqual(self.local.cached, [])
 
     def test_duplicate_prevention_by_reading_id(self):
         self.remote.online = True
@@ -612,7 +634,65 @@ class HandheldSyncTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_local_schedule_queries_fall_back_to_cached_consumers_when_month_schedule_missing(self):
+    def test_multi_day_routes_are_reader_scoped_and_offline_ready_only_after_verification(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.replace_reading_schedules_from_sync(
+                [
+                    {
+                        "schedule_id": 201,
+                        "start_date": "2026-07-30",
+                        "due_date": "2026-08-10",
+                        "billing_month": "August 2026",
+                        "zone_name": "Route A",
+                        "meter_reader_id": 12,
+                        "status": "In Progress",
+                    },
+                    {
+                        "schedule_id": 202,
+                        "start_date": "2026-08-01",
+                        "due_date": "2026-08-15",
+                        "billing_month": "August 2026",
+                        "zone_name": "Private Route",
+                        "meter_reader_id": 13,
+                        "status": "Scheduled",
+                    },
+                ],
+                meter_reader_id=12,
+                date_from="2026-07-01",
+                date_to="2026-08-31",
+            )
+            database.replace_consumers_from_sync(
+                [
+                    {"id": 1, "meter_no": "MTR-A-1", "acct_no": "A-1", "name": "Assigned", "zone_name": "Route A"},
+                    {"id": 2, "meter_no": "MTR-P-1", "acct_no": "P-1", "name": "Other Reader", "zone_name": "Private Route"},
+                ]
+            )
+
+            routes = database.get_assigned_routes(12)
+            self.assertEqual([route["schedule_id"] for route in routes], [201])
+            self.assertIsNone(routes[0]["cache_verified_at"])
+            self.assertEqual(database.get_all_zone_names("2026-08-05", 12), ["Route A"])
+            self.assertIsNone(database.search_consumer("MTR-P-1", False, "2026-08-05", 12))
+
+            self.assertTrue(database.mark_route_cache_verified(201, 12, 1))
+            self.assertFalse(database.mark_route_cache_verified(202, 12, 1))
+            verified = database.get_assigned_routes(12)[0]
+            self.assertEqual(verified["cached_consumer_count"], 1)
+            self.assertIsNotNone(verified["cache_verified_at"])
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_local_schedule_queries_do_not_expose_cached_routes_without_assignment(self):
         original_db_path = database._db_path
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
         db_path = handle.name
@@ -652,14 +732,13 @@ class HandheldSyncTests(unittest.TestCase):
             )
 
             zone_names = database.get_all_zone_names("2026-07-12", 12)
-            self.assertEqual(zone_names, ["Zone 1", "Zone 3"])
+            self.assertEqual(zone_names, [])
 
             consumer = database.search_consumer("MTR-Z3-001", unread_only=True, schedule_date="2026-07-12", meter_reader_id=12)
-            self.assertIsNotNone(consumer)
+            self.assertIsNone(consumer)
 
             rows = database.get_zone_consumers_with_status("Zone 3", "2026-07-12", 12)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["name"], "Zone Three Consumer")
+            self.assertEqual(rows, [])
         finally:
             database._db_path = original_db_path
             try:

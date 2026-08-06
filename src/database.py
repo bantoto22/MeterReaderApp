@@ -180,12 +180,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS reading_schedule (
             schedule_id INTEGER PRIMARY KEY,
             schedule_date TEXT NOT NULL,
+            start_date TEXT,
+            due_date TEXT,
+            billing_month TEXT,
             remote_zone_id INTEGER,
             zone_name TEXT NOT NULL,
             meter_reader_id INTEGER,
             meter_reader_name TEXT,
             meter_reader_contact TEXT,
             status TEXT NOT NULL DEFAULT 'Scheduled',
+            cached_consumer_count INTEGER NOT NULL DEFAULT 0,
+            cache_verified_at TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -239,12 +244,17 @@ def init_db():
         "reading_schedule",
         {
             "schedule_date": "TEXT",
+            "start_date": "TEXT",
+            "due_date": "TEXT",
+            "billing_month": "TEXT",
             "remote_zone_id": "INTEGER",
             "zone_name": "TEXT",
             "meter_reader_id": "INTEGER",
             "meter_reader_name": "TEXT",
             "meter_reader_contact": "TEXT",
             "status": "TEXT",
+            "cached_consumer_count": "INTEGER NOT NULL DEFAULT 0",
+            "cache_verified_at": "TEXT",
             "updated_at": "DATETIME DEFAULT CURRENT_TIMESTAMP",
         },
     )
@@ -539,16 +549,18 @@ def _effective_schedule_context(
             SELECT 1
             FROM reading_schedule rs
             WHERE rs.meter_reader_id = ?
-              AND date(rs.schedule_date) >= date(?)
-              AND date(rs.schedule_date) <= date(?)
+              AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+              AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
             LIMIT 1
             """,
-            (reader_id_int, month_start, month_end),
+            (reader_id_int, month_end, month_start),
         ).fetchone() is not None
     finally:
         conn.close()
-    return normalized_date, reader_id_int, has_schedule_rows
+    # A known reader is always assignment-filtered. Falling back to every local
+    # zone when their schedule cache is empty can expose another reader's route.
+    return normalized_date, reader_id_int, True
 
 
 def _month_bounds(schedule_date: str | None) -> tuple[str, str]:
@@ -590,7 +602,12 @@ def replace_reading_schedules_from_sync(
         if not isinstance(row, dict):
             continue
         schedule_id = row.get("Schedule_ID", row.get("schedule_id"))
-        schedule_date = _normalize_schedule_date(row.get("Schedule_Date", row.get("schedule_date")))
+        start_date = _normalize_schedule_date(
+            row.get("Start_Date", row.get("start_date", row.get("Schedule_Date", row.get("schedule_date"))))
+        )
+        due_date = _normalize_schedule_date(row.get("Due_Date", row.get("due_date", start_date)))
+        schedule_date = start_date
+        billing_month = str(row.get("Billing_Month", row.get("billing_month")) or "").strip() or None
         remote_zone_id = row.get("Zone_ID", row.get("zone_id"))
         zone_name = str(row.get("Zone_Name", row.get("zone_name")) or "").strip()
         meter_reader_value = row.get("Meter_Reader_ID", row.get("meter_reader_id", reader_id_int))
@@ -615,12 +632,16 @@ def replace_reading_schedules_from_sync(
         cur.execute(
             """
             INSERT INTO reading_schedule (
-                schedule_id, schedule_date, remote_zone_id, zone_name, meter_reader_id,
+                schedule_id, schedule_date, start_date, due_date, billing_month,
+                remote_zone_id, zone_name, meter_reader_id,
                 meter_reader_name, meter_reader_contact, status, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(schedule_id) DO UPDATE SET
                 schedule_date = excluded.schedule_date,
+                start_date = excluded.start_date,
+                due_date = excluded.due_date,
+                billing_month = excluded.billing_month,
                 remote_zone_id = excluded.remote_zone_id,
                 zone_name = excluded.zone_name,
                 meter_reader_id = excluded.meter_reader_id,
@@ -632,6 +653,9 @@ def replace_reading_schedules_from_sync(
             (
                 schedule_id_int,
                 schedule_date,
+                start_date,
+                due_date,
+                billing_month,
                 remote_zone_id_int,
                 zone_name,
                 meter_reader_id_int,
@@ -645,6 +669,68 @@ def replace_reading_schedules_from_sync(
     conn.commit()
     conn.close()
     return upserted
+
+
+def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
+    """Return only routes belonging to the signed-in reader, including offline readiness."""
+    try:
+        reader_id = int(meter_reader_id) if meter_reader_id not in (None, "") else None
+    except (TypeError, ValueError):
+        reader_id = None
+    if reader_id is None:
+        return []
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT schedule_id,
+               COALESCE(start_date, schedule_date) AS start_date,
+               COALESCE(due_date, start_date, schedule_date) AS due_date,
+               billing_month, zone_name, status,
+               cached_consumer_count, cache_verified_at,
+               CASE
+                   WHEN lower(status) IN ('completed', 'cancelled') THEN status
+                   WHEN date(COALESCE(due_date, start_date, schedule_date)) < date('now') THEN 'Overdue'
+                   ELSE status
+               END AS display_status
+        FROM reading_schedule
+        WHERE meter_reader_id = ?
+          AND lower(status) NOT IN ('completed', 'cancelled')
+        ORDER BY date(COALESCE(start_date, schedule_date)), zone_name, schedule_id
+        """,
+        (reader_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def mark_route_cache_verified(
+    schedule_id: int | str,
+    meter_reader_id: int | str,
+    consumer_count: int,
+) -> bool:
+    """Mark a route ready only when it still belongs to this reader and has cached rows."""
+    try:
+        schedule_id_int = int(schedule_id)
+        reader_id_int = int(meter_reader_id)
+        count = int(consumer_count)
+    except (TypeError, ValueError):
+        return False
+    if count <= 0:
+        return False
+    conn = get_connection()
+    cur = conn.execute(
+        """
+        UPDATE reading_schedule
+        SET cached_consumer_count = ?, cache_verified_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE schedule_id = ? AND meter_reader_id = ?
+        """,
+        (count, schedule_id_int, reader_id_int),
+    )
+    conn.commit()
+    changed = cur.rowcount == 1
+    conn.close()
+    return changed
 
 
 # ─── Query helpers ────────────────────────────────────────────────────────────
@@ -693,12 +779,12 @@ def search_consumer(
                    FROM reading_schedule rs
                    WHERE rs.zone_name = z.name
                      AND rs.meter_reader_id = ?
-                     AND date(rs.schedule_date) >= date(?)
-                     AND date(rs.schedule_date) <= date(?)
+                     AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+                     AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
                      AND rs.status IN ('Scheduled', 'In Progress')
                )
         """
-        params.extend([effective_reader_id, month_start, month_end])
+        params.extend([effective_reader_id, month_end, month_start])
     if unread_only:
         if use_schedule_filter:
             sql += """
@@ -779,12 +865,12 @@ def get_consumer_by_id(
                    FROM reading_schedule rs
                    WHERE rs.zone_name = z.name
                      AND rs.meter_reader_id = ?
-                     AND date(rs.schedule_date) >= date(?)
-                     AND date(rs.schedule_date) <= date(?)
+                     AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+                     AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
                      AND rs.status IN ('Scheduled', 'In Progress')
                )
         """
-        params.extend([effective_reader_id, month_start, month_end])
+        params.extend([effective_reader_id, month_end, month_start])
     sql += " LIMIT 1"
     row = conn.execute(sql, params).fetchone()
     conn.close()
@@ -841,12 +927,12 @@ def search_consumers_by_zone(
                    FROM reading_schedule rs
                    WHERE rs.zone_name = z.name
                      AND rs.meter_reader_id = ?
-                     AND date(rs.schedule_date) >= date(?)
-                     AND date(rs.schedule_date) <= date(?)
+                     AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+                     AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
                      AND rs.status IN ('Scheduled', 'In Progress')
                )
         """
-        params.extend([effective_reader_id, month_start, month_end])
+        params.extend([effective_reader_id, month_end, month_start])
     if unread_only:
         if use_schedule_filter:
             sql += """
@@ -1090,12 +1176,12 @@ def get_zone_stats(
             FROM zones z
             JOIN reading_schedule rs ON rs.zone_name = z.name
             WHERE rs.meter_reader_id = ?
-              AND date(rs.schedule_date) >= date(?)
-              AND date(rs.schedule_date) <= date(?)
+              AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+              AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
             ORDER BY rs.zone_name
             """,
-            (effective_reader_id, month_start, month_end),
+            (effective_reader_id, month_end, month_start),
         ).fetchall()
     else:
         zones = conn.execute("SELECT id, name FROM zones ORDER BY name").fetchall()
@@ -1175,12 +1261,12 @@ def get_all_zone_names(
             SELECT DISTINCT rs.zone_name AS name
             FROM reading_schedule rs
             WHERE rs.meter_reader_id = ?
-              AND date(rs.schedule_date) >= date(?)
-              AND date(rs.schedule_date) <= date(?)
+              AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+              AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
               AND rs.status IN ('Scheduled', 'In Progress')
             ORDER BY rs.zone_name
             """,
-            (effective_reader_id, month_start, month_end),
+            (effective_reader_id, month_end, month_start),
         ).fetchall()
     else:
         rows = conn.execute("SELECT name FROM zones ORDER BY name").fetchall()
@@ -1263,8 +1349,8 @@ def get_zone_consumers_with_status(
                  FROM reading_schedule rs
                  WHERE rs.zone_name = z.name
                    AND rs.meter_reader_id = ?
-                   AND date(rs.schedule_date) >= date(?)
-                   AND date(rs.schedule_date) <= date(?)
+                   AND date(COALESCE(rs.start_date, rs.schedule_date)) <= date(?)
+                   AND date(COALESCE(rs.due_date, rs.start_date, rs.schedule_date)) >= date(?)
                    AND rs.status IN ('Scheduled', 'In Progress')
              )
            ORDER BY c.meter_no"""
@@ -1272,7 +1358,7 @@ def get_zone_consumers_with_status(
             month_start, month_end,
             month_start, month_end,
             month_start, month_end,
-            zone_name, effective_reader_id, month_start, month_end,
+            zone_name, effective_reader_id, month_end, month_start,
         )
     else:
         sql = """SELECT 

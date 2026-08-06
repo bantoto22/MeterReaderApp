@@ -145,9 +145,13 @@ def _reading_date(value) -> date:
 
 def _device_schedule_window(today: date | None = None) -> tuple[str, str]:
     anchor = today or datetime.now().date()
-    start = anchor.replace(day=1)
-    year = start.year + ((start.month) // 12)
-    month = 1 if start.month == 12 else start.month + 1
+    current_month_start = anchor.replace(day=1)
+    if current_month_start.month == 1:
+        start = current_month_start.replace(year=current_month_start.year - 1, month=12)
+    else:
+        start = current_month_start.replace(month=current_month_start.month - 1)
+    year = current_month_start.year + ((current_month_start.month) // 12)
+    month = 1 if current_month_start.month == 12 else current_month_start.month + 1
     next_month_start = date(year, month, 1)
     following_year = next_month_start.year + ((next_month_start.month) // 12)
     following_month = 1 if next_month_start.month == 12 else next_month_start.month + 1
@@ -530,12 +534,17 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         CREATE TABLE IF NOT EXISTS reading_schedule (
             schedule_id INTEGER PRIMARY KEY,
             schedule_date TEXT NOT NULL,
+            start_date TEXT,
+            due_date TEXT,
+            billing_month TEXT,
             remote_zone_id INTEGER,
             zone_name TEXT NOT NULL,
             meter_reader_id INTEGER,
             meter_reader_name TEXT,
             meter_reader_contact TEXT,
             status TEXT NOT NULL DEFAULT 'Scheduled',
+            cached_consumer_count INTEGER NOT NULL DEFAULT 0,
+            cache_verified_at TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """
@@ -594,12 +603,17 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 "reading_schedule",
                 {
                     "schedule_date": "TEXT",
+                    "start_date": "TEXT",
+                    "due_date": "TEXT",
+                    "billing_month": "TEXT",
                     "remote_zone_id": "INTEGER",
                     "zone_name": "TEXT",
                     "meter_reader_id": "INTEGER",
                     "meter_reader_name": "TEXT",
                     "meter_reader_contact": "TEXT",
                     "status": "TEXT NOT NULL DEFAULT 'Scheduled'",
+                    "cached_consumer_count": "INTEGER NOT NULL DEFAULT 0",
+                    "cache_verified_at": "TEXT",
                     "updated_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
                 },
             )
@@ -618,12 +632,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             reader_id = None
         sql = """
         INSERT INTO reading_schedule (
-            schedule_id, schedule_date, remote_zone_id, zone_name, meter_reader_id,
+            schedule_id, schedule_date, start_date, due_date, billing_month,
+            remote_zone_id, zone_name, meter_reader_id,
             meter_reader_name, meter_reader_contact, status, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(schedule_id) DO UPDATE SET
             schedule_date = excluded.schedule_date,
+            start_date = excluded.start_date,
+            due_date = excluded.due_date,
+            billing_month = excluded.billing_month,
             remote_zone_id = excluded.remote_zone_id,
             zone_name = excluded.zone_name,
             meter_reader_id = excluded.meter_reader_id,
@@ -637,7 +655,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 if not isinstance(item, dict):
                     continue
                 schedule_id = item.get("Schedule_ID", item.get("schedule_id"))
-                schedule_date = str(item.get("Schedule_Date", item.get("schedule_date")) or "").split("T", 1)[0].split(" ", 1)[0]
+                start_date = str(
+                    item.get("Start_Date", item.get("start_date", item.get("Schedule_Date", item.get("schedule_date")))) or ""
+                ).split("T", 1)[0].split(" ", 1)[0]
+                due_date = str(item.get("Due_Date", item.get("due_date", start_date)) or "").split("T", 1)[0].split(" ", 1)[0]
+                schedule_date = start_date
+                billing_month = str(item.get("Billing_Month", item.get("billing_month")) or "").strip() or None
                 zone_name = str(item.get("Zone_Name", item.get("zone_name")) or "").strip()
                 if not schedule_id or not schedule_date or not zone_name:
                     continue
@@ -656,6 +679,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     (
                         int(schedule_id),
                         schedule_date,
+                        start_date,
+                        due_date,
+                        billing_month,
                         remote_zone_id,
                         zone_name,
                         schedule_reader_id,

@@ -63,7 +63,7 @@ Rectangle {
                         spacing: 6
 
                         Text {
-                            text: "Assigned Zone"
+                            text: "My Reading Route"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -73,8 +73,14 @@ Rectangle {
                         ComboBox {
                             id: cmbProgressZone
                             Layout.fillWidth: true
-                            model: bridgeObj ? bridgeObj.zones : []
-                            currentIndex: bridgeObj ? Math.max(0, bridgeObj.zones.indexOf(bridgeObj.selectedZone)) : 0
+                            textRole: "label"
+                            valueRole: "scheduleId"
+                            model: bridgeObj ? bridgeObj.assignedRoutes : []
+                            currentIndex: {
+                                if (!bridgeObj) return -1
+                                var ids = bridgeObj.assignedRoutes.map(function(route) { return route.scheduleId })
+                                return ids.indexOf(bridgeObj.selectedRouteId)
+                            }
 
                             background: Rectangle {
                                 implicitHeight: TouchMetrics.buttonHeight
@@ -95,15 +101,74 @@ Rectangle {
 
                             delegate: ItemDelegate {
                                 width: cmbProgressZone.width
-                                text: modelData
+                                text: modelData.label
                                 highlighted: cmbProgressZone.highlightedIndex === index
                             }
 
-                            onCurrentTextChanged: {
-                                if (bridgeObj && currentText) {
-                                    bridgeObj.selectedZone = currentText
+                            onActivated: {
+                                if (bridgeObj && currentValue) {
+                                    bridgeObj.selectedRouteId = currentValue
                                 }
                             }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: bridgeObj ? ("Reading month: " + bridgeObj.selectedRouteBillingMonth + "  |  " + bridgeObj.selectedRoutePeriod) : ""
+                            font.pixelSize: TouchMetrics.helperText
+                            font.family: "Montserrat"
+                            color: "#64748B"
+                            wrapMode: Text.WordWrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Rectangle {
+                                Layout.preferredWidth: routeReadyText.implicitWidth + 24
+                                Layout.preferredHeight: 32
+                                radius: 16
+                                color: bridgeObj && bridgeObj.routeOfflineReady ? "#DCFCE7" : "#FEF3C7"
+                                border.color: bridgeObj && bridgeObj.routeOfflineReady ? "#86EFAC" : "#FCD34D"
+                                Text {
+                                    id: routeReadyText
+                                    anchors.centerIn: parent
+                                    text: bridgeObj ? bridgeObj.routeCacheMessage : ""
+                                    font.pixelSize: TouchMetrics.helperText
+                                    font.family: "Montserrat"
+                                    font.bold: true
+                                    color: bridgeObj && bridgeObj.routeOfflineReady ? "#166534" : "#92400E"
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
+
+                            Rectangle {
+                                Layout.preferredWidth: pendingSyncText.implicitWidth + 22
+                                Layout.preferredHeight: 32
+                                radius: 16
+                                color: bridgeObj && bridgeObj.syncPendingCount > 0 ? "#FFF7ED" : "#EFF6FF"
+                                border.color: bridgeObj && bridgeObj.syncPendingCount > 0 ? "#FDBA74" : "#BFDBFE"
+                                Text {
+                                    id: pendingSyncText
+                                    anchors.centerIn: parent
+                                    text: bridgeObj ? (bridgeObj.syncPendingCount + " pending sync") : "0 pending sync"
+                                    font.pixelSize: TouchMetrics.helperText
+                                    font.family: "Montserrat"
+                                    font.bold: true
+                                    color: bridgeObj && bridgeObj.syncPendingCount > 0 ? "#9A3412" : "#1D4ED8"
+                                }
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: bridgeObj ? ("Status: " + bridgeObj.selectedRouteStatus) : ""
+                            font.pixelSize: TouchMetrics.helperText
+                            font.family: "Montserrat"
+                            font.bold: true
+                            color: bridgeObj && bridgeObj.selectedRouteStatus === "Overdue" ? "#DC2626" : "#475569"
                         }
                     }
 
@@ -238,7 +303,7 @@ Rectangle {
 
                                     Text {
                                         Layout.alignment: Qt.AlignHCenter
-                                        text: "Today's Progress"
+                                        text: "Route Progress"
                                         color: "white"
                                         font.pixelSize: TouchMetrics.bodyText
                                         font.family: "Montserrat"

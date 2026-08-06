@@ -63,6 +63,7 @@ try:
         cache_meter_reader_credentials,
         clear_current_meter_reader,
         get_receipt_print_by_id,
+        get_assigned_routes,
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
@@ -78,6 +79,7 @@ try:
         update_consumer_due_date,
         replace_consumers_from_sync,
         replace_reading_schedules_from_sync,
+        mark_route_cache_verified,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
@@ -88,6 +90,7 @@ except ImportError:
         cache_meter_reader_credentials,
         clear_current_meter_reader,
         get_receipt_print_by_id,
+        get_assigned_routes,
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
@@ -103,6 +106,7 @@ except ImportError:
         update_consumer_due_date,
         replace_consumers_from_sync,
         replace_reading_schedules_from_sync,
+        mark_route_cache_verified,
         save_reading,
         search_consumer,
         search_consumers_by_zone,
@@ -195,6 +199,32 @@ def _month_window(value: datetime.date) -> tuple[str, str]:
         next_month = start.replace(month=start.month + 1, day=1)
     end = next_month - timedelta(days=1)
     return start.isoformat(), end.isoformat()
+
+
+def _multi_day_assignment_window(value: datetime.date) -> tuple[str, str]:
+    current_start = value.replace(day=1)
+    previous_start = (
+        current_start.replace(year=current_start.year - 1, month=12)
+        if current_start.month == 1
+        else current_start.replace(month=current_start.month - 1)
+    )
+    if current_start.month >= 11:
+        end_month = current_start.replace(year=current_start.year + 1, month=(current_start.month + 2) % 12 or 12, day=1)
+    else:
+        end_month = current_start.replace(month=current_start.month + 2, day=1)
+    end = end_month - timedelta(days=1)
+    return previous_start.isoformat(), end.isoformat()
+
+
+def _billing_month_date(value, fallback: str = "") -> str:
+    raw = str(value or "").strip()
+    if raw:
+        for fmt in ("%Y-%m", "%B %Y", "%b %Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt).date().replace(day=1).isoformat()
+            except ValueError:
+                continue
+    return _normalize_iso_date(fallback) or ""
 
 
 def _normalize_shutdown_error(detail: str) -> str:
@@ -355,6 +385,8 @@ class AppBridge(QObject):
     # Meter Entry properties
     zonesChanged = Signal()
     selectedZoneChanged = Signal()
+    assignedRoutesChanged = Signal()
+    selectedRouteChanged = Signal()
     searchQueryChanged = Signal()
 
     
@@ -443,6 +475,9 @@ class AppBridge(QObject):
 
         self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
         self._selected_zone = self._zones[0] if self._zones else ""
+        self._assigned_routes = []
+        self._selected_route_id = ""
+        self._selected_route_billing_date = ""
         self._search_query = ""
         self._search_unread_only = False
 
@@ -621,6 +656,9 @@ class AppBridge(QObject):
         self._meter_reader_account_id = ""
         self._zones = []
         self._selected_zone = ""
+        self._assigned_routes = []
+        self._selected_route_id = ""
+        self._selected_route_billing_date = ""
         self._zone_consumers = []
         self._search_suggestions = []
         self._search_query = ""
@@ -685,7 +723,7 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 with self._sync_dal.operation_lock:
-                    date_from, date_to = _month_window(self._selected_reading_date())
+                    date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id,
                         zone_name,
@@ -702,6 +740,68 @@ class AppBridge(QObject):
     @Property(list, notify=zonesChanged)
     def zones(self) -> list:
         return self._zones
+
+    @Property(list, notify=assignedRoutesChanged)
+    def assignedRoutes(self) -> list:
+        return self._assigned_routes
+
+    @Property(str, notify=selectedRouteChanged)
+    def selectedRouteId(self) -> str:
+        return self._selected_route_id
+
+    @selectedRouteId.setter
+    def selectedRouteId(self, value: str) -> None:
+        route_id = str(value or "").strip()
+        route = next((item for item in self._assigned_routes if str(item.get("scheduleId")) == route_id), None)
+        if not route or route_id == self._selected_route_id:
+            return
+        self._selected_route_id = route_id
+        self._selected_zone = str(route.get("zoneName") or "")
+        self._selected_route_billing_date = str(route.get("billingDate") or route.get("startDate") or "")
+        self.selectedRouteChanged.emit()
+        self.selectedZoneChanged.emit()
+        self.assignedRoutesChanged.emit()
+        self.selectedRouteChanged.emit()
+        self.selectedBillingMonthChanged.emit()
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
+        self.update_stats()
+        if not route.get("offlineReady"):
+            self._start_selected_zone_consumer_refresh(self._selected_zone)
+
+    def _selected_route(self) -> dict:
+        return next(
+            (item for item in self._assigned_routes if str(item.get("scheduleId")) == self._selected_route_id),
+            {},
+        )
+
+    @Property(str, notify=selectedRouteChanged)
+    def selectedRoutePeriod(self) -> str:
+        route = self._selected_route()
+        start = str(route.get("startDate") or "-")
+        due = str(route.get("dueDate") or "-")
+        return f"{start} to {due}"
+
+    @Property(str, notify=selectedRouteChanged)
+    def selectedRouteBillingMonth(self) -> str:
+        return str(self._selected_route().get("billingMonth") or "-")
+
+    @Property(str, notify=selectedRouteChanged)
+    def selectedRouteStatus(self) -> str:
+        return str(self._selected_route().get("status") or "-")
+
+    @Property(bool, notify=selectedRouteChanged)
+    def routeOfflineReady(self) -> bool:
+        return bool(self._selected_route().get("offlineReady"))
+
+    @Property(str, notify=selectedRouteChanged)
+    def routeCacheMessage(self) -> str:
+        route = self._selected_route()
+        if not route:
+            return "No assigned route selected"
+        if route.get("offlineReady"):
+            return "Route ready for offline use"
+        return "Connect to download and verify this route"
 
     @Property(str, notify=selectedZoneChanged)
     def selectedZone(self) -> str:
@@ -823,6 +923,9 @@ class AppBridge(QObject):
 
     @Property(str, notify=selectedBillingMonthChanged)
     def selectedBillingDate(self) -> str:
+        route_date = _normalize_iso_date(self._selected_route_billing_date)
+        if route_date:
+            return route_date
         return self._selected_reading_date().isoformat()
 
     # Exception properties
@@ -1156,6 +1259,32 @@ class AppBridge(QObject):
             self._assignment_refresh_timer.stop()
 
     def _refresh_local_assignment_views(self) -> None:
+        routes = get_assigned_routes(self._meter_reader_account_id or None)
+        self._assigned_routes = [
+            {
+                "scheduleId": str(route.get("schedule_id") or ""),
+                "zoneName": str(route.get("zone_name") or ""),
+                "startDate": str(route.get("start_date") or ""),
+                "dueDate": str(route.get("due_date") or ""),
+                "billingMonth": str(route.get("billing_month") or ""),
+                "billingDate": _billing_month_date(route.get("billing_month"), str(route.get("start_date") or "")),
+                "status": str(route.get("display_status") or route.get("status") or "Scheduled"),
+                "offlineReady": bool(route.get("cache_verified_at")) and int(route.get("cached_consumer_count") or 0) > 0,
+                "label": f"{str(route.get('zone_name') or 'Route')} | {str(route.get('billing_month') or route.get('start_date') or '')}",
+            }
+            for route in routes
+        ]
+        valid_ids = {str(route.get("scheduleId")) for route in self._assigned_routes}
+        if self._selected_route_id not in valid_ids:
+            self._selected_route_id = str(self._assigned_routes[0].get("scheduleId")) if self._assigned_routes else ""
+        selected_route = self._selected_route()
+        if selected_route:
+            self._selected_zone = str(selected_route.get("zoneName") or "")
+            self._selected_route_billing_date = str(selected_route.get("billingDate") or selected_route.get("startDate") or "")
+        else:
+            self._selected_route_billing_date = ""
+        self.assignedRoutesChanged.emit()
+        self.selectedRouteChanged.emit()
         self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
         if self._selected_zone not in self._zones:
             self._selected_zone = self._zones[0] if self._zones else ""
@@ -1197,7 +1326,7 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 with self._sync_dal.operation_lock:
-                    date_from, date_to = _month_window(self._selected_reading_date())
+                    date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
                     schedule_count = self._mirror_assigned_schedules(date_from, date_to)
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id,
@@ -1227,6 +1356,23 @@ class AppBridge(QObject):
 
         threading.Thread(target=_task, daemon=True).start()
 
+    def _verify_cached_routes(self, pulled_zones: list[str]) -> None:
+        """Persist readiness only after the assignment and its local consumer rows agree."""
+        verified_zones = {str(zone or "").strip() for zone in pulled_zones if str(zone or "").strip()}
+        if not verified_zones or not self._meter_reader_account_id:
+            return
+        for route in get_assigned_routes(self._meter_reader_account_id):
+            zone_name = str(route.get("zone_name") or "").strip()
+            if zone_name not in verified_zones:
+                continue
+            schedule_date = _billing_month_date(route.get("billing_month"), str(route.get("start_date") or ""))
+            cached_rows = get_zone_consumers_with_status(
+                zone_name,
+                schedule_date=schedule_date,
+                meter_reader_id=self._meter_reader_account_id,
+            )
+            mark_route_cache_verified(route.get("schedule_id"), self._meter_reader_account_id, len(cached_rows))
+
     def _finish_assigned_consumer_dataset(self, result: dict) -> None:
         self._assigned_dataset_refreshing = False
         zone_name = str(result.get("zone") or "")
@@ -1245,6 +1391,9 @@ class AppBridge(QObject):
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
             pulled_zones = result.get("pulled_zones") or []
+            if zone_name and not pulled_zones:
+                pulled_zones = [zone_name]
+            self._verify_cached_routes(pulled_zones)
             if pulled_zones:
                 self._sync_logs = (
                     f"Assigned consumers refreshed.\n"
@@ -1264,7 +1413,7 @@ class AppBridge(QObject):
             return
         if self._sync_dal:
             try:
-                date_from, date_to = _month_window(self._selected_reading_date())
+                date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
                 self._mirror_assigned_schedules(date_from, date_to)
                 consumers = self._sync_dal.loadAssignedConsumers(
                     self._meter_reader_account_id,
@@ -1469,10 +1618,35 @@ class AppBridge(QObject):
         self.wifiBusyChanged.emit()
 
     def _set_wifi_status(self, status: str, color: str) -> None:
+        was_connected = self._wifi_status.startswith("Status: Connected")
         self._wifi_status = status
         self._wifi_status_color = color
         self.wifiStatusChanged.emit()
         self.wifiStatusColorChanged.emit()
+        is_connected = status.startswith("Status: Connected")
+        if is_connected and not was_connected:
+            self._start_reconnect_sync()
+
+    def _start_reconnect_sync(self) -> None:
+        if not self._auto_sync_enabled or not self._sync_dal:
+            return
+        try:
+            if not self._sync_dal.listPendingBackendReadings():
+                return
+        except Exception:
+            return
+
+        def _task() -> None:
+            try:
+                with self._sync_dal.operation_lock:
+                    result = self._sync_dal.syncPendingReadings()
+                self.syncTaskFinished.emit({"kind": "sync", "result": result, "silent": True, "mirrored": 0})
+            except Exception as exc:
+                self.syncTaskFinished.emit(
+                    {"kind": "error", "error": format_sync_error("Synchronizing after reconnect", exc, self._backend_endpoint), "silent": True}
+                )
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def _start_wifi_scan(self, silent: bool = False) -> None:
         if self._wifi_busy:
@@ -2004,7 +2178,7 @@ class AppBridge(QObject):
                     mirrored = 0
                     try:
                         stage = "Downloading assigned schedules"
-                        date_from, date_to = _month_window(self._selected_reading_date())
+                        date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
                         self._mirror_assigned_schedules(date_from, date_to)
                         stage = "Downloading assigned consumers"
                         consumers = self._sync_dal.loadAssignedConsumers(
