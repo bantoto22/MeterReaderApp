@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 sqlite3.register_adapter(Decimal, float)
@@ -135,6 +135,16 @@ def init_db():
             exception       TEXT     DEFAULT 'None',
             reading_date    DATETIME DEFAULT CURRENT_TIMESTAMP,
             is_flagged      BOOLEAN  DEFAULT 0,
+            schedule_id     INTEGER,
+            schedule_date   TEXT,
+            schedule_due_date TEXT,
+            billing_cycle   TEXT,
+            reading_route_id TEXT,
+            assignment_order INTEGER,
+            reading_status  TEXT NOT NULL DEFAULT 'valid',
+            reading_sync_status TEXT NOT NULL DEFAULT 'pending',
+            sync_reading_id TEXT,
+            captured_at     TEXT,
             FOREIGN KEY (consumer_id) REFERENCES consumers(id)
         );
 
@@ -194,6 +204,25 @@ def init_db():
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS reading_assignment (
+            schedule_id INTEGER NOT NULL,
+            consumer_id INTEGER NOT NULL,
+            schedule_date TEXT NOT NULL,
+            schedule_due_date TEXT NOT NULL,
+            billing_cycle TEXT,
+            zone_name TEXT NOT NULL,
+            acct_no TEXT,
+            assignment_order INTEGER,
+            reading_route_id TEXT,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            reading_status TEXT NOT NULL DEFAULT 'pending',
+            reading_sync_status TEXT NOT NULL DEFAULT 'pending',
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (schedule_id, consumer_id),
+            FOREIGN KEY (schedule_id) REFERENCES reading_schedule(schedule_id),
+            FOREIGN KEY (consumer_id) REFERENCES consumers(id)
+        );
+
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT,
@@ -201,6 +230,22 @@ def init_db():
         );
     """)
 
+    _ensure_columns(
+        conn,
+        "readings",
+        {
+            "schedule_id": "INTEGER",
+            "schedule_date": "TEXT",
+            "schedule_due_date": "TEXT",
+            "billing_cycle": "TEXT",
+            "reading_route_id": "TEXT",
+            "assignment_order": "INTEGER",
+            "reading_status": "TEXT NOT NULL DEFAULT 'valid'",
+            "reading_sync_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "sync_reading_id": "TEXT",
+            "captured_at": "TEXT",
+        },
+    )
     _ensure_columns(
         conn,
         "consumers",
@@ -230,6 +275,15 @@ def init_db():
     )
     _ensure_columns(
         conn,
+        "reading_assignment",
+        {
+            "acct_no": "TEXT",
+            "assignment_order": "INTEGER",
+            "reading_route_id": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
         "users",
         {
             "account_id": "INTEGER",
@@ -239,6 +293,11 @@ def init_db():
             "account_status": "TEXT",
         },
     )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_schedule_consumer ON readings(schedule_id, consumer_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_reading_date ON readings(reading_date)")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_sync_reading_id ON readings(sync_reading_id) WHERE sync_reading_id IS NOT NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignment_deadline ON reading_assignment(schedule_due_date, is_read)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_receipt_prints_printed_at ON receipt_prints(printed_at)")
     _ensure_columns(
         conn,
         "reading_schedule",
@@ -581,6 +640,46 @@ def _natural_zone_key(value: str) -> tuple:
     return tuple(int(part) if part.isdigit() else part for part in parts)
 
 
+def account_base_group(value) -> str:
+    """Return the first three account-number segments without rewriting the value."""
+    parts = str(value or "").strip().split("-")
+    return "-".join(parts[:3]) if len(parts) >= 3 else str(value or "").strip()
+
+
+def natural_account_key(value) -> tuple:
+    """Naturally order mixed numeric/alphanumeric account-number segments."""
+    segments = str(value or "").strip().split("-")
+    return tuple(
+        tuple((0, int(token)) if token.isdigit() else (1, token.lower())
+              for token in re.findall(r"\d+|[^\d]+", segment))
+        for segment in segments
+    )
+
+
+def assignment_sort_key(row: dict) -> tuple:
+    raw_order = row.get("assignment_order")
+    try:
+        order_key = (0, float(raw_order)) if raw_order not in (None, "") else (1, 0.0)
+    except (TypeError, ValueError):
+        order_key = (1, 0.0)
+    return (*order_key, natural_account_key(row.get("acct_no")), int(row.get("id") or row.get("consumer_id") or 0))
+
+
+def sort_and_mark_nearby(rows: list[dict]) -> list[dict]:
+    """Sort assignments and annotate accounts sharing the same base group."""
+    items = [dict(row) for row in rows]
+    counts: dict[str, int] = {}
+    for item in items:
+        base = account_base_group(item.get("acct_no"))
+        if base:
+            counts[base] = counts.get(base, 0) + 1
+    for item in items:
+        base = account_base_group(item.get("acct_no"))
+        item["account_base"] = base
+        item["is_nearby_connection"] = bool(base and counts.get(base, 0) > 1)
+    return sorted(items, key=assignment_sort_key)
+
+
 def replace_reading_schedules_from_sync(
     schedules: list[dict],
     meter_reader_id: int | str | None,
@@ -683,19 +782,42 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
     rows = conn.execute(
         """
         SELECT schedule_id,
+               meter_reader_id,
                COALESCE(start_date, schedule_date) AS start_date,
                COALESCE(due_date, start_date, schedule_date) AS due_date,
                billing_month, zone_name, status,
                cached_consumer_count, cache_verified_at,
+               (SELECT COUNT(*) FROM reading_assignment ra
+                WHERE ra.schedule_id = reading_schedule.schedule_id) AS assignment_count,
+               (SELECT COUNT(*) FROM reading_assignment ra
+                WHERE ra.schedule_id = reading_schedule.schedule_id AND ra.is_read = 0) AS unread_count,
                CASE
-                   WHEN lower(status) IN ('completed', 'cancelled') THEN status
                    WHEN date(COALESCE(due_date, start_date, schedule_date)) < date('now') THEN 'Overdue'
+                   WHEN lower(status) IN ('completed', 'cancelled') THEN status
                    ELSE status
                END AS display_status
         FROM reading_schedule
         WHERE meter_reader_id = ?
-          AND lower(status) NOT IN ('completed', 'cancelled')
-        ORDER BY date(COALESCE(start_date, schedule_date)), zone_name, schedule_id
+          AND lower(status) <> 'cancelled'
+          AND (
+              lower(status) <> 'completed'
+              OR EXISTS (
+                  SELECT 1 FROM reading_assignment ra
+                  WHERE ra.schedule_id = reading_schedule.schedule_id AND ra.is_read = 0
+              )
+          )
+        ORDER BY
+          CASE
+            WHEN date(COALESCE(start_date, schedule_date)) <= date('now')
+             AND date(COALESCE(due_date, start_date, schedule_date)) >= date('now') THEN 0
+            WHEN date(COALESCE(start_date, schedule_date)) > date('now') THEN 1
+            ELSE 2
+          END,
+          CASE WHEN date(COALESCE(start_date, schedule_date)) > date('now')
+               THEN date(COALESCE(start_date, schedule_date)) END ASC,
+          CASE WHEN date(COALESCE(due_date, start_date, schedule_date)) < date('now')
+               THEN date(COALESCE(due_date, start_date, schedule_date)) END DESC,
+          zone_name, schedule_id
         """,
         (reader_id,),
     ).fetchall()
@@ -735,11 +857,35 @@ def mark_route_cache_verified(
 
 # ─── Query helpers ────────────────────────────────────────────────────────────
 
+def _attach_assignment_context(conn: sqlite3.Connection, item: dict, schedule_id: int | None) -> dict:
+    if schedule_id is None or not item:
+        return item
+    assignment = conn.execute(
+        """
+        SELECT schedule_id, consumer_id, schedule_date, schedule_due_date, billing_cycle,
+               zone_name, acct_no, assignment_order, reading_route_id,
+               is_read, reading_status, reading_sync_status
+        FROM reading_assignment
+        WHERE schedule_id = ? AND consumer_id = ?
+        LIMIT 1
+        """,
+        (schedule_id, int(item.get("id") or item.get("consumer_id"))),
+    ).fetchone()
+    if assignment:
+        context = dict(assignment)
+        if context.get("acct_no") not in (None, ""):
+            item["acct_no"] = context["acct_no"]
+        context.pop("acct_no", None)
+        item.update(context)
+    return item
+
+
 def search_consumer(
     meter_no: str,
     unread_only: bool = True,
     schedule_date: str | None = None,
     meter_reader_id: int | str | None = None,
+    schedule_id: int | str | None = None,
 ) -> dict | None:
     """Look up a consumer by meter/account/name. Returns dict or None."""
     conn = get_connection()
@@ -772,7 +918,19 @@ def search_consumer(
                  OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') = ?
              )"""
     params: list[object] = [meter_no, meter_no, meter_no, normalized, normalized]
-    if use_schedule_filter:
+    try:
+        selected_schedule_id = int(schedule_id) if schedule_id not in (None, "") else None
+    except (TypeError, ValueError):
+        selected_schedule_id = None
+    if use_schedule_filter and selected_schedule_id is not None:
+        sql += """
+               AND EXISTS (
+                   SELECT 1 FROM reading_assignment ra
+                   WHERE ra.consumer_id = c.id AND ra.schedule_id = ?
+               )
+        """
+        params.append(selected_schedule_id)
+    elif use_schedule_filter:
         sql += """
                AND EXISTS (
                    SELECT 1
@@ -786,7 +944,15 @@ def search_consumer(
         """
         params.extend([effective_reader_id, month_end, month_start])
     if unread_only:
-        if use_schedule_filter:
+        if use_schedule_filter and selected_schedule_id is not None:
+            sql += """
+               AND EXISTS (
+                   SELECT 1 FROM reading_assignment ra
+                   WHERE ra.consumer_id = c.id AND ra.schedule_id = ? AND ra.is_read = 0
+               )
+            """
+            params.append(selected_schedule_id)
+        elif use_schedule_filter:
             sql += """
                AND NOT EXISTS (
                    SELECT 1
@@ -823,16 +989,16 @@ def search_consumer(
         meter_no, meter_no, meter_no, normalized, normalized,
     )
     row = conn.execute(sql, params).fetchone()
+    data = _attach_assignment_context(conn, dict(row), selected_schedule_id) if row else None
     conn.close()
-    if row:
-        return dict(row)
-    return None
+    return data
 
 
 def get_consumer_by_id(
     consumer_id: int | str,
     schedule_date: str | None = None,
     meter_reader_id: int | str | None = None,
+    schedule_id: int | str | None = None,
 ) -> dict | None:
     """Look up a consumer by exact local/remote consumer id."""
     conn = get_connection()
@@ -858,7 +1024,19 @@ def get_consumer_by_id(
              JOIN zones z ON c.zone_id = z.id
              WHERE c.id = ?"""
     params: list[object] = [int(consumer_id)]
-    if use_schedule_filter:
+    try:
+        selected_schedule_id = int(schedule_id) if schedule_id not in (None, "") else None
+    except (TypeError, ValueError):
+        selected_schedule_id = None
+    if use_schedule_filter and selected_schedule_id is not None:
+        sql += """
+               AND EXISTS (
+                   SELECT 1 FROM reading_assignment ra
+                   WHERE ra.consumer_id = c.id AND ra.schedule_id = ?
+               )
+        """
+        params.append(selected_schedule_id)
+    elif use_schedule_filter:
         sql += """
                AND EXISTS (
                    SELECT 1
@@ -873,8 +1051,9 @@ def get_consumer_by_id(
         params.extend([effective_reader_id, month_end, month_start])
     sql += " LIMIT 1"
     row = conn.execute(sql, params).fetchone()
+    data = _attach_assignment_context(conn, dict(row), selected_schedule_id) if row else None
     conn.close()
-    return dict(row) if row else None
+    return data
 
 
 
@@ -885,6 +1064,7 @@ def search_consumers_by_zone(
     unread_only: bool = True,
     schedule_date: str | None = None,
     meter_reader_id: int | str | None = None,
+    schedule_id: int | str | None = None,
 ) -> list[dict]:
     """Search consumers by partial meter_no or name, filtered to a specific zone."""
     conn = get_connection()
@@ -920,7 +1100,19 @@ def search_consumers_by_zone(
                    OR REPLACE(REPLACE(c.acct_no, '-', ''), ' ', '') LIKE ?
                )"""
     params: list[object] = [zone_name, like_pattern, like_pattern, like_pattern, normalized_like, normalized_like]
-    if use_schedule_filter:
+    try:
+        selected_schedule_id = int(schedule_id) if schedule_id not in (None, "") else None
+    except (TypeError, ValueError):
+        selected_schedule_id = None
+    if use_schedule_filter and selected_schedule_id is not None:
+        sql += """
+               AND EXISTS (
+                   SELECT 1 FROM reading_assignment ra
+                   WHERE ra.consumer_id = c.id AND ra.schedule_id = ?
+               )
+        """
+        params.append(selected_schedule_id)
+    elif use_schedule_filter:
         sql += """
                AND EXISTS (
                    SELECT 1
@@ -934,7 +1126,15 @@ def search_consumers_by_zone(
         """
         params.extend([effective_reader_id, month_end, month_start])
     if unread_only:
-        if use_schedule_filter:
+        if use_schedule_filter and selected_schedule_id is not None:
+            sql += """
+               AND EXISTS (
+                   SELECT 1 FROM reading_assignment ra
+                   WHERE ra.consumer_id = c.id AND ra.schedule_id = ? AND ra.is_read = 0
+               )
+            """
+            params.append(selected_schedule_id)
+        elif use_schedule_filter:
             sql += """
                AND NOT EXISTS (
                    SELECT 1 FROM readings r
@@ -955,11 +1155,18 @@ def search_consumers_by_zone(
                    SELECT 1 FROM readings r WHERE r.consumer_id = c.id
                )
             """
-    sql += " ORDER BY c.meter_no LIMIT ?"
-    params.append(limit)
+    if selected_schedule_id is None:
+        sql += " ORDER BY c.meter_no LIMIT ?"
+        params.append(limit)
     rows = conn.execute(sql, tuple(params)).fetchall()
+    results = [
+        _attach_assignment_context(conn, dict(row), selected_schedule_id)
+        for row in rows
+    ]
     conn.close()
-    return [dict(r) for r in rows]
+    if selected_schedule_id is not None:
+        return sort_and_mark_nearby(results)[:limit]
+    return sort_and_mark_nearby(results)
 
 
 def save_reading(
@@ -969,22 +1176,48 @@ def save_reading(
     exception: str = "None",
     is_flagged: bool = False,
     reading_date: str | None = None,
+    *,
+    schedule_id: int | str | None = None,
+    schedule_date: str | None = None,
+    schedule_due_date: str | None = None,
+    billing_cycle: str | None = None,
+    reading_route_id: int | str | None = None,
+    assignment_order: int | str | None = None,
+    reading_status: str = "valid",
+    reading_sync_status: str = "pending",
+    sync_reading_id: str | None = None,
+    captured_at: str | None = None,
 ):
-    """Insert a new reading record and update the consumer's previous reading."""
+    """Insert a reading and attach it to the exact field assignment when available."""
     conn = get_connection()
     cur = conn.cursor()
-    if reading_date:
-        cur.execute(
-            "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged, reading_date) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0, reading_date),
-        )
-    else:
-        cur.execute(
-            "INSERT INTO readings (consumer_id, present_reading, consumption, exception, is_flagged) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0),
-        )
+    normalized_status = str(reading_status or "valid").strip().lower()
+    normalized_sync = str(reading_sync_status or "pending").strip().lower()
+    try:
+        normalized_assignment_order = int(float(assignment_order)) if assignment_order not in (None, "") else None
+    except (TypeError, ValueError):
+        normalized_assignment_order = None
+    captured = captured_at or datetime.now().astimezone().isoformat()
+    cur.execute(
+        """
+        INSERT INTO readings (
+            consumer_id, present_reading, consumption, exception, is_flagged, reading_date,
+            schedule_id, schedule_date, schedule_due_date, billing_cycle,
+            reading_route_id, assignment_order,
+            reading_status, reading_sync_status, sync_reading_id, captured_at
+        ) VALUES (?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0, reading_date,
+            int(schedule_id) if schedule_id not in (None, "") else None,
+            _normalize_schedule_date(schedule_date), _normalize_schedule_date(schedule_due_date),
+            str(billing_cycle or "").strip() or None,
+            str(reading_route_id) if reading_route_id not in (None, "") else None,
+            normalized_assignment_order,
+            normalized_status, normalized_sync,
+            str(sync_reading_id or "").strip() or None, captured,
+        ),
+    )
     effective_reading_date = str(reading_date).strip() if reading_date else date.today().isoformat()
     conn.execute(
         """
@@ -996,10 +1229,58 @@ def save_reading(
         """,
         (present_reading, present_reading, effective_reading_date, consumer_id),
     )
+    if schedule_id not in (None, ""):
+        is_valid = normalized_status not in {"rejected", "deleted", "invalid"}
+        conn.execute(
+            """
+            UPDATE reading_assignment
+            SET is_read = ?, reading_status = ?, reading_sync_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE schedule_id = ? AND consumer_id = ?
+            """,
+            (1 if is_valid else 0, normalized_status, normalized_sync, int(schedule_id), int(consumer_id)),
+        )
     conn.commit()
     reading_id = cur.lastrowid
     conn.close()
     return reading_id
+
+
+def update_reading_sync_state(
+    sync_reading_id: str,
+    sync_status: str,
+    reading_status: str | None = None,
+) -> bool:
+    """Update the local reading and its assignment after a queue/sync outcome."""
+    key = str(sync_reading_id or "").strip()
+    if not key:
+        return False
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, consumer_id, schedule_id, reading_status FROM readings WHERE sync_reading_id = ? LIMIT 1",
+        (key,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return False
+    normalized_sync = str(sync_status or "pending").strip().lower()
+    normalized_reading = str(reading_status or row["reading_status"] or "valid").strip().lower()
+    conn.execute(
+        "UPDATE readings SET reading_sync_status = ?, reading_status = ? WHERE id = ?",
+        (normalized_sync, normalized_reading, row["id"]),
+    )
+    if row["schedule_id"] is not None:
+        valid = normalized_reading not in {"rejected", "deleted", "invalid"}
+        conn.execute(
+            """
+            UPDATE reading_assignment
+            SET is_read = ?, reading_status = ?, reading_sync_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE schedule_id = ? AND consumer_id = ?
+            """,
+            (1 if valid else 0, normalized_reading, normalized_sync, row["schedule_id"], row["consumer_id"]),
+        )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def save_receipt_print(
@@ -1102,13 +1383,18 @@ def get_latest_receipt_print(consumer_id: int | None = None) -> dict | None:
     return data
 
 
-def list_receipt_print_history(search_text: str = "", limit: int = 200) -> list[dict]:
-    """Return recent receipt print history rows for preview and reprint."""
+def list_receipt_print_history(
+    search_text: str = "",
+    month: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Return persisted receipt history, optionally filtered by reading month."""
     conn = get_connection()
-    normalized_limit = max(1, min(int(limit or 200), 500))
     sql = """
         SELECT
             rp.*,
+            COALESCE(r.reading_date, rp.printed_at) AS history_date,
+            strftime('%Y-%m', COALESCE(r.reading_date, rp.printed_at)) AS history_month,
             (
                 SELECT COUNT(*)
                 FROM receipt_prints rp_count
@@ -1123,25 +1409,52 @@ def list_receipt_print_history(search_text: str = "", limit: int = 200) -> list[
                   AND rp_count.print_action = 'reprint'
             ) AS reprint_count
         FROM receipt_prints rp
+        LEFT JOIN readings r ON r.id = rp.reading_id
     """
     params: list[object] = []
+    conditions: list[str] = []
     trimmed = (search_text or "").strip()
     if trimmed:
         like = f"%{trimmed}%"
-        sql += """
-            WHERE CAST(rp.id AS TEXT) LIKE ?
+        conditions.append("""(
+               CAST(rp.id AS TEXT) LIKE ?
                OR COALESCE(rp.acct_no, '') LIKE ?
                OR COALESCE(rp.consumer_name, '') LIKE ?
                OR COALESCE(rp.meter_no, '') LIKE ?
                OR COALESCE(rp.zone_name, '') LIKE ?
                OR COALESCE(rp.receipt_text, '') LIKE ?
-        """
+            )""")
         params.extend([like, like, like, like, like, like])
-    sql += " ORDER BY rp.printed_at DESC, rp.id DESC LIMIT ?"
-    params.append(normalized_limit)
+    normalized_month = str(month or "").strip()
+    if normalized_month:
+        conditions.append("strftime('%Y-%m', COALESCE(r.reading_date, rp.printed_at)) = ?")
+        params.append(normalized_month)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY datetime(rp.printed_at) DESC, rp.id DESC"
+    if limit is not None:
+        normalized_limit = max(1, int(limit))
+        sql += " LIMIT ?"
+        params.append(normalized_limit)
     rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def list_receipt_print_months() -> list[str]:
+    """Return every persisted receipt month, newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT strftime('%Y-%m', COALESCE(r.reading_date, rp.printed_at)) AS history_month
+        FROM receipt_prints rp
+        LEFT JOIN readings r ON r.id = rp.reading_id
+        WHERE COALESCE(r.reading_date, rp.printed_at) IS NOT NULL
+        ORDER BY history_month DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [str(row["history_month"]) for row in rows if row["history_month"]]
 
 
 def get_receipt_print_by_id(receipt_print_id: int) -> dict | None:
@@ -1278,12 +1591,42 @@ def get_zone_consumers_with_status(
     zone_name: str,
     schedule_date: str | None = None,
     meter_reader_id: int | str | None = None,
+    schedule_id: int | str | None = None,
 ) -> list[dict]:
     """Return all consumers in a zone with their reading status."""
     conn = get_connection()
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
-    if use_schedule_filter:
+    selected_schedule_id = None
+    try:
+        selected_schedule_id = int(schedule_id) if schedule_id not in (None, "") else None
+    except (TypeError, ValueError):
+        selected_schedule_id = None
+    if use_schedule_filter and selected_schedule_id is not None:
+        sql = """SELECT
+            c.id, c.meter_no, COALESCE(ra.acct_no, c.acct_no) AS acct_no,
+            c.name, c.address, c.previous_reading,
+            c.latest_reading, c.latest_reading_date, c.classification_id, c.classification_name,
+            c.minimum_cubic, c.minimum_rate, c.excess_rate_per_cubic, c.due_days,
+            c.penalty_percent, c.billing_month, c.date_covered_from, c.date_covered_to,
+            c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty,
+            c.total_after_due_date, c.bill_status, c.late_fee,
+            ra.schedule_id, ra.schedule_date, ra.schedule_due_date, ra.billing_cycle,
+            ra.assignment_order, ra.reading_route_id,
+            ra.zone_name, ra.is_read, ra.reading_status, ra.reading_sync_status,
+            r.present_reading AS reading_value, r.consumption, r.reading_date,
+            r.exception, r.is_flagged, r.captured_at
+        FROM reading_assignment ra
+        JOIN consumers c ON c.id = ra.consumer_id
+        LEFT JOIN readings r ON r.id = (
+            SELECT MAX(r2.id) FROM readings r2
+            WHERE r2.consumer_id = ra.consumer_id AND r2.schedule_id = ra.schedule_id
+              AND lower(COALESCE(r2.reading_status, 'valid')) NOT IN ('rejected', 'deleted', 'invalid')
+        )
+        WHERE ra.schedule_id = ? AND ra.zone_name = ?
+        """
+        params = (selected_schedule_id, zone_name)
+    elif use_schedule_filter:
         sql = """SELECT 
             c.id,
             c.meter_no,
@@ -1411,7 +1754,34 @@ def get_zone_consumers_with_status(
         params = (zone_name,)
     rows = conn.execute(sql, params).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+    today = date.today()
+    for item in results:
+        due = _normalize_schedule_date(item.get("schedule_due_date") or item.get("due_date"))
+        scheduled = _normalize_schedule_date(item.get("schedule_date"))
+        item["schedule_date"] = scheduled
+        item["schedule_due_date"] = due
+        if item.get("is_read"):
+            item["deadline_status"] = "Completed"
+            item["deadline_days"] = None
+            continue
+        try:
+            delta = (date.fromisoformat(due) - today).days if due else None
+        except ValueError:
+            delta = None
+        item["deadline_days"] = delta
+        if delta is None or delta > 2:
+            item["deadline_status"] = "Pending"
+        elif delta == 2:
+            item["deadline_status"] = "Due in 2d"
+        elif delta == 1:
+            item["deadline_status"] = "Due in 1d"
+        elif delta == 0:
+            item["deadline_status"] = "Due today"
+        else:
+            overdue_days = abs(delta)
+            item["deadline_status"] = f"Overdue {overdue_days}d"
+    return sort_and_mark_nearby(results)
 
 
 def replace_consumers_from_sync(consumers: list[dict]) -> int:
@@ -1483,7 +1853,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         if zone_id is None:
             continue
 
-        acct_no = (c.get("acct_no") or "").strip()
+        # Account numbers are identifiers, not numbers. Preserve every segment
+        # exactly as supplied by the assignment service (for example A1 or 0).
+        acct_no = str(c.get("acct_no") or "").strip()
         name = _clean_display_name(c.get("name")) or "Unknown"
         address = (str(c.get("address")).strip() if c.get("address") not in (None, "") else None)
         previous_reading = int(c.get("previous_reading") or 0)
@@ -1513,7 +1885,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         late_fee = _optional_float(c.get("late_fee"))
         latest_reading = _optional_float(c.get("latest_reading"))
         latest_reading_date = (str(c.get("latest_reading_date") or c.get("latest_reading_updated_at")).strip() if c.get("latest_reading_date") not in (None, "") or c.get("latest_reading_updated_at") not in (None, "") else None)
-        cid = c.get("id")
+        cid = c.get("id") or c.get("consumer_id")
 
         local_consumer_id = None
         if cid is not None:
@@ -1637,6 +2009,95 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     (local_consumer_id, int(round(float(latest_reading))), consumption, "Synced", 0, latest_reading_date),
                 )
                 latest_local_readings[local_consumer_id] = latest_reading
+
+        if local_consumer_id is not None:
+            raw_schedule_id = c.get("schedule_id", c.get("Schedule_ID"))
+            schedule_row = None
+            if raw_schedule_id not in (None, ""):
+                try:
+                    schedule_row = cur.execute(
+                        """
+                        SELECT schedule_id, COALESCE(start_date, schedule_date) AS schedule_date,
+                               COALESCE(due_date, start_date, schedule_date) AS schedule_due_date,
+                               billing_month, zone_name
+                        FROM reading_schedule WHERE schedule_id = ? LIMIT 1
+                        """,
+                        (int(raw_schedule_id),),
+                    ).fetchone()
+                except (TypeError, ValueError):
+                    schedule_row = None
+            if schedule_row is None:
+                candidates = cur.execute(
+                    """
+                    SELECT schedule_id, COALESCE(start_date, schedule_date) AS schedule_date,
+                           COALESCE(due_date, start_date, schedule_date) AS schedule_due_date,
+                           billing_month, zone_name
+                    FROM reading_schedule
+                    WHERE zone_name = ? AND lower(status) NOT IN ('cancelled')
+                    ORDER BY date(COALESCE(start_date, schedule_date)) DESC
+                    """,
+                    (zone_name,),
+                ).fetchall()
+                if len(candidates) == 1:
+                    schedule_row = candidates[0]
+                elif billing_month:
+                    matching = [row for row in candidates if str(row["billing_month"] or "") == billing_month]
+                    if len(matching) == 1:
+                        schedule_row = matching[0]
+            if schedule_row is not None:
+                raw_assignment_order = c.get("assignment_order", c.get("Assignment_Order"))
+                try:
+                    assignment_order = int(float(raw_assignment_order)) if raw_assignment_order not in (None, "") else None
+                except (TypeError, ValueError):
+                    assignment_order = None
+                reading_route_id = c.get("reading_route_id", c.get("Reading_Route_ID"))
+                reading_route_id = str(reading_route_id) if reading_route_id not in (None, "") else None
+                remote_status = str(c.get("reading_status") or "").strip().lower()
+                raw_is_read = c.get("is_read")
+                remote_is_read = str(raw_is_read).strip().lower() in {"1", "true", "yes"}
+                remote_is_read = remote_is_read and remote_status not in {"rejected", "deleted", "invalid"}
+                assignment_status = "valid" if remote_is_read else (remote_status or "pending")
+                remote_sync = str(c.get("reading_sync_status") or ("synced" if remote_is_read else "pending")).strip().lower()
+                cur.execute(
+                    """
+                    INSERT INTO reading_assignment (
+                        schedule_id, consumer_id, schedule_date, schedule_due_date,
+                        billing_cycle, zone_name, acct_no, assignment_order, reading_route_id,
+                        is_read, reading_status, reading_sync_status, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(schedule_id, consumer_id) DO UPDATE SET
+                        schedule_date = excluded.schedule_date,
+                        schedule_due_date = excluded.schedule_due_date,
+                        billing_cycle = excluded.billing_cycle,
+                        zone_name = excluded.zone_name,
+                        acct_no = excluded.acct_no,
+                        assignment_order = excluded.assignment_order,
+                        reading_route_id = excluded.reading_route_id,
+                        is_read = CASE
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                             AND reading_assignment.reading_status = 'valid' THEN 1
+                            ELSE excluded.is_read
+                        END,
+                        reading_status = CASE
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                             AND reading_assignment.reading_status = 'valid' THEN reading_assignment.reading_status
+                            ELSE excluded.reading_status
+                        END,
+                        reading_sync_status = CASE
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                             AND reading_assignment.reading_status = 'valid' THEN reading_assignment.reading_sync_status
+                            ELSE excluded.reading_sync_status
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        schedule_row["schedule_id"], local_consumer_id, schedule_row["schedule_date"],
+                        schedule_row["schedule_due_date"],
+                        c.get("billing_cycle") or schedule_row["billing_month"], schedule_row["zone_name"],
+                        acct_no, assignment_order, reading_route_id,
+                        1 if remote_is_read else 0, assignment_status, remote_sync,
+                    ),
+                )
         upserted += 1
 
     conn.commit()

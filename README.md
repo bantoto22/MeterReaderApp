@@ -116,3 +116,40 @@ Device -> https://aspire.tail3de291.ts.net/api -> Node backend:3001 -> PostgreSQ
 - Sync badges are shown in Meter Entry: `Online`, `Offline`, `Pending Sync`, `Sync Failed`.
 - Pending count is displayed.
 - `Sync Now` triggers manual queue flush.
+
+### Schedule-assignment API contract
+
+To keep missed readings available, `/api/handheld/consumers` must return one row per
+consumer assignment with `consumer_id`, the complete text `acct_no`,
+`assignment_order`, `schedule_id`, `reading_route_id`, `schedule_date`,
+`schedule_due_date`, `billing_cycle`, `zone_name`, `is_read`, `reading_status`, and
+`reading_sync_status`. Account numbers must be returned without numeric coercion or
+segment rewriting (for example `02-11-152-0` and `02-11-152-A1`). The endpoint must
+include unread assignments after their due
+date and must not treat a schedule status change as completion.
+
+Reading-bundle requests carry `consumer_id`, `schedule_id`, `reading_route_id`,
+`assignment_order`, the same schedule fields, and `captured_at`. The account number
+is included for identification only and is not the reading's database key. The
+backend must persist `schedule_id` on the meter reading, accept a valid late
+reading, and clear reader/biller exceptions only after that reading is committed.
+Rejected or deleted readings must leave the assignment pending.
+
+Schedules are grouped on the device only when meter reader, scheduled date, due
+date, and billing cycle match. Each grouped route keeps its zone schedules and
+their original IDs. “All zones” is a display filter only: consumer lookup,
+deadline state, offline completion, and reading submission always use the
+`schedule_id` belonging to the consumer's zone.
+
+Expired schedules with unread assignments are also carried into the prioritized
+active route automatically. They remain available under Past schedules, but the
+reader does not need to open that selector to discover or process them. Carry-over
+rows retain their expired schedule dates and original zone `schedule_id`.
+
+Within a grouped route, the device uses `assignment_order` as the authoritative
+sequence and never redistributes consumers between readers. Rows without an order
+fall back to segment-aware account sorting, so `152-0`, `152-A1`, `152-A2`, and
+`152-B1` remain together. Searches match both the complete account number and its
+first-three-segment base group. The raw offline assignment cache stores the account
+text, order, route ID, and zone-specific schedule ID so the same behavior survives
+a device restart.

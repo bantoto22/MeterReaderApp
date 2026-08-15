@@ -484,19 +484,44 @@ Rectangle {
                 onTextChanged: { if (bridgeObj) bridgeObj.refreshPrintHistory(text) }
             }
 
-            ScrollView {
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                ComboBox {
+                    id: historyMonth
+                    Layout.fillWidth: true
+                    textRole: "label"
+                    valueRole: "value"
+                    model: bridgeObj ? bridgeObj.printHistoryMonthOptions : []
+                    currentIndex: {
+                        if (!bridgeObj) return 0
+                        var values = bridgeObj.printHistoryMonthOptions.map(function(item) { return item.value })
+                        return Math.max(0, values.indexOf(bridgeObj.selectedPrintHistoryMonth))
+                    }
+                    onActivated: { if (bridgeObj) bridgeObj.setPrintHistoryMonth(currentValue) }
+                }
+
+                Text {
+                    text: bridgeObj ? (bridgeObj.printHistoryRecords.length + " records") : "0 records"
+                    font.family: "Montserrat"
+                    font.pixelSize: TouchMetrics.helperText
+                    color: "#526176"
+                }
+            }
+
+            ListView {
+                id: historyList
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-
-                ListView {
-                    id: historyList
-                    width: parent.width
-                    model: bridgeObj ? bridgeObj.printHistoryRecords : []
-                    spacing: 8
+                model: bridgeObj ? bridgeObj.printHistoryRecords : []
+                spacing: 8
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
                     delegate: Rectangle {
-                        width: historyList.width
+                        width: Math.max(0, historyList.width - 12)
                         height: 116
                         radius: 10
                         color: "#F8FAFD"
@@ -550,7 +575,6 @@ Rectangle {
                             }
                         }
                     }
-                }
             }
 
             Button {

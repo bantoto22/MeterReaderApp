@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -51,6 +52,21 @@ def _load_env_fallback(env_path: str) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _update_local_reading_state(reading_id: str | None, sync_status: str, reading_status: str | None = None) -> None:
+    """Best-effort bridge from queue outcomes to the schedule-scoped local reading."""
+    if not reading_id:
+        return
+    try:
+        try:
+            from .database import update_reading_sync_state
+        except ImportError:
+            from database import update_reading_sync_state
+        update_reading_sync_state(str(reading_id), sync_status, reading_status)
+    except Exception:
+        # Queue persistence remains authoritative; a later refresh can reconcile state.
+        return
 
 
 def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> str:
@@ -103,6 +119,22 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def _cached_assignment_sort_key(row: dict) -> tuple:
+    """Use backend order first and a segment-aware account order as fallback."""
+    raw_order = row.get("assignment_order")
+    try:
+        order_key = (0, float(raw_order)) if raw_order not in (None, "") else (1, 0.0)
+    except (TypeError, ValueError):
+        order_key = (1, 0.0)
+    account_segments = []
+    for segment in str(row.get("acct_no") or "").strip().split("-"):
+        account_segments.append(tuple(
+            (0, int(token)) if token.isdigit() else (1, token.lower())
+            for token in re.findall(r"\d+|[^\d]+", segment)
+        ))
+    return (*order_key, tuple(account_segments), int(row.get("consumer_id") or row.get("id") or 0))
+
+
 def _parse_date(value) -> date | None:
     if value in (None, ""):
         return None
@@ -146,10 +178,7 @@ def _reading_date(value) -> date:
 def _device_schedule_window(today: date | None = None) -> tuple[str, str]:
     anchor = today or datetime.now().date()
     current_month_start = anchor.replace(day=1)
-    if current_month_start.month == 1:
-        start = current_month_start.replace(year=current_month_start.year - 1, month=12)
-    else:
-        start = current_month_start.replace(month=current_month_start.month - 1)
+    start = current_month_start.replace(year=current_month_start.year - 1)
     year = current_month_start.year + ((current_month_start.month) // 12)
     month = 1 if current_month_start.month == 12 else current_month_start.month + 1
     next_month_start = date(year, month, 1)
@@ -403,9 +432,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             except (TypeError, ValueError):
                 classification_id = None
         return (
-            _safe_int(row.get("id"), None),
+            _safe_int(row.get("id") or row.get("consumer_id"), None),
             meter_no,
-            row.get("acct_no"),
+            str(row.get("acct_no") or ""),
             row.get("name", ""),
             row.get("address") or row.get("consumer_address") or row.get("service_address"),
             row.get("zone_name"),
@@ -529,6 +558,23 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             late_fee REAL,
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS handheld_assignments_cache (
+            schedule_id INTEGER NOT NULL,
+            consumer_id INTEGER NOT NULL,
+            acct_no TEXT,
+            assignment_order INTEGER,
+            reading_route_id TEXT,
+            zone_name TEXT,
+            schedule_date TEXT,
+            schedule_due_date TEXT,
+            billing_cycle TEXT,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            reading_status TEXT NOT NULL DEFAULT 'pending',
+            reading_sync_status TEXT NOT NULL DEFAULT 'pending',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (schedule_id, consumer_id)
         );
 
         CREATE TABLE IF NOT EXISTS reading_schedule (
@@ -738,26 +784,72 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 if not params:
                     continue
                 conn.execute(sql, params)
+                schedule_id = item.get("schedule_id", item.get("Schedule_ID"))
+                consumer_id = item.get("id") or item.get("consumer_id")
+                if schedule_id not in (None, "") and consumer_id not in (None, ""):
+                    raw_order = item.get("assignment_order", item.get("Assignment_Order"))
+                    try:
+                        assignment_order = int(float(raw_order)) if raw_order not in (None, "") else None
+                    except (TypeError, ValueError):
+                        assignment_order = None
+                    raw_is_read = item.get("is_read")
+                    is_read = 1 if str(raw_is_read).strip().lower() in {"1", "true", "yes"} else 0
+                    conn.execute(
+                        """
+                        INSERT INTO handheld_assignments_cache (
+                            schedule_id, consumer_id, acct_no, assignment_order, reading_route_id,
+                            zone_name, schedule_date, schedule_due_date, billing_cycle,
+                            is_read, reading_status, reading_sync_status, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(schedule_id, consumer_id) DO UPDATE SET
+                            acct_no = excluded.acct_no,
+                            assignment_order = excluded.assignment_order,
+                            reading_route_id = excluded.reading_route_id,
+                            zone_name = excluded.zone_name,
+                            schedule_date = excluded.schedule_date,
+                            schedule_due_date = excluded.schedule_due_date,
+                            billing_cycle = excluded.billing_cycle,
+                            is_read = excluded.is_read,
+                            reading_status = excluded.reading_status,
+                            reading_sync_status = excluded.reading_sync_status,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            int(schedule_id), int(consumer_id), str(item.get("acct_no") or ""), assignment_order,
+                            str(item.get("reading_route_id", item.get("Reading_Route_ID")) or "") or None,
+                            item.get("zone_name"),
+                            item.get("schedule_date", item.get("Schedule_Date")),
+                            item.get("schedule_due_date", item.get("Schedule_Due_Date")),
+                            item.get("billing_cycle", item.get("Billing_Cycle")), is_read,
+                            str(item.get("reading_status") or "pending"),
+                            str(item.get("reading_sync_status") or "pending"),
+                        ),
+                    )
             conn.commit()
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         base = """
-        SELECT id, meter_no, acct_no, name, address, zone_name, classification_id, classification_name,
-               minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
-               billing_month, date_covered_from, date_covered_to,
-               amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
-               bill_status, late_fee,
-               previous_reading
-        FROM handheld_consumers_cache
+        SELECT hc.id, hc.id AS consumer_id, hc.meter_no, COALESCE(ha.acct_no, hc.acct_no) AS acct_no,
+               hc.name, hc.address, COALESCE(ha.zone_name, hc.zone_name) AS zone_name,
+               hc.classification_id, hc.classification_name,
+               hc.minimum_cubic, hc.minimum_rate, hc.excess_rate_per_cubic, hc.due_days, hc.penalty_percent,
+               hc.billing_month, hc.date_covered_from, hc.date_covered_to,
+               hc.amount_due, hc.previous_balance, hc.due_date, hc.penalty, hc.previous_penalty,
+               hc.total_after_due_date, hc.bill_status, hc.late_fee, hc.previous_reading,
+               ha.schedule_id, ha.assignment_order, ha.reading_route_id,
+               ha.schedule_date, ha.schedule_due_date, ha.billing_cycle,
+               ha.is_read, ha.reading_status, ha.reading_sync_status
+        FROM handheld_consumers_cache hc
+        LEFT JOIN handheld_assignments_cache ha ON ha.consumer_id = hc.id
         """
         params: tuple = ()
         if zone_name:
-            base += " WHERE zone_name = ?"
+            base += " WHERE COALESCE(ha.zone_name, hc.zone_name) = ?"
             params = (zone_name,)
-        base += " ORDER BY meter_no"
+        base += " ORDER BY ha.schedule_id"
         with self._connect() as conn:
             rows = conn.execute(base, params).fetchall()
-        return [dict(row) for row in rows]
+        return sorted((dict(row) for row in rows), key=_cached_assignment_sort_key)
 
     def enqueue_operation(
         self,
@@ -1133,15 +1225,20 @@ class HandheldSyncDataAccess:
             try:
                 schedules: list[dict] = []
                 if effective_reader_id not in (None, ""):
-                    for schedule_status in ("Scheduled", "In Progress"):
-                        schedules.extend(
-                            self.remote.load_reading_schedules(
-                                effective_reader_id,
-                                date_from,
-                                date_to,
-                                schedule_status,
+                    for schedule_status in ("Scheduled", "In Progress", "Completed"):
+                        try:
+                            schedules.extend(
+                                self.remote.load_reading_schedules(
+                                    effective_reader_id,
+                                    date_from,
+                                    date_to,
+                                    schedule_status,
+                                )
                             )
-                        )
+                        except Exception:
+                            # Some backend versions do not accept Completed as a filter.
+                            if schedule_status != "Completed":
+                                raise
                     self.local.cache_reading_schedules(schedules, effective_reader_id, date_from, date_to)
 
                 consumers = self.remote.load_assigned_consumers(
@@ -1194,18 +1291,21 @@ class HandheldSyncDataAccess:
         with self.operation_lock:
             reading = self._normalize_reading(payload)
             queued = self._queue_for_sync("create", reading)
+            _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
             self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
     def _save_or_queue(self, operation: str, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
         queued = self._queue_for_sync(operation, reading)
+        _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
         if not self.is_online():
             self.local.log_audit(queued["id"], "pending", f"Queued offline {operation} operation", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
         try:
             remote = self.remote.save_reading_bundle(reading)
             self.local.mark_target_synced(queued["id"], "backend")
+            _update_local_reading_state(reading.get("reading_id"), "synced", "valid")
             self.local.log_audit(
                 queued["id"],
                 "success",
@@ -1221,6 +1321,7 @@ class HandheldSyncDataAccess:
             }
         except Exception as exc:
             self.local.mark_target_failed(queued["id"], "backend", str(exc))
+            _update_local_reading_state(reading.get("reading_id"), "failed", "valid")
             self.local.log_audit(queued["id"], "failed", f"Backend API save failed, queued for retry: {exc}", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
@@ -1320,12 +1421,14 @@ class HandheldSyncDataAccess:
                 ):
                     reason = "Server has a newer reading for the same consumer and date."
                     self.local.mark_conflict(queue_id, reason, existing, target="backend")
+                    _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")
                     self._audit(queue_id, "conflict", f"Stage: Checking server version\nProblem: {reason}", {"local": payload, "server": existing})
                     conflicts += 1
                     continue
 
                 self.remote.save_reading_bundle(payload)
                 self.local.mark_target_synced(queue_id, "backend")
+                _update_local_reading_state(payload.get("reading_id"), "synced", "valid")
                 self._audit(
                     queue_id,
                     "success",
@@ -1335,6 +1438,7 @@ class HandheldSyncDataAccess:
                 synced += 1
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc), target="backend")
+                _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")
                 diagnostic = format_sync_error("Validating queued reading", exc, self._endpoint())
                 self._audit(queue_id, "conflict", diagnostic, payload)
                 errors.append(diagnostic)
@@ -1347,6 +1451,7 @@ class HandheldSyncDataAccess:
                 )
                 try:
                     self.local.mark_target_failed(queue_id, "backend", str(exc))
+                    _update_local_reading_state(payload.get("reading_id"), "failed", "valid")
                 except Exception as queue_exc:
                     diagnostic += "\n\n" + format_sync_error("Updating the local retry queue", queue_exc)
                 self._audit(queue_id, "failed", diagnostic, payload)

@@ -122,7 +122,7 @@ Rectangle {
                 RowLayout {
                     Layout.fillWidth: true
                     Text {
-                        text: "Search by Meter No."
+                        text: "Search by account or meter"
                         font.pixelSize: TouchMetrics.bodyText
                         font.family: "Montserrat"
                         font.bold: true
@@ -152,7 +152,7 @@ Rectangle {
                             id: txtSearch
                             property string keyboardMode: "alpha"
                             Layout.fillWidth: true
-                            placeholderText: "Type 001, 002..."
+                            placeholderText: "02-11-152 or meter no."
                             text: bridgeObj ? bridgeObj.searchQuery : ""
                             inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferLowercase
                             font.pixelSize: TouchMetrics.bodyText
@@ -196,7 +196,7 @@ Rectangle {
                                     id: suggestionDelegate
                                     width: searchPopup.width
                                     contentItem: Text {
-                                        text: modelData.meter_no + " - " + modelData.name
+                                        text: modelData.acct_no + " — " + modelData.name + (modelData.is_nearby_connection ? " • Nearby connections" : "") + (bridgeObj && bridgeObj.selectedZone === "All zones" ? " (" + modelData.zone_name + ")" : "") + (modelData.is_carry_over ? " • OVERDUE" : "")
                                         color: "#0F172A"
                                         font.family: "Montserrat"
                                         font.pixelSize: 13
@@ -207,7 +207,7 @@ Rectangle {
                                         color: suggestionDelegate.hovered ? "#EFF6FF" : "white"
                                     }
                                     onClicked: {
-                                        if (bridgeObj) bridgeObj.selectSearchSuggestion(modelData.meter_no)
+                                        if (bridgeObj) bridgeObj.selectSearchSuggestion(modelData.meter_no, String(modelData.schedule_id || ""))
                                         searchPopup.close()
                                     }
                                 }

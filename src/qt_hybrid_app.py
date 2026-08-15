@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -70,6 +71,7 @@ try:
         get_consumer_by_id,
         get_latest_receipt_print,
         list_receipt_print_history,
+        list_receipt_print_months,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
@@ -83,6 +85,7 @@ try:
         save_reading,
         search_consumer,
         search_consumers_by_zone,
+        sort_and_mark_nearby,
     )
 except ImportError:
     from database import (
@@ -97,6 +100,7 @@ except ImportError:
         get_consumer_by_id,
         get_latest_receipt_print,
         list_receipt_print_history,
+        list_receipt_print_months,
         get_zone_consumers_with_status,
         get_zone_stats,
         init_db,
@@ -110,6 +114,7 @@ except ImportError:
         save_reading,
         search_consumer,
         search_consumers_by_zone,
+        sort_and_mark_nearby,
     )
 
 try:
@@ -203,11 +208,8 @@ def _month_window(value: datetime.date) -> tuple[str, str]:
 
 def _multi_day_assignment_window(value: datetime.date) -> tuple[str, str]:
     current_start = value.replace(day=1)
-    previous_start = (
-        current_start.replace(year=current_start.year - 1, month=12)
-        if current_start.month == 1
-        else current_start.replace(month=current_start.month - 1)
-    )
+    # Keep a full year of missed routes discoverable while caching two months ahead.
+    previous_start = current_start.replace(year=current_start.year - 1)
     if current_start.month >= 11:
         end_month = current_start.replace(year=current_start.year + 1, month=(current_start.month + 2) % 12 or 12, day=1)
     else:
@@ -252,6 +254,113 @@ def _route_reading_date(
     if normalized_due:
         reading_date = min(reading_date, datetime.fromisoformat(normalized_due).date())
     return reading_date
+
+
+def _group_route_rows(routes: list[dict], today: datetime.date | None = None) -> list[dict]:
+    """Group routes and carry expired unread schedules into the current route."""
+    grouped: dict[tuple[str, str, str, str], dict] = {}
+    for row in routes or []:
+        meter_reader_id = str(row.get("meter_reader_id") or "")
+        start_date = str(row.get("start_date") or "")
+        due_date = str(row.get("due_date") or start_date)
+        billing_month = str(row.get("billing_month") or "")
+        key = (meter_reader_id, start_date, due_date, billing_month)
+        group = grouped.setdefault(
+            key,
+            {
+                "scheduleId": "route|" + "|".join(key),
+                "meterReaderId": meter_reader_id,
+                "startDate": start_date,
+                "dueDate": due_date,
+                "billingMonth": billing_month,
+                "billingDate": _billing_month_date(billing_month, start_date),
+                "schedules": [],
+            },
+        )
+        group["schedules"].append(
+            {
+                "scheduleId": str(row.get("schedule_id") or ""),
+                "zoneName": str(row.get("zone_name") or ""),
+                "status": str(row.get("display_status") or row.get("status") or "Scheduled"),
+                "offlineReady": bool(row.get("cache_verified_at")) and int(row.get("cached_consumer_count") or 0) > 0,
+                "startDate": start_date,
+                "dueDate": due_date,
+                "billingMonth": billing_month,
+                "unreadCount": int(row.get("unread_count") or 0),
+                "isCarryOver": False,
+            }
+        )
+
+    status_rank = {"Overdue": 0, "In Progress": 1, "Scheduled": 2, "Completed": 3}
+    result = []
+    for group in grouped.values():
+        schedules = sorted(group["schedules"], key=lambda item: _natural_display_key(item.get("zoneName")))
+        group["schedules"] = schedules
+        group["viewSchedules"] = list(schedules)
+        group["zones"] = ["All zones"] + list(dict.fromkeys(
+            item["zoneName"] for item in schedules if item.get("zoneName")
+        ))
+        group["zoneName"] = "All zones"
+        group["offlineReady"] = bool(schedules) and all(item.get("offlineReady") for item in schedules)
+        group["carryOverUnreadCount"] = 0
+        group["status"] = min(
+            (str(item.get("status") or "Scheduled") for item in schedules),
+            key=lambda value: status_rank.get(value, 2),
+            default="Scheduled",
+        )
+        zone_count = len(schedules)
+        group["label"] = (
+            f"{zone_count} zone{'s' if zone_count != 1 else ''} | "
+            f"{group['billingMonth'] or group['startDate']}"
+        )
+        result.append(group)
+
+    reference = today or datetime.now().date()
+    reference_text = reference.isoformat()
+    current_groups = [
+        group for group in result
+        if str(group.get("startDate") or reference_text) <= reference_text <= str(group.get("dueDate") or reference_text)
+    ]
+    future_groups = [group for group in result if str(group.get("startDate") or "") > reference_text]
+    target = current_groups[0] if current_groups else (future_groups[0] if future_groups else None)
+    if target:
+        carry_schedules = []
+        for group in result:
+            if group is target or str(group.get("dueDate") or reference_text) >= reference_text:
+                continue
+            if str(group.get("meterReaderId") or "") != str(target.get("meterReaderId") or ""):
+                continue
+            for schedule in group.get("schedules") or []:
+                if int(schedule.get("unreadCount") or 0) > 0:
+                    carry_schedules.append({**schedule, "isCarryOver": True})
+        carry_schedules.sort(key=lambda item: (str(item.get("dueDate") or ""), _natural_display_key(item.get("zoneName"))))
+        if carry_schedules:
+            target["viewSchedules"] = carry_schedules + list(target.get("schedules") or [])
+            target["carryOverUnreadCount"] = sum(int(item.get("unreadCount") or 0) for item in carry_schedules)
+            target["zones"] = ["All zones"] + list(dict.fromkeys(
+                item["zoneName"] for item in target["viewSchedules"] if item.get("zoneName")
+            ))
+            target["offlineReady"] = all(item.get("offlineReady") for item in target["viewSchedules"])
+            target["label"] += f" • {target['carryOverUnreadCount']} overdue"
+    return result
+
+
+def _natural_display_key(value) -> tuple:
+    parts = re.split(r"(\d+)", str(value or "").lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def _zone_schedule(group: dict, zone_name: str = "", schedule_id: str = "") -> dict:
+    """Resolve a grouped route back to one zone-specific schedule."""
+    schedules = list(group.get("viewSchedules") or group.get("schedules") or [])
+    if schedule_id:
+        matched = next(
+            (item for item in schedules if str(item.get("scheduleId")) == str(schedule_id)),
+            None,
+        )
+        if matched:
+            return matched
+    return next((item for item in schedules if str(item.get("zoneName")) == str(zone_name)), {})
 
 
 def _normalize_shutdown_error(detail: str) -> str:
@@ -464,6 +573,7 @@ class AppBridge(QObject):
     testPrintFinished = Signal(bool, str)
     printPreviewBusyChanged = Signal()
     printHistoryRecordsChanged = Signal()
+    printHistoryFiltersChanged = Signal()
     printHistoryDetailChanged = Signal()
     printExecutionFinished = Signal(object)
     assignedDatasetFinished = Signal(object)
@@ -503,9 +613,10 @@ class AppBridge(QObject):
         self._assigned_routes = []
         self._selected_route_id = ""
         self._selected_route_billing_date = ""
-        self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
-        self._selected_zone = self._zones[0] if self._zones else ""
+        self._zones = []
+        self._selected_zone = ""
         self._search_query = ""
+        self._selected_search_schedule_id = ""
         self._search_unread_only = False
 
         self._account_no = "-"
@@ -549,6 +660,9 @@ class AppBridge(QObject):
         self._pending_print_job = None
         self._print_history_records = []
         self._print_history_detail = None
+        self._print_history_months = []
+        self._selected_print_history_month = ""
+        self._print_history_search = ""
 
         self._overall_percentage = 0
         self._overall_fraction = "0/0"
@@ -689,6 +803,7 @@ class AppBridge(QObject):
         self._zone_consumers = []
         self._search_suggestions = []
         self._search_query = ""
+        self._selected_search_schedule_id = ""
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
         self.zonesChanged.emit()
@@ -701,6 +816,68 @@ class AppBridge(QObject):
         self._status_time = datetime.now().strftime("%I:%M %p")
         self.statusTimeChanged.emit()
 
+    def _route_schedules(self, zone_name: str | None = None) -> list[dict]:
+        route = self._selected_route()
+        schedules = list(route.get("viewSchedules") or route.get("schedules") or [])
+        effective_zone = str(zone_name if zone_name is not None else self._selected_zone or "")
+        if effective_zone and effective_zone != "All zones":
+            schedules = [item for item in schedules if str(item.get("zoneName")) == effective_zone]
+        return schedules
+
+    def _schedule_for_consumer(self, consumer: dict | None = None) -> dict:
+        source = consumer or self._consumer or {}
+        explicit_schedule_id = str(source.get("schedule_id") or "")
+        zone_name = str(source.get("zone_name") or self._selected_zone or "")
+        return _zone_schedule(self._selected_route(), zone_name, explicit_schedule_id)
+
+    def _selected_route_consumer_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        for schedule in self._route_schedules():
+            schedule_id = schedule.get("scheduleId")
+            zone_name = str(schedule.get("zoneName") or "")
+            if not schedule_id or not zone_name:
+                continue
+            for row in get_zone_consumers_with_status(
+                zone_name,
+                schedule_date=self.selectedBillingDate,
+                meter_reader_id=self._meter_reader_account_id or None,
+                schedule_id=schedule_id,
+            ):
+                item = dict(row)
+                item["schedule_id"] = int(schedule_id)
+                item["is_carry_over"] = bool(schedule.get("isCarryOver"))
+                rows.append(item)
+        # A grouped route can contain several zone-specific schedules. Sort the
+        # combined list once while preserving every item's original schedule_id.
+        return sort_and_mark_nearby(rows)
+
+    def _search_selected_route(self, query: str, limit: int, unread_only: bool) -> list[dict]:
+        matches: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+        for schedule in self._route_schedules():
+            schedule_id = schedule.get("scheduleId")
+            zone_name = str(schedule.get("zoneName") or "")
+            if not schedule_id or not zone_name:
+                continue
+            rows = search_consumers_by_zone(
+                query,
+                zone_name,
+                limit=max(limit, 50),
+                unread_only=unread_only,
+                schedule_date=self.selectedBillingDate,
+                meter_reader_id=self._meter_reader_account_id or None,
+                schedule_id=schedule_id,
+            )
+            for row in rows:
+                item = dict(row)
+                item["schedule_id"] = int(schedule_id)
+                item["is_carry_over"] = bool(schedule.get("isCarryOver"))
+                key = (int(item.get("id") or 0), str(schedule_id))
+                if key not in seen:
+                    seen.add(key)
+                    matches.append(item)
+        return sort_and_mark_nearby(matches)[:limit]
+
     def _refresh_search_suggestions(self) -> None:
         query = self._search_query.strip()
         if not query:
@@ -709,14 +886,7 @@ class AppBridge(QObject):
             return
 
         try:
-            self._search_suggestions = search_consumers_by_zone(
-                query,
-                self._selected_zone,
-                limit=6,
-                unread_only=self._search_unread_only,
-                schedule_date=self.selectedBillingDate,
-                meter_reader_id=self._meter_reader_account_id or None,
-            )
+            self._search_suggestions = self._search_selected_route(query, 6, self._search_unread_only)
         except Exception:
             self._search_suggestions = []
         self.searchSuggestionsChanged.emit()
@@ -728,11 +898,7 @@ class AppBridge(QObject):
             return
 
         try:
-            self._zone_consumers = get_zone_consumers_with_status(
-                self._selected_zone,
-                schedule_date=self.selectedBillingDate,
-                meter_reader_id=self._meter_reader_account_id or None,
-            )
+            self._zone_consumers = self._selected_route_consumer_rows()
         except Exception:
             self._zone_consumers = []
         self.zoneConsumersChanged.emit()
@@ -753,12 +919,19 @@ class AppBridge(QObject):
                     date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id,
-                        zone_name,
+                        None if zone_name == "All zones" else zone_name,
                         date_from,
                         date_to,
                     )
                     mirrored = replace_consumers_from_sync(consumers)
-                self.assignedDatasetFinished.emit({"success": True, "pulled": len(consumers), "mirrored": mirrored, "zone": zone_name})
+                pulled_zones = sorted({
+                    str(item.get("zone_name") or "").strip()
+                    for item in consumers if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
+                })
+                self.assignedDatasetFinished.emit({
+                    "success": True, "pulled": len(consumers), "mirrored": mirrored,
+                    "zone": zone_name, "pulled_zones": pulled_zones,
+                })
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
 
@@ -770,7 +943,13 @@ class AppBridge(QObject):
 
     @Property(list, notify=assignedRoutesChanged)
     def assignedRoutes(self) -> list:
-        return self._assigned_routes
+        today = datetime.now().date().isoformat()
+        return [route for route in self._assigned_routes if str(route.get("dueDate") or today) >= today]
+
+    @Property(list, notify=assignedRoutesChanged)
+    def pastRoutes(self) -> list:
+        today = datetime.now().date().isoformat()
+        return [route for route in self._assigned_routes if str(route.get("dueDate") or today) < today]
 
     @Property(str, notify=selectedRouteChanged)
     def selectedRouteId(self) -> str:
@@ -783,9 +962,11 @@ class AppBridge(QObject):
         if not route or route_id == self._selected_route_id:
             return
         self._selected_route_id = route_id
-        self._selected_zone = str(route.get("zoneName") or "")
+        self._zones = list(route.get("zones") or [])
+        self._selected_zone = "All zones" if self._zones else ""
         self._selected_route_billing_date = str(route.get("billingDate") or route.get("startDate") or "")
         self.selectedRouteChanged.emit()
+        self.zonesChanged.emit()
         self.selectedZoneChanged.emit()
         self.assignedRoutesChanged.emit()
         self.selectedRouteChanged.emit()
@@ -817,6 +998,15 @@ class AppBridge(QObject):
     def selectedRouteStatus(self) -> str:
         return str(self._selected_route().get("status") or "-")
 
+    @Property(int, notify=selectedRouteChanged)
+    def selectedRouteCarryOverCount(self) -> int:
+        return int(self._selected_route().get("carryOverUnreadCount") or 0)
+
+    @Property(bool, notify=selectedRouteChanged)
+    def selectedRouteIsPast(self) -> bool:
+        due_date = str(self._selected_route().get("dueDate") or "")
+        return bool(due_date and due_date < datetime.now().date().isoformat())
+
     @Property(bool, notify=selectedRouteChanged)
     def routeOfflineReady(self) -> bool:
         return bool(self._selected_route().get("offlineReady"))
@@ -828,6 +1018,10 @@ class AppBridge(QObject):
             return "No assigned route selected"
         if route.get("offlineReady"):
             return "Route ready for offline use"
+        schedules = list(route.get("schedules") or [])
+        ready_count = sum(1 for item in schedules if item.get("offlineReady"))
+        if ready_count:
+            return f"{ready_count}/{len(schedules)} zones ready offline"
         return "Connect to download and verify this route"
 
     @Property(str, notify=selectedZoneChanged)
@@ -836,13 +1030,12 @@ class AppBridge(QObject):
 
     @selectedZone.setter
     def selectedZone(self, val: str) -> None:
-        if self._selected_zone != val:
+        if val in self._zones and self._selected_zone != val:
             self._selected_zone = val
             self.selectedZoneChanged.emit()
-            self.update_stats()
             self._refresh_search_suggestions()
-            if self._progress_details_visible:
-                self._refresh_zone_consumers()
+            self._refresh_zone_consumers()
+            self.update_stats()
 
     @Property(str, notify=searchQueryChanged)
     def searchQuery(self) -> str:
@@ -852,6 +1045,7 @@ class AppBridge(QObject):
     def searchQuery(self, val: str) -> None:
         if self._search_query != val:
             self._search_query = val
+            self._selected_search_schedule_id = ""
             self.searchQueryChanged.emit()
             self._refresh_search_suggestions()
 
@@ -939,11 +1133,6 @@ class AppBridge(QObject):
             if self._consumer:
                 self._due_date = self._default_due_date_for_consumer(self._consumer)
                 self.dueDateChanged.emit()
-            self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
-            if self._selected_zone not in self._zones:
-                self._selected_zone = self._zones[0] if self._zones else ""
-                self.selectedZoneChanged.emit()
-            self.zonesChanged.emit()
             self.update_stats()
             self._refresh_search_suggestions()
             self._refresh_zone_consumers()
@@ -1120,6 +1309,21 @@ class AppBridge(QObject):
     def printHistoryRecords(self) -> list:
         return self._print_history_records
 
+    @Property(list, notify=printHistoryFiltersChanged)
+    def printHistoryMonthOptions(self) -> list:
+        options = [{"label": "All months", "value": ""}]
+        for month in self._print_history_months:
+            try:
+                label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+            except ValueError:
+                label = month
+            options.append({"label": label, "value": month})
+        return options
+
+    @Property(str, notify=printHistoryFiltersChanged)
+    def selectedPrintHistoryMonth(self) -> str:
+        return self._selected_print_history_month
+
     @Property(str, notify=printHistoryDetailChanged)
     def printHistoryDetailTitle(self) -> str:
         if not self._print_history_detail:
@@ -1287,34 +1491,22 @@ class AppBridge(QObject):
 
     def _refresh_local_assignment_views(self) -> None:
         routes = get_assigned_routes(self._meter_reader_account_id or None)
-        self._assigned_routes = [
-            {
-                "scheduleId": str(route.get("schedule_id") or ""),
-                "zoneName": str(route.get("zone_name") or ""),
-                "startDate": str(route.get("start_date") or ""),
-                "dueDate": str(route.get("due_date") or ""),
-                "billingMonth": str(route.get("billing_month") or ""),
-                "billingDate": _billing_month_date(route.get("billing_month"), str(route.get("start_date") or "")),
-                "status": str(route.get("display_status") or route.get("status") or "Scheduled"),
-                "offlineReady": bool(route.get("cache_verified_at")) and int(route.get("cached_consumer_count") or 0) > 0,
-                "label": f"{str(route.get('zone_name') or 'Route')} | {str(route.get('billing_month') or route.get('start_date') or '')}",
-            }
-            for route in routes
-        ]
+        self._assigned_routes = _group_route_rows(routes)
         valid_ids = {str(route.get("scheduleId")) for route in self._assigned_routes}
         if self._selected_route_id not in valid_ids:
             self._selected_route_id = str(self._assigned_routes[0].get("scheduleId")) if self._assigned_routes else ""
         selected_route = self._selected_route()
         if selected_route:
-            self._selected_zone = str(selected_route.get("zoneName") or "")
+            self._zones = list(selected_route.get("zones") or [])
+            if self._selected_zone not in self._zones:
+                self._selected_zone = "All zones" if self._zones else ""
             self._selected_route_billing_date = str(selected_route.get("billingDate") or selected_route.get("startDate") or "")
         else:
+            self._zones = []
+            self._selected_zone = ""
             self._selected_route_billing_date = ""
         self.assignedRoutesChanged.emit()
         self.selectedRouteChanged.emit()
-        self._zones = get_all_zone_names(self.selectedBillingDate, self._meter_reader_account_id or None)
-        if self._selected_zone not in self._zones:
-            self._selected_zone = self._zones[0] if self._zones else ""
         self.zonesChanged.emit()
         self.selectedZoneChanged.emit()
         self._refresh_search_suggestions()
@@ -1331,8 +1523,12 @@ class AppBridge(QObject):
             try:
                 if hasattr(client, "is_online") and not client.is_online():
                     continue
-                for status in ("Scheduled", "In Progress"):
-                    schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
+                for status in ("Scheduled", "In Progress", "Completed"):
+                    try:
+                        schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
+                    except Exception:
+                        if status != "Completed":
+                            raise
                 if schedules:
                     break
             except Exception:
@@ -1397,6 +1593,7 @@ class AppBridge(QObject):
                 zone_name,
                 schedule_date=schedule_date,
                 meter_reader_id=self._meter_reader_account_id,
+                schedule_id=route.get("schedule_id"),
             )
             mark_route_cache_verified(route.get("schedule_id"), self._meter_reader_account_id, len(cached_rows))
 
@@ -1488,14 +1685,17 @@ class AppBridge(QObject):
         meter_no = (self._consumer.get("meter_no") or "").strip()
         if not meter_no:
             return
+        schedule = self._schedule_for_consumer(self._consumer)
         refreshed = search_consumer(
             meter_no,
             unread_only=False,
             schedule_date=self.selectedBillingDate,
             meter_reader_id=self._meter_reader_account_id or None,
+            schedule_id=schedule.get("scheduleId"),
         )
         if refreshed is None:
             return
+        refreshed["schedule_id"] = int(schedule["scheduleId"]) if schedule.get("scheduleId") else None
         self._consumer = refreshed
         self._account_no = str(refreshed.get("acct_no") or refreshed["id"])
         self._consumer_name = refreshed["name"]
@@ -1594,11 +1794,23 @@ class AppBridge(QObject):
         flagged: bool,
         reading_date: str | None = None,
         due_date: str | None = None,
+        *,
+        sync_reading_id: str | None = None,
+        captured_at: str | None = None,
+        schedule_id: int | str | None = None,
+        schedule_date: str | None = None,
+        schedule_due_date: str | None = None,
+        billing_cycle: str | None = None,
+        reading_route_id: int | str | None = None,
+        assignment_order: int | str | None = None,
     ) -> None:
         if not self._sync_dal:
             return
         consumer = self._consumer or {}
+        route = self._selected_route()
+        schedule = self._schedule_for_consumer(consumer)
         payload = {
+            "reading_id": sync_reading_id or str(uuid.uuid4()),
             "consumer_id": consumer_id,
             "acct_no": consumer.get("acct_no"),
             "meter_no": consumer.get("meter_no"),
@@ -1624,6 +1836,15 @@ class AppBridge(QObject):
             "exception": exception,
             "is_flagged": bool(flagged),
             "reading_date": reading_date or datetime.now().date().isoformat(),
+            "captured_at": captured_at or datetime.now().astimezone().isoformat(),
+            "schedule_id": int(schedule_id) if schedule_id not in (None, "") else (int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None),
+            "schedule_date": schedule_date or route.get("startDate") or self.selectedBillingDate,
+            "schedule_due_date": schedule_due_date or route.get("dueDate") or route.get("startDate") or self.selectedBillingDate,
+            "billing_cycle": billing_cycle or route.get("billingMonth") or consumer.get("billing_month"),
+            "reading_route_id": reading_route_id if reading_route_id not in (None, "") else consumer.get("reading_route_id"),
+            "assignment_order": assignment_order if assignment_order not in (None, "") else consumer.get("assignment_order"),
+            "reading_status": "valid",
+            "reading_sync_status": "pending",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1875,22 +2096,21 @@ class AppBridge(QObject):
         if not query:
             return
 
-        consumer = search_consumer(
-            query,
-            unread_only=self._search_unread_only,
-            schedule_date=self.selectedBillingDate,
-            meter_reader_id=self._meter_reader_account_id or None,
-        )
-        if consumer is None:
-            matches = search_consumers_by_zone(
-                query,
-                self._selected_zone,
-                limit=1,
-                unread_only=self._search_unread_only,
-                schedule_date=self.selectedBillingDate,
-                meter_reader_id=self._meter_reader_account_id or None,
-            )
-            consumer = matches[0] if matches else None
+        matches = []
+        if self._selected_search_schedule_id:
+            schedule = _zone_schedule(self._selected_route(), schedule_id=self._selected_search_schedule_id)
+            if schedule:
+                matches = search_consumers_by_zone(
+                    query, str(schedule.get("zoneName") or ""), limit=1,
+                    unread_only=self._search_unread_only, schedule_date=self.selectedBillingDate,
+                    meter_reader_id=self._meter_reader_account_id or None,
+                    schedule_id=schedule.get("scheduleId"),
+                )
+                for item in matches:
+                    item["schedule_id"] = int(schedule["scheduleId"])
+        if not matches:
+            matches = self._search_selected_route(query, 1, self._search_unread_only)
+        consumer = matches[0] if matches else None
 
         if consumer is None:
             self._consumer = None
@@ -1917,8 +2137,10 @@ class AppBridge(QObject):
         self.consumptionChanged.emit()
 
     @Slot(str)
-    def selectSearchSuggestion(self, meter_no: str) -> None:
+    @Slot(str, str)
+    def selectSearchSuggestion(self, meter_no: str, schedule_id: str = "") -> None:
         self._search_query = meter_no
+        self._selected_search_schedule_id = str(schedule_id or "")
         self.searchQueryChanged.emit()
         self._refresh_search_suggestions()
         self.searchConsumer()
@@ -1935,13 +2157,14 @@ class AppBridge(QObject):
         self.progressDetailsVisibleChanged.emit()
 
     @Slot(int)
-    def reprintZoneConsumer(self, consumer_id: int) -> None:
-        rows = get_zone_consumers_with_status(
-            self._selected_zone,
-            schedule_date=self.selectedBillingDate,
-            meter_reader_id=self._meter_reader_account_id or None,
-        )
-        row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
+    @Slot(int, str)
+    def reprintZoneConsumer(self, consumer_id: int, schedule_id: str = "") -> None:
+        rows = self._selected_route_consumer_rows()
+        row = next((
+            item for item in rows
+            if int(item.get("id", -1)) == consumer_id
+            and (not schedule_id or str(item.get("schedule_id")) == str(schedule_id))
+        ), None)
         if not row or not row.get("is_read"):
             self.alertRequested.emit("No Receipt", "No saved reading is available for this consumer.")
             return
@@ -1976,6 +2199,7 @@ class AppBridge(QObject):
                         consumer_id,
                         schedule_date=self.selectedBillingDate,
                         meter_reader_id=self._meter_reader_account_id or None,
+                        schedule_id=row.get("schedule_id"),
                     )
                     if updated:
                         row = updated
@@ -2021,13 +2245,14 @@ class AppBridge(QObject):
         self.receiptPreviewRequested.emit("Receipt Preview", receipt)
 
     @Slot(int)
-    def startNewBillForZoneConsumer(self, consumer_id: int) -> None:
-        rows = get_zone_consumers_with_status(
-            self._selected_zone,
-            schedule_date=self.selectedBillingDate,
-            meter_reader_id=self._meter_reader_account_id or None,
-        )
-        row = next((item for item in rows if int(item.get("id", -1)) == consumer_id), None)
+    @Slot(int, str)
+    def startNewBillForZoneConsumer(self, consumer_id: int, schedule_id: str = "") -> None:
+        rows = self._selected_route_consumer_rows()
+        row = next((
+            item for item in rows
+            if int(item.get("id", -1)) == consumer_id
+            and (not schedule_id or str(item.get("schedule_id")) == str(schedule_id))
+        ), None)
         if not row:
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
@@ -2036,12 +2261,17 @@ class AppBridge(QObject):
             consumer_id,
             schedule_date=self.selectedBillingDate,
             meter_reader_id=self._meter_reader_account_id or None,
+            schedule_id=row.get("schedule_id"),
         )
         if consumer is None:
             self.alertRequested.emit("Consumer Not Found", "Unable to load this consumer for a new bill.")
             return
 
+        consumer["schedule_id"] = row.get("schedule_id")
+        consumer["zone_name"] = row.get("zone_name") or consumer.get("zone_name")
+
         self._search_query = str(consumer.get("meter_no") or consumer.get("acct_no") or consumer_id)
+        self._selected_search_schedule_id = str(row.get("schedule_id") or "")
         self.searchQueryChanged.emit()
         self._refresh_search_suggestions()
         self._load_consumer_for_new_bill(consumer)
@@ -2106,7 +2336,17 @@ class AppBridge(QObject):
         previous = _to_float(self._consumer["previous_reading"])
         consumption = present - previous
         exception = self._selected_exception
-        reading_date = self._selected_reading_date().isoformat()
+        route = self._selected_route()
+        schedule = self._schedule_for_consumer(self._consumer)
+        reading_date = datetime.now().date().isoformat()
+        captured_at = datetime.now().astimezone().isoformat()
+        sync_reading_id = str(uuid.uuid4())
+        schedule_id = int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None
+        schedule_date = str(route.get("startDate") or self.selectedBillingDate)
+        schedule_due_date = str(route.get("dueDate") or schedule_date)
+        billing_cycle = str(route.get("billingMonth") or self._consumer.get("billing_month") or "")
+        reading_route_id = self._consumer.get("reading_route_id")
+        assignment_order = self._consumer.get("assignment_order")
         due_date = _normalize_iso_date(self._due_date) or self._default_due_date_for_consumer(self._consumer)
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
@@ -2114,8 +2354,21 @@ class AppBridge(QObject):
         flagged = consumption > 500 or exception != "None"
         if due_date:
             update_consumer_due_date(self._consumer["id"], due_date)
-        reading_id = save_reading(self._consumer["id"], present, consumption, exception, flagged, reading_date)
-        self._save_to_sync_layer(self._consumer["id"], present, consumption, exception, flagged, reading_date, due_date)
+        reading_id = save_reading(
+            self._consumer["id"], present, consumption, exception, flagged, reading_date,
+            schedule_id=schedule_id, schedule_date=schedule_date,
+            schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
+            reading_route_id=reading_route_id, assignment_order=assignment_order,
+            reading_status="valid", reading_sync_status="pending",
+            sync_reading_id=sync_reading_id, captured_at=captured_at,
+        )
+        self._save_to_sync_layer(
+            self._consumer["id"], present, consumption, exception, flagged, reading_date, due_date,
+            sync_reading_id=sync_reading_id, captured_at=captured_at,
+            schedule_id=schedule_id, schedule_date=schedule_date,
+            schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
+            reading_route_id=reading_route_id, assignment_order=assignment_order,
+        )
         return {
             "job_type": "original",
             "consumer_snapshot": consumer_snapshot,
@@ -2128,6 +2381,14 @@ class AppBridge(QObject):
             "exception": exception,
             "reading_date": reading_date,
             "due_date": due_date,
+            "schedule_id": schedule_id,
+            "schedule_date": schedule_date,
+            "schedule_due_date": schedule_due_date,
+            "billing_cycle": billing_cycle,
+            "reading_route_id": reading_route_id,
+            "assignment_order": assignment_order,
+            "sync_reading_id": sync_reading_id,
+            "captured_at": captured_at,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }
@@ -2308,8 +2569,21 @@ class AppBridge(QObject):
                         flagged = consumption > 500 or exception != "None"
                         if due_date:
                             update_consumer_due_date(job["consumer_id"], due_date)
-                        reading_id = save_reading(job["consumer_id"], present, consumption, exception, flagged, reading_date)
-                        self._save_to_sync_layer(job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date)
+                        reading_id = save_reading(
+                            job["consumer_id"], present, consumption, exception, flagged, reading_date,
+                            schedule_id=job.get("schedule_id"), schedule_date=job.get("schedule_date"),
+                            schedule_due_date=job.get("schedule_due_date"), billing_cycle=job.get("billing_cycle"),
+                            reading_route_id=job.get("reading_route_id"), assignment_order=job.get("assignment_order"),
+                            reading_status="valid", reading_sync_status="pending",
+                            sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
+                        )
+                        self._save_to_sync_layer(
+                            job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date,
+                            sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
+                            schedule_id=job.get("schedule_id"), schedule_date=job.get("schedule_date"),
+                            schedule_due_date=job.get("schedule_due_date"), billing_cycle=job.get("billing_cycle"),
+                            reading_route_id=job.get("reading_route_id"), assignment_order=job.get("assignment_order"),
+                        )
                     saved_receipt_id = None
                     history_error = None
                     try:
@@ -2478,12 +2752,26 @@ class AppBridge(QObject):
 
     @Slot()
     def openPrintHistory(self) -> None:
+        self._print_history_months = list_receipt_print_months()
+        if self._selected_print_history_month not in self._print_history_months:
+            self._selected_print_history_month = ""
+        self.printHistoryFiltersChanged.emit()
         self.refreshPrintHistory()
         self.printHistoryRequested.emit()
 
     @Slot(str)
     def refreshPrintHistory(self, search_text: str = "") -> None:
-        rows = list_receipt_print_history(search_text=search_text, limit=200)
+        self._print_history_search = str(search_text or "")
+        months = list_receipt_print_months()
+        if months != self._print_history_months:
+            self._print_history_months = months
+            if self._selected_print_history_month not in months:
+                self._selected_print_history_month = ""
+            self.printHistoryFiltersChanged.emit()
+        rows = list_receipt_print_history(
+            search_text=self._print_history_search,
+            month=self._selected_print_history_month or None,
+        )
         self._print_history_records = [
             {
                 "id": row.get("id"),
@@ -2502,6 +2790,16 @@ class AppBridge(QObject):
             for row in rows
         ]
         self.printHistoryRecordsChanged.emit()
+
+    @Slot(str)
+    def setPrintHistoryMonth(self, month: str) -> None:
+        normalized = str(month or "").strip()
+        if normalized and normalized not in self._print_history_months:
+            return
+        if self._selected_print_history_month != normalized:
+            self._selected_print_history_month = normalized
+            self.printHistoryFiltersChanged.emit()
+        self.refreshPrintHistory(self._print_history_search)
 
     @Slot(int)
     def openPrintHistoryDetail(self, receipt_print_id: int) -> None:
@@ -2615,7 +2913,17 @@ class AppBridge(QObject):
 
     @Slot()
     def update_stats(self) -> None:
-        stats = get_zone_stats(self.selectedBillingDate, self._meter_reader_account_id or None)
+        try:
+            route_rows = self._selected_route_consumer_rows()
+        except Exception:
+            route_rows = []
+        stats: dict[str, dict] = {}
+        for row in route_rows:
+            zone_name = str(row.get("zone_name") or "Unassigned")
+            zone = stats.setdefault(zone_name, {"households": 0, "read": 0, "flagged": 0})
+            zone["households"] += 1
+            zone["read"] += 1 if row.get("is_read") else 0
+            zone["flagged"] += 1 if row.get("is_flagged") else 0
         if not stats:
             self._overall_percentage = 0
             self._overall_fraction = "0/0"
@@ -2650,7 +2958,11 @@ class AppBridge(QObject):
         self.overallFractionChanged.emit()
 
         # Active Zone calculations
-        active_zone = stats.get(self._selected_zone)
+        active_zone = (
+            {"households": total_households, "read": total_read, "flagged": flagged}
+            if self._selected_zone == "All zones"
+            else stats.get(self._selected_zone)
+        )
         if active_zone:
             self._zone_read_fraction = f"{active_zone['read']}/{active_zone['households']}"
             if active_zone['households'] > 0:

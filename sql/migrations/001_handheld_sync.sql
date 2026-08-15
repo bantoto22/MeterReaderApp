@@ -45,3 +45,25 @@ CREATE TABLE IF NOT EXISTS handheld_consumers_cache (
     previous_reading INTEGER,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Assignment identity remains separate from the consumer profile because a
+-- grouped route may contain several zone-specific schedules.
+CREATE TABLE IF NOT EXISTS handheld_assignments_cache (
+    schedule_id BIGINT NOT NULL,
+    consumer_id BIGINT NOT NULL,
+    acct_no TEXT,
+    assignment_order INTEGER,
+    reading_route_id TEXT,
+    zone_name TEXT,
+    schedule_date DATE,
+    schedule_due_date DATE,
+    billing_cycle TEXT,
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    reading_status TEXT NOT NULL DEFAULT 'pending',
+    reading_sync_status TEXT NOT NULL DEFAULT 'pending',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (schedule_id, consumer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_handheld_assignments_route_order
+  ON handheld_assignments_cache (reading_route_id, assignment_order, acct_no);

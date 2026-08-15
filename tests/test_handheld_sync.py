@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.handheld_sync import (
     BackendApiClient,
@@ -704,6 +704,212 @@ class HandheldSyncTests(unittest.TestCase):
 
         self.assertEqual(selected, date(2026, 7, 15))
 
+    def test_display_routes_group_matching_zone_schedules_without_losing_ids(self):
+        from src.qt_hybrid_app import _group_route_rows, _zone_schedule
+
+        grouped = _group_route_rows(
+            [
+                {
+                    "schedule_id": 401, "meter_reader_id": 12, "start_date": "2026-09-10", "due_date": "2026-09-12",
+                    "billing_month": "September 2026", "zone_name": "Zone 1",
+                    "display_status": "Scheduled", "cache_verified_at": "2026-09-01", "cached_consumer_count": 4,
+                },
+                {
+                    "schedule_id": 402, "meter_reader_id": 12, "start_date": "2026-09-10", "due_date": "2026-09-12",
+                    "billing_month": "September 2026", "zone_name": "Zone 2",
+                    "display_status": "Scheduled", "cache_verified_at": "2026-09-01", "cached_consumer_count": 3,
+                },
+                {
+                    "schedule_id": 499, "meter_reader_id": 12, "start_date": "2026-09-11", "due_date": "2026-09-13",
+                    "billing_month": "September 2026", "zone_name": "Zone 9",
+                    "display_status": "Scheduled", "cache_verified_at": None, "cached_consumer_count": 0,
+                },
+                {
+                    "schedule_id": 498, "meter_reader_id": 13, "start_date": "2026-09-10", "due_date": "2026-09-12",
+                    "billing_month": "September 2026", "zone_name": "Zone 8",
+                    "display_status": "Scheduled", "cache_verified_at": None, "cached_consumer_count": 0,
+                },
+            ]
+        )
+
+        self.assertEqual(len(grouped), 3)
+        route = grouped[0]
+        self.assertEqual(route["zones"], ["All zones", "Zone 1", "Zone 2"])
+        self.assertEqual(_zone_schedule(route, "Zone 1")["scheduleId"], "401")
+        self.assertEqual(_zone_schedule(route, "Zone 2")["scheduleId"], "402")
+        self.assertEqual(_zone_schedule(route, "", "402")["zoneName"], "Zone 2")
+        self.assertTrue(route["offlineReady"])
+
+    def test_expired_unread_schedules_are_carried_into_current_route(self):
+        from src.qt_hybrid_app import _group_route_rows, _zone_schedule
+
+        grouped = _group_route_rows(
+            [
+                {
+                    "schedule_id": 510, "meter_reader_id": 12,
+                    "start_date": "2026-07-01", "due_date": "2026-07-03",
+                    "billing_month": "July 2026", "zone_name": "Old Zone",
+                    "display_status": "Overdue", "unread_count": 2,
+                    "cache_verified_at": "2026-07-01", "cached_consumer_count": 2,
+                },
+                {
+                    "schedule_id": 511, "meter_reader_id": 12,
+                    "start_date": "2026-07-01", "due_date": "2026-07-03",
+                    "billing_month": "July 2026", "zone_name": "Finished Zone",
+                    "display_status": "Overdue", "unread_count": 0,
+                    "cache_verified_at": "2026-07-01", "cached_consumer_count": 2,
+                },
+                {
+                    "schedule_id": 601, "meter_reader_id": 12,
+                    "start_date": "2026-08-15", "due_date": "2026-08-17",
+                    "billing_month": "August 2026", "zone_name": "Current Zone",
+                    "display_status": "In Progress", "unread_count": 3,
+                    "cache_verified_at": "2026-08-14", "cached_consumer_count": 3,
+                },
+                {
+                    "schedule_id": 710, "meter_reader_id": 13,
+                    "start_date": "2026-07-01", "due_date": "2026-07-03",
+                    "billing_month": "July 2026", "zone_name": "Other Reader Zone",
+                    "display_status": "Overdue", "unread_count": 4,
+                    "cache_verified_at": "2026-07-01", "cached_consumer_count": 4,
+                },
+            ],
+            today=date(2026, 8, 16),
+        )
+
+        current = next(group for group in grouped if group["billingMonth"] == "August 2026")
+        self.assertEqual(current["carryOverUnreadCount"], 2)
+        self.assertEqual(current["zones"], ["All zones", "Old Zone", "Current Zone"])
+        self.assertEqual(_zone_schedule(current, "Old Zone")["scheduleId"], "510")
+        self.assertTrue(_zone_schedule(current, "Old Zone")["isCarryOver"])
+        self.assertNotIn("Finished Zone", current["zones"])
+        self.assertNotIn("Other Reader Zone", current["zones"])
+
+    def test_assignment_deadline_and_completion_are_scoped_to_schedule(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            today = date.today()
+            scheduled = today - timedelta(days=5)
+            due = today - timedelta(days=3)
+            database.replace_reading_schedules_from_sync(
+                [{
+                    "schedule_id": 301,
+                    "start_date": scheduled.isoformat(),
+                    "due_date": due.isoformat(),
+                    "billing_month": today.strftime("%B %Y"),
+                    "zone_name": "Late Route",
+                    "meter_reader_id": 12,
+                    "status": "Completed",
+                }],
+                12, scheduled.isoformat(), today.isoformat(),
+            )
+            database.replace_consumers_from_sync(
+                [{
+                    "id": 50, "meter_no": "MTR-LATE-1", "acct_no": "LATE-1",
+                    "name": "Missed Consumer", "zone_name": "Late Route",
+                    "schedule_id": 301, "schedule_date": scheduled.isoformat(),
+                    "schedule_due_date": due.isoformat(), "is_read": False,
+                    "reading_status": "pending", "reading_sync_status": "pending",
+                }]
+            )
+
+            self.assertEqual([row["schedule_id"] for row in database.get_assigned_routes(12)], [301])
+            pending = database.get_zone_consumers_with_status(
+                "Late Route", today.isoformat(), 12, schedule_id=301,
+            )[0]
+            self.assertEqual(pending["deadline_status"], "Overdue 3d")
+
+            future_due = today + timedelta(days=2)
+            database.replace_reading_schedules_from_sync(
+                [{
+                    "schedule_id": 302, "start_date": today.isoformat(),
+                    "due_date": future_due.isoformat(), "billing_month": today.strftime("%B %Y"),
+                    "zone_name": "Late Route", "meter_reader_id": 12, "status": "Scheduled",
+                }],
+                12, today.isoformat(), future_due.isoformat(),
+            )
+            database.replace_consumers_from_sync(
+                [{
+                    "id": 50, "meter_no": "MTR-LATE-1", "acct_no": "LATE-1",
+                    "name": "Missed Consumer", "zone_name": "Late Route", "schedule_id": 302,
+                    "is_read": False, "reading_status": "pending", "reading_sync_status": "pending",
+                }]
+            )
+
+            database.save_reading(
+                50, 110, 10, reading_date=today.isoformat(), schedule_id=301,
+                schedule_date=scheduled.isoformat(), schedule_due_date=due.isoformat(),
+                billing_cycle=today.strftime("%B %Y"), sync_reading_id="reading-301",
+            )
+            saved = database.get_zone_consumers_with_status(
+                "Late Route", today.isoformat(), 12, schedule_id=301,
+            )[0]
+            self.assertEqual(saved["deadline_status"], "Completed")
+            self.assertEqual(saved["reading_sync_status"], "pending")
+            other_schedule = database.get_zone_consumers_with_status(
+                "Late Route", today.isoformat(), 12, schedule_id=302,
+            )[0]
+            self.assertEqual(other_schedule["deadline_status"], "Due in 2d")
+
+            database.update_reading_sync_state("reading-301", "conflict", "rejected")
+            restored = database.get_zone_consumers_with_status(
+                "Late Route", today.isoformat(), 12, schedule_id=301,
+            )[0]
+            self.assertEqual(restored["deadline_status"], "Overdue 3d")
+            self.assertEqual(restored["reading_status"], "rejected")
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_receipt_history_persists_all_records_and_filters_by_reading_month(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            database.replace_consumers_from_sync(
+                [{
+                    "id": 70, "meter_no": "MTR-HISTORY", "acct_no": "HISTORY-1",
+                    "name": "History Consumer", "zone_name": "History Zone", "previous_reading": 0,
+                }]
+            )
+            for index in range(15):
+                reading_month = 7 if index < 10 else 8
+                reading_date = date(2026, reading_month, (index % 10) + 1).isoformat()
+                reading_id = database.save_reading(70, index + 1, 1, reading_date=reading_date)
+                database.save_receipt_print(
+                    70, f"Receipt body {index}", index, index + 1, 1,
+                    reading_id=reading_id, acct_no="HISTORY-1",
+                    consumer_name="History Consumer", meter_no="MTR-HISTORY",
+                    zone_name="History Zone",
+                )
+
+            all_rows = database.list_receipt_print_history()
+            july_rows = database.list_receipt_print_history(month="2026-07")
+            august_rows = database.list_receipt_print_history(month="2026-08")
+
+            self.assertEqual(len(all_rows), 15)
+            self.assertEqual(len(july_rows), 10)
+            self.assertEqual(len(august_rows), 5)
+            self.assertEqual(database.list_receipt_print_months(), ["2026-08", "2026-07"])
+            self.assertEqual(len(database.list_receipt_print_history("body 12", month="2026-08")), 1)
+        finally:
+            database._db_path = original_db_path
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
     def test_local_schedule_queries_do_not_expose_cached_routes_without_assignment(self):
         original_db_path = database._db_path
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
@@ -1067,6 +1273,127 @@ class HandheldSyncTests(unittest.TestCase):
 
         self.assertIn("Due Penalty(10%): PHP    10.00", text)
         self.assertIn("After Due   : PHP   110.00", text)
+
+    def test_assignment_account_numbers_order_search_and_reading_metadata(self):
+        original_db_path = database._db_path
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        database._db_path = lambda: db_path
+        try:
+            database.init_db()
+            today = date.today().isoformat()
+            database.replace_reading_schedules_from_sync(
+                [{
+                    "schedule_id": 801, "start_date": today, "due_date": today,
+                    "billing_month": "August 2026", "zone_name": "Ordered Zone",
+                    "meter_reader_id": 12, "status": "Scheduled",
+                }, {
+                    "schedule_id": 802, "start_date": today, "due_date": today,
+                    "billing_month": "August 2026", "zone_name": "Natural Zone",
+                    "meter_reader_id": 12, "status": "Scheduled",
+                }],
+                12, today, today,
+            )
+            account_numbers = [
+                "02-11-152-A2", "02-11-153-0", "02-11-152-0",
+                "02-11-151-0", "02-11-152-A1",
+            ]
+            ordered_rows = []
+            for index, acct_no in enumerate(account_numbers, start=1):
+                ordered_rows.append({
+                    "id": index, "consumer_id": index, "meter_no": f"MTR-O-{index}",
+                    "acct_no": acct_no, "name": f"Ordered {index}",
+                    "zone_name": "Ordered Zone", "schedule_id": 801,
+                    "assignment_order": 6 - index, "reading_route_id": "ROUTE-801",
+                    "schedule_date": today, "schedule_due_date": today,
+                    "billing_cycle": "August 2026",
+                })
+            natural_rows = []
+            for index, acct_no in enumerate(account_numbers, start=11):
+                natural_rows.append({
+                    "id": index, "consumer_id": index, "meter_no": f"MTR-N-{index}",
+                    "acct_no": acct_no, "name": f"Natural {index}",
+                    "zone_name": "Natural Zone", "schedule_id": 802,
+                    "assignment_order": None, "reading_route_id": "ROUTE-802",
+                    "schedule_date": today, "schedule_due_date": today,
+                    "billing_cycle": "August 2026",
+                })
+            database.replace_consumers_from_sync(ordered_rows + natural_rows)
+
+            ordered = database.get_zone_consumers_with_status(
+                "Ordered Zone", today, 12, schedule_id=801,
+            )
+            self.assertEqual([row["assignment_order"] for row in ordered], [1, 2, 3, 4, 5])
+            natural = database.get_zone_consumers_with_status(
+                "Natural Zone", today, 12, schedule_id=802,
+            )
+            self.assertEqual(
+                [row["acct_no"] for row in natural],
+                ["02-11-151-0", "02-11-152-0", "02-11-152-A1", "02-11-152-A2", "02-11-153-0"],
+            )
+            nearby = database.search_consumers_by_zone(
+                "02-11-152", "Natural Zone", unread_only=True,
+                schedule_date=today, meter_reader_id=12, schedule_id=802,
+            )
+            self.assertEqual([row["acct_no"] for row in nearby], ["02-11-152-0", "02-11-152-A1", "02-11-152-A2"])
+            self.assertTrue(all(row["is_nearby_connection"] for row in nearby))
+
+            reading_id = database.save_reading(
+                1, 100, 10, reading_date=today, schedule_id=801,
+                reading_route_id="ROUTE-801", assignment_order=5,
+            )
+            with sqlite3.connect(db_path) as conn:
+                stored = conn.execute(
+                    "SELECT reading_route_id, assignment_order, schedule_id, consumer_id FROM readings WHERE id = ?",
+                    (reading_id,),
+                ).fetchone()
+            self.assertEqual(stored, ("ROUTE-801", 5, 801, 1))
+        finally:
+            database._db_path = original_db_path
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_assignment_cache_survives_restart_with_exact_account_and_order(self):
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        try:
+            cfg = SyncConfig(backend_api_base_url="https://example.test")
+            store = SQLiteLocalSyncStore(cfg)
+            store._db_path = db_path
+            store.ensure_schema()
+            store.cache_consumers([
+                {
+                    "id": 21, "consumer_id": 21, "meter_no": "MTR-21", "acct_no": "02-11-152-A1",
+                    "name": "Connection A1", "zone_name": "Zone A", "schedule_id": 901,
+                    "assignment_order": 2, "reading_route_id": "ROUTE-901",
+                },
+                {
+                    "id": 20, "consumer_id": 20, "meter_no": "MTR-20", "acct_no": "02-11-152-0",
+                    "name": "Main Connection", "zone_name": "Zone A", "schedule_id": 901,
+                    "assignment_order": 1, "reading_route_id": "ROUTE-901",
+                },
+            ])
+            del store
+
+            reopened = SQLiteLocalSyncStore(cfg)
+            reopened._db_path = db_path
+            reopened.ensure_schema()
+            cached = reopened.load_cached_consumers("Zone A")
+            self.assertEqual([row["acct_no"] for row in cached], ["02-11-152-0", "02-11-152-A1"])
+            self.assertEqual([row["assignment_order"] for row in cached], [1, 2])
+            self.assertTrue(all(row["reading_route_id"] == "ROUTE-901" for row in cached))
+            self.assertTrue(all(row["schedule_id"] == 901 for row in cached))
+        finally:
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
 
     def test_receipt_uses_latest_reading_date_for_billing_period_start(self):
         text = build_receipt_text(
