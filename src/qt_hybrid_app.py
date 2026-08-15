@@ -500,11 +500,11 @@ class AppBridge(QObject):
         self._billing_month_offsets = [0, 1]
         self._selected_billing_month_offset = 0
 
-        self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
-        self._selected_zone = self._zones[0] if self._zones else ""
         self._assigned_routes = []
         self._selected_route_id = ""
         self._selected_route_billing_date = ""
+        self._zones = get_all_zone_names(self._selected_reading_date().isoformat(), self._meter_reader_account_id or None)
+        self._selected_zone = self._zones[0] if self._zones else ""
         self._search_query = ""
         self._search_unread_only = False
 
