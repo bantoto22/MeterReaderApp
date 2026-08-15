@@ -68,7 +68,7 @@ Rectangle {
                         spacing: 6
 
                         Text {
-                            text: bridgeObj && bridgeObj.selectedRouteIsPast ? "PAST FIELD ROUTE" : "My Reading Route"
+                            text: bridgeObj && bridgeObj.selectedRouteIsPast ? "OVERDUE FIELD ROUTE" : "Current / upcoming routes"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -78,6 +78,7 @@ Rectangle {
                         ComboBox {
                             id: cmbProgressZone
                             Layout.fillWidth: true
+                            visible: bridgeObj && !bridgeObj.selectedRouteIsPast
                             textRole: "label"
                             valueRole: "scheduleId"
                             model: bridgeObj ? bridgeObj.assignedRoutes : []
@@ -117,13 +118,40 @@ Rectangle {
                             }
                         }
 
+                        Button {
+                            id: btnReturnToCurrentRoute
+                            Layout.fillWidth: true
+                            implicitHeight: TouchMetrics.buttonHeight
+                            visible: bridgeObj && bridgeObj.selectedRouteIsPast
+                            enabled: bridgeObj && bridgeObj.assignedRoutes.length > 0
+
+                            background: Rectangle {
+                                radius: 8
+                                color: btnReturnToCurrentRoute.enabled ? (btnReturnToCurrentRoute.pressed ? "#1D4ED8" : "#2563EB") : "#CBD5E1"
+                            }
+                            contentItem: Text {
+                                text: btnReturnToCurrentRoute.enabled ? "Return to current route" : "No current or upcoming route"
+                                color: "white"
+                                font.family: "Montserrat"
+                                font.pixelSize: TouchMetrics.bodyText
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            onClicked: {
+                                if (bridgeObj && bridgeObj.assignedRoutes.length > 0) {
+                                    bridgeObj.selectedRouteId = bridgeObj.assignedRoutes[0].scheduleId
+                                }
+                            }
+                        }
+
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 4
-                            visible: bridgeObj && bridgeObj.pastRoutes.length > 0
+                            visible: bridgeObj && (bridgeObj.pastRoutes.length > 1 || (bridgeObj.pastRoutes.length === 1 && !bridgeObj.selectedRouteIsPast))
 
                             Text {
-                                text: "Past schedules"
+                                text: bridgeObj && bridgeObj.pastRoutes.length > 1 ? "Past schedules" : "Missed schedule"
                                 font.pixelSize: TouchMetrics.helperText
                                 font.family: "Montserrat"
                                 font.bold: true
@@ -133,6 +161,7 @@ Rectangle {
                             ComboBox {
                                 id: cmbPastRoute
                                 Layout.fillWidth: true
+                                visible: bridgeObj && bridgeObj.pastRoutes.length > 1
                                 textRole: "label"
                                 valueRole: "scheduleId"
                                 model: bridgeObj ? bridgeObj.pastRoutes : []
@@ -166,6 +195,35 @@ Rectangle {
                                 }
                                 onActivated: {
                                     if (bridgeObj && currentValue) bridgeObj.selectedRouteId = currentValue
+                                }
+                            }
+
+                            Button {
+                                id: btnSinglePastRoute
+                                Layout.fillWidth: true
+                                implicitHeight: TouchMetrics.buttonHeight
+                                visible: bridgeObj && bridgeObj.pastRoutes.length === 1 && !bridgeObj.selectedRouteIsPast
+
+                                background: Rectangle {
+                                    radius: 8
+                                    color: btnSinglePastRoute.pressed ? "#FEE2E2" : "#FFF7F7"
+                                    border.color: "#FCA5A5"
+                                    border.width: 1
+                                }
+                                contentItem: Text {
+                                    text: bridgeObj && bridgeObj.pastRoutes.length === 1 ? ("Open " + bridgeObj.pastRoutes[0].label) : "Open missed schedule"
+                                    color: "#7F1D1D"
+                                    font.family: "Montserrat"
+                                    font.pixelSize: TouchMetrics.bodyText
+                                    font.bold: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                    elide: Text.ElideRight
+                                }
+                                onClicked: {
+                                    if (bridgeObj && bridgeObj.pastRoutes.length === 1) {
+                                        bridgeObj.selectedRouteId = bridgeObj.pastRoutes[0].scheduleId
+                                    }
                                 }
                             }
                         }
