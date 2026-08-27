@@ -131,6 +131,7 @@ except ImportError:
 
 try:
     from .receipt import (
+        apply_authoritative_bill,
         build_receipt_text,
         build_reprint_receipt_text,
         can_use_system_printer,
@@ -139,6 +140,7 @@ try:
     )
 except ImportError:
     from receipt import (
+        apply_authoritative_bill,
         build_receipt_text,
         build_reprint_receipt_text,
         can_use_system_printer,
@@ -419,6 +421,21 @@ def _has_receipt_context_gaps(consumer: dict | None) -> bool:
     if not str(consumer.get("date_covered_to") or "").strip():
         return True
     return False
+
+
+def _authoritative_bill_from_sync_result(result: dict | None) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+    response = result
+    remote = result.get("remote")
+    if isinstance(remote, dict):
+        response = remote.get("Backend API") or remote.get("backend") or response
+    if not isinstance(response, dict):
+        return None
+    if isinstance(response.get("data"), dict):
+        response = response["data"]
+    bill = response.get("bill")
+    return dict(bill) if isinstance(bill, dict) and bill else None
 
 
 class LoginBridge(QObject):
@@ -1814,7 +1831,8 @@ class AppBridge(QObject):
         billing_cycle: str | None = None,
         reading_route_id: int | str | None = None,
         assignment_order: int | str | None = None,
-    ) -> None:
+        wait_for_result: bool = False,
+    ) -> dict | None:
         if not self._sync_dal:
             return
         consumer = self._consumer or {}
@@ -1859,13 +1877,12 @@ class AppBridge(QObject):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        def _task() -> None:
+        def _save() -> dict | None:
             try:
                 with self._sync_dal.operation_lock:
                     if self._auto_sync_enabled:
-                        self._sync_dal.saveMeterReading(payload)
-                    else:
-                        self._sync_dal.queueMeterReading(payload)
+                        return self._sync_dal.saveMeterReading(payload)
+                    return self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
                 self._sync_logs = format_sync_error("Saving reading to the local retry queue", exc, self._backend_endpoint)
                 self._backend_status = "Sync Failed"
@@ -1873,9 +1890,19 @@ class AppBridge(QObject):
                 self.syncLogsChanged.emit()
                 self.backendStatusChanged.emit()
                 self.backendLogsChanged.emit()
+                return None
+
+        if wait_for_result:
+            result = _save()
+            self._refresh_sync_snapshot()
+            return result
+
+        def _task() -> None:
+            _save()
             self._refresh_sync_snapshot()
 
         threading.Thread(target=_task, daemon=True).start()
+        return None
 
     def _set_wifi_busy(self, busy: bool, status: str | None = None) -> None:
         self._wifi_busy = busy
@@ -2361,7 +2388,6 @@ class AppBridge(QObject):
         due_date = _normalize_iso_date(self._due_date) or self._default_due_date_for_consumer(self._consumer)
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
-        receipt = build_receipt_text(consumer_snapshot, previous, present, exception, self._reader_name, reading_date=reading_date)
         flagged = consumption > 500 or exception != "None"
         if due_date:
             update_consumer_due_date(self._consumer["id"], due_date)
@@ -2373,12 +2399,25 @@ class AppBridge(QObject):
             reading_status="valid", reading_sync_status="pending",
             sync_reading_id=sync_reading_id, captured_at=captured_at,
         )
-        self._save_to_sync_layer(
+        sync_result = self._save_to_sync_layer(
             self._consumer["id"], present, consumption, exception, flagged, reading_date, due_date,
             sync_reading_id=sync_reading_id, captured_at=captured_at,
             schedule_id=schedule_id, schedule_date=schedule_date,
             schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
             reading_route_id=reading_route_id, assignment_order=assignment_order,
+            wait_for_result=True,
+        )
+        authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
+        if authoritative_bill:
+            consumer_snapshot = apply_authoritative_bill(consumer_snapshot, authoritative_bill)
+            due_date = _normalize_iso_date(consumer_snapshot.get("due_date")) or due_date
+        receipt = build_receipt_text(
+            consumer_snapshot,
+            previous,
+            present,
+            exception,
+            self._reader_name,
+            reading_date=reading_date,
         )
         return {
             "job_type": "original",
@@ -2400,6 +2439,7 @@ class AppBridge(QObject):
             "assignment_order": assignment_order,
             "sync_reading_id": sync_reading_id,
             "captured_at": captured_at,
+            "authoritative_bill": authoritative_bill,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }

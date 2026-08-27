@@ -190,8 +190,9 @@ def _calculate_penalty(
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
     bill_status = str(consumer.get("bill_status") or "Unpaid").strip()
-    applied_penalty = round(current_bill * (late_fee_percent / 100.0), 2)
-    penalty_source = "projected after-due penalty"
+    is_overdue = reference_date > due_date and bill_status.lower() != "paid"
+    applied_penalty = round(current_bill * (late_fee_percent / 100.0), 2) if is_overdue else 0.0
+    penalty_source = "current bill penalty" if is_overdue else "not yet due"
     total_after_due_date = round(total_amount + applied_penalty, 2)
     return applied_penalty, total_after_due_date, penalty_source, bill_status
 
@@ -205,24 +206,29 @@ def _optional_money(consumer: dict, field_name: str) -> float:
     except (TypeError, ValueError):
         return 0.0
 
+
+def apply_authoritative_bill(consumer: dict, bill: dict) -> dict:
+    """Overlay a backend-calculated bill onto consumer display metadata."""
+    snapshot = dict(consumer)
+    snapshot.update(bill)
+    if bill.get("status") not in (None, ""):
+        snapshot["bill_status"] = bill["status"]
+    snapshot["_authoritative_bill"] = True
+    return snapshot
+
+
 def _carried_previous_bill(consumer: dict) -> tuple[float, float, str]:
     bill_status = str(consumer.get("bill_status") or "Unpaid").strip() or "Unpaid"
-    previous_balance = _optional_money(consumer, "previous_balance")
     if bill_status.lower() == "paid":
         return 0.0, 0.0, bill_status
 
-    unpaid_amount = _optional_money(consumer, "amount_due")
-    unpaid_penalty = _optional_money(consumer, "penalty")
-    previous_penalty = _optional_money(consumer, "previous_penalty")
-    late_fee = consumer.get("late_fee")
-    late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
-
-    latest_unpaid_principal = max(0.0, unpaid_amount - previous_penalty)
-    carried = max(previous_balance, latest_unpaid_principal)
-    computed_previous_penalty = round(carried * (late_fee_percent / 100.0), 2)
-    stored_previous_penalty = previous_penalty if previous_balance > 0 else max(previous_penalty, unpaid_penalty)
-    carried_penalty = max(stored_previous_penalty, computed_previous_penalty)
-    return carried, carried_penalty, bill_status
+    # Server-provided aggregates are display values. Never derive a fresh
+    # penalty from amount_due, because it may already include older penalties.
+    return (
+        _optional_money(consumer, "previous_balance"),
+        _optional_money(consumer, "previous_penalty"),
+        bill_status,
+    )
 
 def _compute_bill(consumption: float, consumer: dict) -> tuple[float, int, float, float]:
     minimum_cubic = _require_int(consumer, "minimum_cubic")
@@ -246,7 +252,14 @@ def build_receipt_text(
 ) -> str:
     _require_billing_profile(consumer)
     consumption = present - previous
-    current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
+    calculated_current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
+    authoritative = bool(consumer.get("_authoritative_bill"))
+    current_bill = calculated_current_bill
+    if authoritative:
+        for field_name in ("current_month_amount", "original_amount", "water_charge", "class_cost"):
+            if consumer.get(field_name) not in (None, ""):
+                current_bill = _optional_money(consumer, field_name)
+                break
 
     now = datetime.datetime.now()
     reference_date = _parse_date(str(reading_date)) if reading_date not in (None, "") else now.date()
@@ -254,11 +267,32 @@ def build_receipt_text(
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
     carried_previous_bill, previous_penalty, previous_bill_status = _carried_previous_bill(consumer)
-    amount_due = round(current_bill + carried_previous_bill + previous_penalty, 2)
+    calculated_amount_due = round(current_bill + carried_previous_bill + previous_penalty, 2)
+    amount_due = (
+        _optional_money(consumer, "amount_due")
+        if authoritative and consumer.get("amount_due") not in (None, "")
+        else calculated_amount_due
+    )
     due_date_value = consumer.get("due_date")
     due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
     due_date = due_date_obj.isoformat()
-    penalty, after_due, penalty_source, bill_status = _calculate_penalty(consumer, current_bill, amount_due, due_date_obj, reference_date)
+    if authoritative:
+        penalty = (
+            _optional_money(consumer, "current_penalty")
+            if consumer.get("current_penalty") not in (None, "")
+            else _optional_money(consumer, "penalty")
+        )
+        after_due = (
+            _optional_money(consumer, "total_after_due_date")
+            if consumer.get("total_after_due_date") not in (None, "")
+            else round(amount_due + penalty, 2)
+        )
+        penalty_source = "backend bill"
+        bill_status = str(consumer.get("status") or consumer.get("bill_status") or "Unpaid")
+    else:
+        penalty, after_due, penalty_source, bill_status = _calculate_penalty(
+            consumer, current_bill, amount_due, due_date_obj, reference_date
+        )
     bill_status = previous_bill_status
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")

@@ -234,34 +234,42 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
         context.get("excess_rate_per_cubic"),
     )
 
-    latest_bill_sync_id = str(context.get("bill_sync_id") or "").strip()
-    current_sync_id = str(reading.get("reading_id") or "").strip()
-    same_bill = latest_bill_sync_id and current_sync_id and latest_bill_sync_id == current_sync_id
-
     due_days = _safe_int(context.get("due_days"), 15) or 15
     late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
-    latest_bill_status = str(context.get("bill_status") or "").strip().lower()
-    previous_balance = max(0.0, _safe_float(context.get("previous_balance")))
-    latest_amount_due = max(0.0, _safe_float(context.get("amount_due")))
-    stored_previous_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
-    stored_unpaid_penalty = max(0.0, _safe_float(context.get("penalty")))
-
     carried_balance = 0.0
     carried_penalty = 0.0
-    if same_bill:
-        carried_balance = previous_balance
-        carried_penalty = stored_previous_penalty
-    elif latest_bill_status and latest_bill_status != "paid":
-        latest_unpaid_principal = max(0.0, latest_amount_due - stored_previous_penalty)
-        carried_balance = max(previous_balance, latest_unpaid_principal)
-        computed_previous_penalty = round(carried_balance * (late_fee_percent / 100.0), 2)
-        stored_penalty = stored_previous_penalty if previous_balance > 0 else max(stored_previous_penalty, stored_unpaid_penalty)
-        carried_penalty = max(stored_penalty, computed_previous_penalty)
+
+    # This is only an offline estimate. A reliable carry-forward requires every
+    # unpaid monthly bill; a rolled-up latest bill must never be treated as new
+    # principal or have another penalty applied to it.
+    unpaid_bills = context.get("unpaid_bills")
+    if isinstance(unpaid_bills, list):
+        current_sync_id = str(reading.get("reading_id") or "").strip()
+        for unpaid_bill in unpaid_bills:
+            if not isinstance(unpaid_bill, dict):
+                continue
+            if str(unpaid_bill.get("status") or "Unpaid").strip().lower() == "paid":
+                continue
+            if current_sync_id and str(unpaid_bill.get("bill_id") or "").strip() == current_sync_id:
+                continue
+            original_amount = max(0.0, _safe_float(unpaid_bill.get("original_amount")))
+            own_penalty = max(0.0, _safe_float(unpaid_bill.get("own_penalty")))
+            unpaid_due_date = _parse_date(unpaid_bill.get("due_date"))
+            if own_penalty == 0 and unpaid_due_date is not None and reference_date > unpaid_due_date:
+                own_penalty = round(original_amount * (late_fee_percent / 100.0), 2)
+            carried_balance += original_amount
+            carried_penalty += own_penalty
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
-    due_date = datetime.combine(reference_date + timedelta(days=due_days), datetime.min.time())
+    supplied_due_date = _parse_date(reading.get("due_date") or reading.get("schedule_due_date"))
+    due_date_obj = supplied_due_date or (reference_date + timedelta(days=due_days))
+    due_date = datetime.combine(due_date_obj, datetime.min.time())
     amount_due = round(current_charge + carried_balance + carried_penalty, 2)
-    current_penalty = round(current_charge * (late_fee_percent / 100.0), 2)
+    current_penalty = (
+        round(current_charge * (late_fee_percent / 100.0), 2)
+        if reference_date > due_date_obj
+        else 0.0
+    )
     total_amount = amount_due
     total_after_due_date = round(amount_due + current_penalty, 2)
     reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())
@@ -1130,19 +1138,18 @@ class BackendApiClient:
         return data if isinstance(data, dict) and data else None
 
     def save_reading_bundle(self, payload: dict) -> dict:
-        context = self.get_consumer_context(int(payload["consumer_id"]))
-        merged = dict(context)
-        merged.update(payload)
+        merged = dict(payload)
         if self._meter_reader_id is not None:
             merged.setdefault("meter_reader_id", self._meter_reader_id)
-        bill = _build_bill_payload(merged, context, 0)
         status, data = self._req(
             "POST",
             "/api/handheld/reading-bundles",
-            payload={"reading": merged, "bill": bill},
+            payload={"reading": merged},
         )
         if status >= 400 or status == 0 or not isinstance(data, dict):
             raise self._request_failure(status, "/api/handheld/reading-bundles", data, "Backend reading sync failed.")
+        if not isinstance(data.get("bill"), dict):
+            raise RuntimeError("Backend reading sync succeeded but did not return the authoritative response.bill.")
         return data
 
     def upsert_meter_reading(self, payload: dict) -> dict:
