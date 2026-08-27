@@ -157,6 +157,17 @@ print(f"Qt version: {QT_VERSION}")
 print(f"QML main file: {QML_MAIN_FILE}")
 
 
+def _load_qml(quick: QQuickWidget, path: Path) -> None:
+    """Load a QML view and turn otherwise-silent load failures into startup errors."""
+    if not path.is_file():
+        raise RuntimeError(f"QML file was not found: {path}")
+    quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+    quick.setSource(QUrl.fromLocalFile(str(path)))
+    if quick.status() == QQuickWidget.Status.Error:
+        details = "\n".join(error.toString() for error in quick.errors())
+        raise RuntimeError(f"Unable to load the device UI from {path}:\n{details}")
+
+
 def _to_float(value, default: float = 0.0) -> float:
     if value in (None, ""):
         return default
@@ -2995,8 +3006,7 @@ class LoginPage(QWidget):
 
         self.quick = QQuickWidget()
         self.quick.rootContext().setContextProperty("loginBridge", self.bridge)
-        self.quick.setSource(QUrl.fromLocalFile(str(QML_LOGIN_FILE)))
-        self.quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        _load_qml(self.quick, QML_LOGIN_FILE)
         layout.addWidget(self.quick)
 
 
@@ -3010,8 +3020,7 @@ class MainContainerPage(QWidget):
 
         self.quick = QQuickWidget()
         self.quick.rootContext().setContextProperty("appBridge", self.bridge)
-        self.quick.setSource(QUrl.fromLocalFile(str(QML_MAIN_FILE)))
-        self.quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        _load_qml(self.quick, QML_MAIN_FILE)
         layout.addWidget(self.quick)
 
 

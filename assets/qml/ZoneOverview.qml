@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import QtQuick.Effects
 import "TouchMetrics.js" as TouchMetrics
 
 Rectangle {
@@ -357,15 +356,6 @@ Rectangle {
                         border.width: 1
                         clip: true
                         
-                        layer.enabled: true
-                        layer.effect: MultiEffect {
-                            shadowEnabled: true
-                            shadowBlur: 0.8
-                            shadowHorizontalOffset: 0
-                            shadowVerticalOffset: 4
-                            shadowColor: "#20000000"
-                        }
-
                         scale: progressCardMouse.pressed ? 0.985 : 1.0
                         transformOrigin: Item.Center
                         Behavior on scale { NumberAnimation { duration: 90 } }
