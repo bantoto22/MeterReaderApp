@@ -537,6 +537,11 @@ class HandheldSyncTests(unittest.TestCase):
                         "billing_month": "July 2026",
                         "date_covered_from": "2026-06-09 00:00:00",
                         "date_covered_to": "2026-07-09 00:00:00",
+                        "connection_fee_components": [
+                            {"code": "MTR", "amount": 25},
+                            {"code": "CONN", "amount": 10},
+                            {"code": "MEM", "amount": 5},
+                        ],
                     }
                 ]
             )
@@ -547,6 +552,9 @@ class HandheldSyncTests(unittest.TestCase):
             self.assertEqual(consumer["billing_month"], "July 2026")
             self.assertEqual(consumer["date_covered_from"], "2026-06-09 00:00:00")
             self.assertEqual(consumer["date_covered_to"], "2026-07-09 00:00:00")
+            self.assertEqual(consumer["water_meter_fee"], 25)
+            self.assertEqual(consumer["connection_fee"], 10)
+            self.assertEqual(consumer["membership_fee"], 5)
         finally:
             database._db_path = original_db_path
             try:
@@ -1093,6 +1101,71 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["penalty"], 3.0)
         self.assertEqual(payload["total_after_due_date"], 33.0)
 
+    def test_bill_payload_includes_fees_but_never_penalizes_them(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "fee-rule-current",
+                "consumer_id": 42,
+                "present_reading": 10,
+                "previous_reading": 0,
+                "consumption": 10,
+                "reading_date": "2026-07-09",
+                "due_date": "2026-07-08",
+            },
+            {
+                "minimum_cubic": 10,
+                "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+                "late_fee": 10,
+                "connection_fee_components": [
+                    {"component_code": "MTR", "component_amount": 25},
+                    {"fee_code": "CONN", "fee_amount": 10},
+                    {"type": "MEM", "value": 5},
+                ],
+            },
+            101,
+        )
+
+        self.assertEqual(payload["meter_maintenance_fee"], 25.0)
+        self.assertEqual(payload["connection_fee"], 10.0)
+        self.assertEqual(payload["membership_fee"], 5.0)
+        self.assertEqual(payload["amount_due"], 140.0)
+        self.assertEqual(payload["penalty"], 10.0)
+        self.assertEqual(payload["total_after_due_date"], 150.0)
+
+    def test_prior_unpaid_fees_are_excluded_from_reconstructed_penalty(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "fee-rule-prior",
+                "consumer_id": 42,
+                "present_reading": 0,
+                "previous_reading": 0,
+                "consumption": 0,
+                "reading_date": "2026-07-09",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "late_fee": 10,
+                "unpaid_bills": [{
+                    "bill_id": "prior-with-fees",
+                    "original_amount": 140,
+                    "water_charge": 100,
+                    "meter_maintenance_fee": 25,
+                    "connection_fee": 10,
+                    "membership_fee": 5,
+                    "due_date": "2026-06-01",
+                    "status": "Unpaid",
+                }],
+            },
+            102,
+        )
+
+        self.assertEqual(payload["previous_balance"], 140.0)
+        self.assertEqual(payload["previous_penalty"], 10.0)
+        self.assertEqual(payload["amount_due"], 150.0)
+
     def test_receipt_total_uses_current_reading_bill_not_stale_amount_due(self):
         text = build_receipt_text(
             {
@@ -1124,6 +1197,43 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Coverage   : 2026-07-01 to", text)
         self.assertIn("TOTAL DUE   : PHP    10.00", text)
         self.assertNotIn("TOTAL DUE   : PHP   339.00", text)
+
+    def test_receipt_lists_fees_and_penalizes_only_the_water_charge(self):
+        text = build_receipt_text(
+            {
+                "id": 42,
+                "acct_no": "09-99-0000",
+                "name": "Test Consumer",
+                "zone_name": "Zone 1",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-TEST",
+                "minimum_cubic": 10,
+                "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+                "due_days": 15,
+                "due_date": "2026-07-08",
+                "late_fee": 10,
+                "bill_status": "Unpaid",
+                "connection_fee_components": {
+                    "MTR": 25,
+                    "CONN": {"amount": 10},
+                    "MEM": {"fee_amount": 5},
+                },
+            },
+            previous=0,
+            present=10,
+            exception="None",
+            reader_name="Reader",
+            reading_date="2026-07-09",
+        )
+
+        self.assertIn("Water Meter Fee: PHP    25.00", text)
+        self.assertIn("Connection Fee: PHP    10.00", text)
+        self.assertIn("Membership Fee: PHP     5.00", text)
+        self.assertIn("Due Pen(10%): PHP    10.00", text)
+        self.assertIn("TOTAL DUE   : PHP   140.00", text)
+        self.assertIn("AFTER DUE   : PHP   150.00", text)
 
     def test_receipt_total_includes_previous_balance(self):
         text = build_receipt_text(
@@ -1426,6 +1536,7 @@ class HandheldSyncTests(unittest.TestCase):
                     "id": 21, "consumer_id": 21, "meter_no": "MTR-21", "acct_no": "02-11-152-A1",
                     "name": "Connection A1", "zone_name": "Zone A", "schedule_id": 901,
                     "assignment_order": 2, "reading_route_id": "ROUTE-901",
+                    "meter_maintenance_fee": 25, "connection_fee": 10, "membership_fee": 5,
                 },
                 {
                     "id": 20, "consumer_id": 20, "meter_no": "MTR-20", "acct_no": "02-11-152-0",
@@ -1443,6 +1554,9 @@ class HandheldSyncTests(unittest.TestCase):
             self.assertEqual([row["assignment_order"] for row in cached], [1, 2])
             self.assertTrue(all(row["reading_route_id"] == "ROUTE-901" for row in cached))
             self.assertTrue(all(row["schedule_id"] == 901 for row in cached))
+            self.assertEqual(cached[1]["water_meter_fee"], 25)
+            self.assertEqual(cached[1]["connection_fee"], 10)
+            self.assertEqual(cached[1]["membership_fee"], 5)
         finally:
             gc.collect()
             try:

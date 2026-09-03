@@ -207,6 +207,69 @@ def _optional_money(consumer: dict, field_name: str) -> float:
         return 0.0
 
 
+_FEE_ALIASES = {
+    "water_meter_fee": ("water_meter_fee", "meter_maintenance_fee", "meter_fee"),
+    "connection_fee": ("connection_fee",),
+    "membership_fee": ("membership_fee",),
+}
+
+_FEE_COMPONENT_CODES = {
+    "water_meter_fee": "MTR",
+    "connection_fee": "CONN",
+    "membership_fee": "MEM",
+}
+
+
+def _component_fee(source: dict, fee_name: str) -> float | None:
+    components = source.get("connection_fee_components")
+    target_code = _FEE_COMPONENT_CODES[fee_name]
+    if isinstance(components, dict):
+        value = components.get(target_code, components.get(target_code.lower()))
+        if isinstance(value, dict):
+            for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                if value.get(amount_name) not in (None, ""):
+                    return _optional_money(value, amount_name)
+        elif value not in (None, ""):
+            return _optional_money({"value": value}, "value")
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            code = next(
+                (
+                    component.get(code_name)
+                    for code_name in (
+                        "code", "component_code", "fee_code", "fee_type", "component", "type", "component_type"
+                    )
+                    if component.get(code_name) not in (None, "")
+                ),
+                "",
+            )
+            if str(code).strip().upper() != target_code:
+                continue
+            for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                if component.get(amount_name) not in (None, ""):
+                    return _optional_money(component, amount_name)
+    return None
+
+
+def _consumer_fee(consumer: dict, fee_name: str) -> float:
+    """Read a concessionaire fee from flat or nested backend bill data."""
+    component_value = _component_fee(consumer, fee_name)
+    if component_value is not None:
+        return component_value
+    sources = [consumer]
+    for container_name in ("fees", "consumer_fees", "concessionaire_fees"):
+        nested = consumer.get(container_name)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    for source in sources:
+        for field_name in _FEE_ALIASES[fee_name]:
+            if source.get(field_name) not in (None, ""):
+                return _optional_money(source, field_name)
+    return 0.0
+
+
 def apply_authoritative_bill(consumer: dict, bill: dict) -> dict:
     """Overlay a backend-calculated bill onto consumer display metadata."""
     snapshot = dict(consumer)
@@ -253,13 +316,23 @@ def build_receipt_text(
     _require_billing_profile(consumer)
     consumption = present - previous
     calculated_current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
+    water_meter_fee = _consumer_fee(consumer, "water_meter_fee")
+    connection_fee = _consumer_fee(consumer, "connection_fee")
+    membership_fee = _consumer_fee(consumer, "membership_fee")
+    concessionaire_fees = round(water_meter_fee + connection_fee + membership_fee, 2)
     authoritative = bool(consumer.get("_authoritative_bill"))
     current_bill = calculated_current_bill
     if authoritative:
-        for field_name in ("current_month_amount", "original_amount", "water_charge", "class_cost"):
+        for field_name in ("water_charge", "class_cost"):
             if consumer.get(field_name) not in (None, ""):
                 current_bill = _optional_money(consumer, field_name)
                 break
+        else:
+            for field_name in ("current_month_amount", "original_amount"):
+                if consumer.get(field_name) not in (None, ""):
+                    # Some backend totals include the non-penalizable fees.
+                    current_bill = max(0.0, round(_optional_money(consumer, field_name) - concessionaire_fees, 2))
+                    break
 
     now = datetime.datetime.now()
     reference_date = _parse_date(str(reading_date)) if reading_date not in (None, "") else now.date()
@@ -267,7 +340,10 @@ def build_receipt_text(
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
     carried_previous_bill, previous_penalty, previous_bill_status = _carried_previous_bill(consumer)
-    calculated_amount_due = round(current_bill + carried_previous_bill + previous_penalty, 2)
+    calculated_amount_due = round(
+        current_bill + concessionaire_fees + carried_previous_bill + previous_penalty,
+        2,
+    )
     amount_due = (
         _optional_money(consumer, "amount_due")
         if authoritative and consumer.get("amount_due") not in (None, "")
@@ -337,6 +413,9 @@ def build_receipt_text(
         _money_line("Min Rate", minimum_rate),
         _money_line("Excess Rate", excess_rate),
         _money_line("Current Bill", current_bill),
+        _money_line("Water Meter Fee", water_meter_fee),
+        _money_line("Connection Fee", connection_fee),
+        _money_line("Membership Fee", membership_fee),
         _money_line("Due Pen(10%)", penalty),
         _money_line("Previous", carried_previous_bill),
         _money_line("Prev Pen(10%)", previous_penalty),

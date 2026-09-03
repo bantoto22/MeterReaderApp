@@ -199,6 +199,68 @@ def _compute_charge(consumption: int, minimum_cubic, minimum_rate, excess_rate_p
     return round(minimum_rate_val + ((safe_consumption - minimum_cubic_int) * excess_rate_val), 2)
 
 
+_FEE_ALIASES = {
+    "water_meter_fee": ("water_meter_fee", "meter_maintenance_fee", "meter_fee"),
+    "connection_fee": ("connection_fee",),
+    "membership_fee": ("membership_fee",),
+}
+
+_FEE_COMPONENT_CODES = {
+    "water_meter_fee": "MTR",
+    "connection_fee": "CONN",
+    "membership_fee": "MEM",
+}
+
+
+def _component_fee(source: dict, fee_name: str) -> float | None:
+    components = source.get("connection_fee_components")
+    target_code = _FEE_COMPONENT_CODES[fee_name]
+    if isinstance(components, dict):
+        value = components.get(target_code, components.get(target_code.lower()))
+        if isinstance(value, dict):
+            for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                if value.get(amount_name) not in (None, ""):
+                    return max(0.0, _safe_float(value.get(amount_name)))
+        elif value not in (None, ""):
+            return max(0.0, _safe_float(value))
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            code = next(
+                (
+                    component.get(code_name)
+                    for code_name in (
+                        "code", "component_code", "fee_code", "fee_type", "component", "type", "component_type"
+                    )
+                    if component.get(code_name) not in (None, "")
+                ),
+                "",
+            )
+            if str(code).strip().upper() != target_code:
+                continue
+            for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                if component.get(amount_name) not in (None, ""):
+                    return max(0.0, _safe_float(component.get(amount_name)))
+    return None
+
+
+def _fee_value(source: dict, fee_name: str) -> float:
+    component_value = _component_fee(source, fee_name)
+    if component_value is not None:
+        return component_value
+    sources = [source]
+    for container_name in ("fees", "consumer_fees", "concessionaire_fees"):
+        nested = source.get(container_name)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    for candidate in sources:
+        for field_name in _FEE_ALIASES[fee_name]:
+            if candidate.get(field_name) not in (None, ""):
+                return max(0.0, _safe_float(candidate.get(field_name)))
+    return 0.0
+
+
 def _calculate_visible_penalty(
     amount_due,
     due_date_value,
@@ -233,6 +295,10 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
         context.get("minimum_rate"),
         context.get("excess_rate_per_cubic"),
     )
+    water_meter_fee = _fee_value(context, "water_meter_fee")
+    connection_fee = _fee_value(context, "connection_fee")
+    membership_fee = _fee_value(context, "membership_fee")
+    concessionaire_fees = round(water_meter_fee + connection_fee + membership_fee, 2)
 
     due_days = _safe_int(context.get("due_days"), 15) or 15
     late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
@@ -256,7 +322,16 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
             own_penalty = max(0.0, _safe_float(unpaid_bill.get("own_penalty")))
             unpaid_due_date = _parse_date(unpaid_bill.get("due_date"))
             if own_penalty == 0 and unpaid_due_date is not None and reference_date > unpaid_due_date:
-                own_penalty = round(original_amount * (late_fee_percent / 100.0), 2)
+                prior_fees = sum(_fee_value(unpaid_bill, name) for name in _FEE_ALIASES)
+                penalty_base = next(
+                    (
+                        max(0.0, _safe_float(unpaid_bill.get(field_name)))
+                        for field_name in ("water_charge", "class_cost")
+                        if unpaid_bill.get(field_name) not in (None, "")
+                    ),
+                    max(0.0, original_amount - prior_fees),
+                )
+                own_penalty = round(penalty_base * (late_fee_percent / 100.0), 2)
             carried_balance += original_amount
             carried_penalty += own_penalty
 
@@ -264,7 +339,7 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     supplied_due_date = _parse_date(reading.get("due_date") or reading.get("schedule_due_date"))
     due_date_obj = supplied_due_date or (reference_date + timedelta(days=due_days))
     due_date = datetime.combine(due_date_obj, datetime.min.time())
-    amount_due = round(current_charge + carried_balance + carried_penalty, 2)
+    amount_due = round(current_charge + concessionaire_fees + carried_balance + carried_penalty, 2)
     current_penalty = (
         round(current_charge * (late_fee_percent / 100.0), 2)
         if reference_date > due_date_obj
@@ -290,8 +365,11 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
         "disconnection_date": None,
         "class_cost": round(current_charge, 2),
         "water_charge": round(current_charge, 2),
-        "meter_maintenance_fee": 0.0,
-        "connection_fee": 0.0,
+        # The backend bill schema calls the water-meter charge
+        # meter_maintenance_fee. It is a fee for the meter itself.
+        "meter_maintenance_fee": water_meter_fee,
+        "connection_fee": connection_fee,
+        "membership_fee": membership_fee,
         "amount_due": amount_due,
         "previous_balance": round(carried_balance, 2),
         "previous_penalty": round(carried_penalty, 2),
@@ -464,6 +542,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             _safe_float(row.get("total_after_due_date"), None),
             row.get("bill_status"),
             _safe_float(row.get("late_fee"), None),
+            _fee_value(row, "water_meter_fee"),
+            _fee_value(row, "connection_fee"),
+            _fee_value(row, "membership_fee"),
             _safe_float(row.get("previous_reading"), 0.0),
         )
 
@@ -564,6 +645,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             total_after_due_date REAL,
             bill_status TEXT,
             late_fee REAL,
+            water_meter_fee REAL NOT NULL DEFAULT 0,
+            connection_fee REAL NOT NULL DEFAULT 0,
+            membership_fee REAL NOT NULL DEFAULT 0,
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -650,6 +734,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "total_after_due_date": "REAL",
                     "bill_status": "TEXT",
                     "late_fee": "REAL",
+                    "water_meter_fee": "REAL NOT NULL DEFAULT 0",
+                    "connection_fee": "REAL NOT NULL DEFAULT 0",
+                    "membership_fee": "REAL NOT NULL DEFAULT 0",
                 },
             )
             self._ensure_columns(
@@ -755,10 +842,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             minimum_cubic, minimum_rate, excess_rate_per_cubic, due_days, penalty_percent,
             billing_month, date_covered_from, date_covered_to,
             amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
-            bill_status, late_fee,
+            bill_status, late_fee, water_meter_fee, connection_fee, membership_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
@@ -783,6 +870,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             total_after_due_date = excluded.total_after_due_date,
             bill_status = excluded.bill_status,
             late_fee = excluded.late_fee,
+            water_meter_fee = excluded.water_meter_fee,
+            connection_fee = excluded.connection_fee,
+            membership_fee = excluded.membership_fee,
             previous_reading = excluded.previous_reading,
             updated_at = CURRENT_TIMESTAMP
         """
@@ -843,7 +933,8 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                hc.minimum_cubic, hc.minimum_rate, hc.excess_rate_per_cubic, hc.due_days, hc.penalty_percent,
                hc.billing_month, hc.date_covered_from, hc.date_covered_to,
                hc.amount_due, hc.previous_balance, hc.due_date, hc.penalty, hc.previous_penalty,
-               hc.total_after_due_date, hc.bill_status, hc.late_fee, hc.previous_reading,
+               hc.total_after_due_date, hc.bill_status, hc.late_fee,
+               hc.water_meter_fee, hc.connection_fee, hc.membership_fee, hc.previous_reading,
                ha.schedule_id, ha.assignment_order, ha.reading_route_id,
                ha.schedule_date, ha.schedule_due_date, ha.billing_cycle,
                ha.is_read, ha.reading_status, ha.reading_sync_status

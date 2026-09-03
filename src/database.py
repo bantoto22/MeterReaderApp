@@ -121,6 +121,9 @@ def init_db():
             total_after_due_date REAL,
             bill_status TEXT,
             late_fee REAL,
+            water_meter_fee REAL NOT NULL DEFAULT 0,
+            connection_fee REAL NOT NULL DEFAULT 0,
+            membership_fee REAL NOT NULL DEFAULT 0,
             latest_reading REAL,
             latest_reading_date TEXT,
             zone_id          INTEGER NOT NULL,
@@ -269,6 +272,9 @@ def init_db():
             "total_after_due_date": "REAL",
             "bill_status": "TEXT",
             "late_fee": "REAL",
+            "water_meter_fee": "REAL NOT NULL DEFAULT 0",
+            "connection_fee": "REAL NOT NULL DEFAULT 0",
+            "membership_fee": "REAL NOT NULL DEFAULT 0",
             "latest_reading": "REAL",
             "latest_reading_date": "TEXT",
         },
@@ -907,6 +913,7 @@ def search_consumer(
                     c.billing_month, c.date_covered_from, c.date_covered_to,
                     c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
                     c.bill_status, c.late_fee,
+                    c.water_meter_fee, c.connection_fee, c.membership_fee,
                     z.name AS zone_name
              FROM consumers c
              JOIN zones z ON c.zone_id = z.id
@@ -1019,6 +1026,7 @@ def get_consumer_by_id(
                     c.billing_month, c.date_covered_from, c.date_covered_to,
                     c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
                     c.bill_status, c.late_fee,
+                    c.water_meter_fee, c.connection_fee, c.membership_fee,
                     z.name AS zone_name
              FROM consumers c
              JOIN zones z ON c.zone_id = z.id
@@ -1088,6 +1096,7 @@ def search_consumers_by_zone(
                     c.billing_month, c.date_covered_from, c.date_covered_to,
                     c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty, c.total_after_due_date,
                     c.bill_status, c.late_fee,
+                    c.water_meter_fee, c.connection_fee, c.membership_fee,
                     z.name AS zone_name
              FROM consumers c
              JOIN zones z ON c.zone_id = z.id
@@ -1611,6 +1620,7 @@ def get_zone_consumers_with_status(
             c.penalty_percent, c.billing_month, c.date_covered_from, c.date_covered_to,
             c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty,
             c.total_after_due_date, c.bill_status, c.late_fee,
+            c.water_meter_fee, c.connection_fee, c.membership_fee,
             ra.schedule_id, ra.schedule_date, ra.schedule_due_date, ra.billing_cycle,
             ra.assignment_order, ra.reading_route_id,
             ra.zone_name, ra.is_read, ra.reading_status, ra.reading_sync_status,
@@ -1654,6 +1664,9 @@ def get_zone_consumers_with_status(
             c.total_after_due_date,
             c.bill_status,
             c.late_fee,
+            c.water_meter_fee,
+            c.connection_fee,
+            c.membership_fee,
             CASE
                 WHEN r.id IS NOT NULL THEN 1
                 WHEN c.latest_reading_date IS NOT NULL
@@ -1731,6 +1744,9 @@ def get_zone_consumers_with_status(
             c.total_after_due_date,
             c.bill_status,
             c.late_fee,
+            c.water_meter_fee,
+            c.connection_fee,
+            c.membership_fee,
             CASE
                 WHEN r.id IS NOT NULL THEN 1
                 WHEN c.latest_reading_date IS NOT NULL THEN 1
@@ -1813,6 +1829,58 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
             return None
         return float(value)
 
+    def _fee_value(consumer: dict, *field_names: str) -> float:
+        component_codes = {
+            "water_meter_fee": "MTR",
+            "connection_fee": "CONN",
+            "membership_fee": "MEM",
+        }
+        canonical_name = field_names[0]
+        target_code = component_codes[canonical_name]
+        components = consumer.get("connection_fee_components")
+        if isinstance(components, dict):
+            value = components.get(target_code, components.get(target_code.lower()))
+            if isinstance(value, dict):
+                for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                    amount = _optional_float(value.get(amount_name))
+                    if amount is not None:
+                        return max(0.0, amount)
+            else:
+                amount = _optional_float(value)
+                if amount is not None:
+                    return max(0.0, amount)
+        elif isinstance(components, list):
+            for component in components:
+                if not isinstance(component, dict):
+                    continue
+                code = next(
+                    (
+                        component.get(code_name)
+                        for code_name in (
+                            "code", "component_code", "fee_code", "fee_type", "component", "type", "component_type"
+                        )
+                        if component.get(code_name) not in (None, "")
+                    ),
+                    "",
+                )
+                if str(code).strip().upper() != target_code:
+                    continue
+                for amount_name in ("amount", "fee_amount", "component_amount", "value"):
+                    amount = _optional_float(component.get(amount_name))
+                    if amount is not None:
+                        return max(0.0, amount)
+        sources = [consumer]
+        for container_name in ("fees", "consumer_fees", "concessionaire_fees"):
+            nested = consumer.get(container_name)
+            if isinstance(nested, dict):
+                sources.append(nested)
+        for source in sources:
+            for field_name in field_names:
+                value = _optional_float(source.get(field_name))
+                if value is not None:
+                    return max(0.0, value)
+        return 0.0
+
     zone_names = sorted(
         {
             (c.get("zone_name") or "Unassigned").strip()
@@ -1883,6 +1951,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         total_after_due_date = _optional_float(c.get("total_after_due_date"))
         bill_status = (str(c.get("bill_status")).strip() if c.get("bill_status") not in (None, "") else None)
         late_fee = _optional_float(c.get("late_fee"))
+        water_meter_fee = _fee_value(c, "water_meter_fee", "meter_maintenance_fee", "meter_fee")
+        connection_fee = _fee_value(c, "connection_fee")
+        membership_fee = _fee_value(c, "membership_fee")
         latest_reading = _optional_float(c.get("latest_reading"))
         latest_reading_date = (str(c.get("latest_reading_date") or c.get("latest_reading_updated_at")).strip() if c.get("latest_reading_date") not in (None, "") or c.get("latest_reading_updated_at") not in (None, "") else None)
         cid = c.get("id") or c.get("consumer_id")
@@ -1897,9 +1968,11 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id
+                    previous_penalty, total_after_due_date, bill_status, late_fee,
+                    water_meter_fee, connection_fee, membership_fee,
+                    latest_reading, latest_reading_date, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     meter_no = excluded.meter_no,
                     acct_no = excluded.acct_no,
@@ -1924,6 +1997,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     total_after_due_date = excluded.total_after_due_date,
                     bill_status = excluded.bill_status,
                     late_fee = excluded.late_fee,
+                    water_meter_fee = excluded.water_meter_fee,
+                    connection_fee = excluded.connection_fee,
+                    membership_fee = excluded.membership_fee,
                     latest_reading = excluded.latest_reading,
                     latest_reading_date = excluded.latest_reading_date,
                     zone_id = excluded.zone_id
@@ -1933,7 +2009,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id,
+                    previous_penalty, total_after_due_date, bill_status, late_fee,
+                    water_meter_fee, connection_fee, membership_fee,
+                    latest_reading, latest_reading_date, zone_id,
                 ),
             )
         else:
@@ -1944,9 +2022,11 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id
+                    previous_penalty, total_after_due_date, bill_status, late_fee,
+                    water_meter_fee, connection_fee, membership_fee,
+                    latest_reading, latest_reading_date, zone_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(meter_no) DO UPDATE SET
                     acct_no = excluded.acct_no,
                     name = COALESCE(NULLIF(NULLIF(NULLIF(TRIM(excluded.name), ''), 'Unknown'), 'unknown'), consumers.name),
@@ -1970,6 +2050,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     total_after_due_date = excluded.total_after_due_date,
                     bill_status = excluded.bill_status,
                     late_fee = excluded.late_fee,
+                    water_meter_fee = excluded.water_meter_fee,
+                    connection_fee = excluded.connection_fee,
+                    membership_fee = excluded.membership_fee,
                     latest_reading = excluded.latest_reading,
                     latest_reading_date = excluded.latest_reading_date,
                     zone_id = excluded.zone_id
@@ -1979,7 +2062,9 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     classification_name, minimum_cubic, minimum_rate, excess_rate_per_cubic,
                     due_days, penalty_percent, billing_month, date_covered_from, date_covered_to,
                     amount_due, previous_balance, due_date, penalty,
-                    previous_penalty, total_after_due_date, bill_status, late_fee, latest_reading, latest_reading_date, zone_id,
+                    previous_penalty, total_after_due_date, bill_status, late_fee,
+                    water_meter_fee, connection_fee, membership_fee,
+                    latest_reading, latest_reading_date, zone_id,
                 ),
             )
             local_row = cur.execute("SELECT id FROM consumers WHERE meter_no = ?", (meter_no,)).fetchone()

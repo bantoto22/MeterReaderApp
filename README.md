@@ -135,6 +135,14 @@ backend must persist `schedule_id` on the meter reading, accept a valid late
 reading, and clear reader/biller exceptions only after that reading is committed.
 Rejected or deleted readings must leave the assignment pending.
 
+The assigned-consumer/context response and the authoritative `response.bill` must
+also expose the concessionaire's `connection_fee_components` records. The device
+maps component code `MTR` to **Water Meter Fee**, `CONN` to **Connection Fee**, and
+`MEM` to **Membership Fee**. Flat `meter_maintenance_fee`, `connection_fee`, and
+`membership_fee` bill fields remain supported. These fees are added to the amount
+due, but they must never be included in either the current or carried penalty
+base. The penalty base is the water-consumption charge only.
+
 Schedules are grouped on the device only when meter reader, scheduled date, due
 date, and billing cycle match. Each grouped route keeps its zone schedules and
 their original IDs. “All zones” is a display filter only: consumer lookup,
