@@ -11,6 +11,11 @@ import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
 
+try:
+    from .sqlite_support import connect_sqlite
+except ImportError:
+    from sqlite_support import connect_sqlite
+
 sqlite3.register_adapter(Decimal, float)
 
 DB_NAME = "meter.db"
@@ -55,11 +60,7 @@ def _db_path():
 
 def get_connection():
     """Return a new connection to the database with foreign keys enabled."""
-    conn = sqlite3.connect(_db_path(), timeout=15.0)
-    conn.row_factory = sqlite3.Row          # allows dict-like access on rows
-    conn.execute("PRAGMA busy_timeout = 15000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return connect_sqlite(_db_path())
 
 
 def _sqlite_safe(value):

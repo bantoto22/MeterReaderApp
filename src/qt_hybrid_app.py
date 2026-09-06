@@ -118,13 +118,14 @@ except ImportError:
     )
 
 try:
-    from .handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
+    from .handheld_sync import HandheldSyncDataAccess, SyncConfig, _build_bill_payload, format_sync_error
 except ImportError:
     try:
-        from handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
+        from handheld_sync import HandheldSyncDataAccess, SyncConfig, _build_bill_payload, format_sync_error
     except ImportError:
         HandheldSyncDataAccess = None
         SyncConfig = None
+        _build_bill_payload = None
 
         def format_sync_error(stage: str, exc, endpoint: str = "") -> str:
             return f"Stage: {stage}\nProblem: {exc}"
@@ -604,6 +605,7 @@ class AppBridge(QObject):
     printHistoryFiltersChanged = Signal()
     printHistoryDetailChanged = Signal()
     printExecutionFinished = Signal(object)
+    printPreparationFinished = Signal(object)
     assignedDatasetFinished = Signal(object)
 
     # Circular progress / dashboard stats
@@ -713,6 +715,7 @@ class AppBridge(QObject):
         self.powerOffFailed.connect(self._finish_power_off_failure)
         self.testPrintFinished.connect(self._finish_test_print)
         self.printExecutionFinished.connect(self._finish_print_execution)
+        self.printPreparationFinished.connect(self._finish_print_preparation)
         self.assignedDatasetFinished.connect(self._finish_assigned_consumer_dataset)
 
         self._wifi_timer = QTimer(self)
@@ -1704,10 +1707,10 @@ class AppBridge(QObject):
             return
         self._start_assigned_consumer_dataset_refresh()
 
-    def _ensure_current_consumer_receipt_context(self) -> None:
+    def _ensure_current_consumer_receipt_context(self, force_refresh: bool = False) -> None:
         if not self._consumer or not self._sync_dal:
             return
-        if not _has_receipt_context_gaps(self._consumer):
+        if not force_refresh and not _has_receipt_context_gaps(self._consumer):
             return
         consumer_id = self._consumer.get("id")
         try:
@@ -1722,6 +1725,11 @@ class AppBridge(QObject):
             return
         replace_consumers_from_sync([refreshed])
         self._reload_current_consumer_from_db()
+        # Keep response-only billing details such as unpaid_bills in memory;
+        # the normalized consumer cache intentionally stores only scalar data.
+        current = dict(self._consumer or {})
+        current.update(refreshed)
+        self._consumer = current
 
     @Slot(bool)
     def setAutoSyncEnabled(self, enabled: bool) -> None:
@@ -1880,11 +1888,13 @@ class AppBridge(QObject):
             "membership_fee": consumer.get("membership_fee"),
             "amount_due": consumer.get("amount_due"),
             "previous_balance": consumer.get("previous_balance"),
+            "prior_bill_due_date": consumer.get("due_date"),
             "due_date": due_date or consumer.get("due_date"),
             "penalty": consumer.get("penalty"),
             "previous_penalty": consumer.get("previous_penalty"),
             "total_after_due_date": consumer.get("total_after_due_date"),
             "bill_status": consumer.get("bill_status"),
+            "unpaid_bills": consumer.get("unpaid_bills"),
             "meter_reader_id": self._meter_reader_account_id or None,
             "previous_reading": consumer.get("previous_reading"),
             "present_reading": present,
@@ -1914,7 +1924,10 @@ class AppBridge(QObject):
                         return self._sync_dal.saveMeterReading(payload)
                     return self._sync_dal.queueMeterReading(payload)
             except Exception as exc:
-                self._sync_logs = format_sync_error("Saving reading to the local retry queue", exc, self._backend_endpoint)
+                diagnostic = format_sync_error("Saving reading to the local retry queue", exc, self._backend_endpoint)
+                if wait_for_result:
+                    raise RuntimeError(diagnostic) from exc
+                self._sync_logs = diagnostic
                 self._backend_status = "Sync Failed"
                 self._backend_logs = self._sync_logs
                 self.syncLogsChanged.emit()
@@ -1923,9 +1936,7 @@ class AppBridge(QObject):
                 return None
 
         if wait_for_result:
-            result = _save()
-            self._refresh_sync_snapshot()
-            return result
+            return _save()
 
         def _task() -> None:
             _save()
@@ -2399,7 +2410,7 @@ class AppBridge(QObject):
 
     def _build_pending_receipt_job(self) -> dict:
         self._reload_current_consumer_from_db()
-        self._ensure_current_consumer_receipt_context()
+        self._ensure_current_consumer_receipt_context(force_refresh=True)
         present = _to_float(self._present_reading)
         previous = _to_float(self._consumer["previous_reading"])
         consumption = present - previous
@@ -2425,36 +2436,26 @@ class AppBridge(QObject):
         consumer_snapshot["due_date"] = due_date
         consumer_snapshot["billing_reference"] = billing_reference
         flagged = consumption > 500 or exception != "None"
-        if due_date:
-            update_consumer_due_date(self._consumer["id"], due_date)
-        reading_id = save_reading(
-            self._consumer["id"], present, consumption, exception, flagged, reading_date,
-            schedule_id=schedule_id, schedule_date=schedule_date,
-            schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
-            reading_route_id=reading_route_id, assignment_order=assignment_order,
-            reading_status="valid", reading_sync_status="pending",
-            sync_reading_id=sync_reading_id, captured_at=captured_at,
+        if _build_bill_payload is None:
+            raise RuntimeError("Billing calculation is unavailable.")
+        preview_bill = _build_bill_payload(
+            {
+                "reading_id": sync_reading_id,
+                "consumer_id": self._consumer["id"],
+                "previous_reading": previous,
+                "present_reading": present,
+                "consumption": consumption,
+                "reading_date": reading_date,
+                "due_date": due_date,
+            },
+            self._consumer,
+            0,
         )
-        sync_result = self._save_to_sync_layer(
-            self._consumer["id"], present, consumption, exception, flagged, reading_date, due_date,
-            sync_reading_id=sync_reading_id, captured_at=captured_at,
-            schedule_id=schedule_id, schedule_date=schedule_date,
-            schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
-            reading_route_id=reading_route_id, assignment_order=assignment_order,
-            bill_sync_id=bill_sync_id, bill_date=reading_date,
-            billing_reference=billing_reference,
-            wait_for_result=True,
-        )
-        if not sync_result:
-            raise RuntimeError("The reserved bill could not be persisted to the local retry queue.")
-        if sync_result.get("status") == "conflict":
-            errors = sync_result.get("errors") or []
-            detail = str(errors[0]) if errors else "The reserved reference conflicts with the submitted bill."
-            raise RuntimeError(f"The bill was not printed because the backend rejected it. {detail}")
-        authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
-        if authoritative_bill:
-            consumer_snapshot = apply_authoritative_bill(consumer_snapshot, authoritative_bill)
-            due_date = _normalize_iso_date(consumer_snapshot.get("due_date")) or due_date
+        preview_bill.update({
+            "sync_id": bill_sync_id,
+            "billing_reference": billing_reference,
+        })
+        consumer_snapshot = apply_authoritative_bill(consumer_snapshot, preview_bill)
         receipt = build_receipt_text(
             consumer_snapshot,
             previous,
@@ -2467,8 +2468,8 @@ class AppBridge(QObject):
             "job_type": "original",
             "consumer_snapshot": consumer_snapshot,
             "consumer_id": self._consumer["id"],
-            "reading_id": reading_id,
-            "saved_locally": True,
+            "reading_id": None,
+            "saved_locally": False,
             "previous": previous,
             "present": present,
             "consumption": consumption,
@@ -2485,13 +2486,15 @@ class AppBridge(QObject):
             "bill_sync_id": bill_sync_id,
             "billing_reference": billing_reference,
             "captured_at": captured_at,
-            "authoritative_bill": authoritative_bill,
+            "authoritative_bill": None,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }
 
     @Slot()
     def printReceipt(self) -> None:
+        if self._operation_busy:
+            return
         if not self._consumer or not self._present_reading:
             self.alertRequested.emit("Missing Details", "Select a consumer and enter a present reading.")
             return
@@ -2509,13 +2512,35 @@ class AppBridge(QObject):
             if self._paper_status.lower() in {"out", "jam"}:
                 self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
                 return
-            job = self._build_pending_receipt_job()
-            self._open_print_preview("Print Preview", job["receipt_text"], "Proceed to Print", job)
-            self.update_stats()
-            self._refresh_search_suggestions()
-            self._refresh_zone_consumers()
         except Exception as e:
             self.alertRequested.emit("Save Failed", str(e))
+            return
+
+        self._set_operation_busy(True, "Preparing bill...")
+
+        def _task() -> None:
+            try:
+                job = self._build_pending_receipt_job()
+                self.printPreparationFinished.emit({"success": True, "job": job})
+            except Exception as exc:
+                self.printPreparationFinished.emit({"success": False, "error": str(exc)})
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _finish_print_preparation(self, result: dict) -> None:
+        self._set_operation_busy(False, "")
+        self._refresh_sync_snapshot()
+        if not result.get("success"):
+            self.alertRequested.emit("Save Failed", str(result.get("error") or "Unable to prepare the bill."))
+            return
+        job = result.get("job")
+        if not isinstance(job, dict):
+            self.alertRequested.emit("Save Failed", "The prepared bill response was invalid.")
+            return
+        self._open_print_preview("Print Preview", job["receipt_text"], "Proceed to Print", job)
+        self.update_stats()
+        self._refresh_search_suggestions()
+        self._refresh_zone_consumers()
 
     @Slot(int)
     def setBatteryLevel(self, level: int) -> None:
@@ -2639,7 +2664,7 @@ class AppBridge(QObject):
 
         job = dict(self._pending_print_job)
 
-        if job.get("job_type") != "original" and not can_use_system_printer():
+        if not can_use_system_printer():
             self.alertRequested.emit(
                 "Printer Error",
                 "Unable to print. Please check that the thermal printer is connected, powered on, and ready.",
@@ -2674,13 +2699,34 @@ class AppBridge(QObject):
                             reading_status="valid", reading_sync_status="pending",
                             sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
                         )
-                        self._save_to_sync_layer(
+                        sync_result = self._save_to_sync_layer(
                             job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date,
                             sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
                             schedule_id=job.get("schedule_id"), schedule_date=job.get("schedule_date"),
                             schedule_due_date=job.get("schedule_due_date"), billing_cycle=job.get("billing_cycle"),
                             reading_route_id=job.get("reading_route_id"), assignment_order=job.get("assignment_order"),
+                            bill_sync_id=job.get("bill_sync_id"), bill_date=reading_date,
+                            billing_reference=job.get("billing_reference"),
+                            wait_for_result=True,
                         )
+                        if not sync_result:
+                            raise RuntimeError("The bill could not be persisted to the local retry queue.")
+                        if sync_result.get("status") == "conflict":
+                            errors = sync_result.get("errors") or []
+                            detail = str(errors[0]) if errors else "The reserved reference conflicts with the bill."
+                            raise RuntimeError(f"The backend rejected the bill. {detail}")
+                        authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
+                        if authoritative_bill:
+                            consumer = apply_authoritative_bill(consumer, authoritative_bill)
+                            due_date = _normalize_iso_date(consumer.get("due_date")) or due_date
+                            receipt_text = build_receipt_text(
+                                consumer,
+                                previous,
+                                present,
+                                exception,
+                                job.get("reader_name") or self._reader_name,
+                                reading_date=reading_date,
+                            )
                     saved_receipt_id = None
                     history_error = None
                     try:

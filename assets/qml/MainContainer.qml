@@ -798,6 +798,11 @@ Rectangle {
         visible: bridgeObj && bridgeObj.operationBusy
         z: 100
 
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+        }
+
         Rectangle {
             anchors.centerIn: parent
             width: 220

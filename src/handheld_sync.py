@@ -23,6 +23,11 @@ import time
 import uuid
 from urllib import error, parse, request
 
+try:
+    from .sqlite_support import connect_sqlite
+except ImportError:
+    from sqlite_support import connect_sqlite
+
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
@@ -334,6 +339,25 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
                 own_penalty = round(penalty_base * (late_fee_percent / 100.0), 2)
             carried_balance += original_amount
             carried_penalty += own_penalty
+    else:
+        # Older context responses expose only the latest bill's rolled totals.
+        # Carry that aggregate exactly once: amount_due already contains all
+        # earlier principal and penalties, while the latest bill's own penalty
+        # is the difference to total_after_due_date (or the stored penalty).
+        prior_status = str(context.get("bill_status") or context.get("status") or "Unpaid").strip().lower()
+        if prior_status != "paid" and context.get("amount_due") not in (None, ""):
+            carried_balance = max(0.0, _safe_float(context.get("amount_due")))
+            prior_due_date = _parse_date(context.get("prior_bill_due_date") or context.get("due_date"))
+            if prior_due_date is not None and reference_date > prior_due_date:
+                total_after_due = max(0.0, _safe_float(context.get("total_after_due_date")))
+                aggregate_difference = max(0.0, round(total_after_due - carried_balance, 2))
+                carried_penalty = max(
+                    aggregate_difference,
+                    max(0.0, _safe_float(context.get("penalty"))),
+                )
+        elif prior_status != "paid":
+            carried_balance = max(0.0, _safe_float(context.get("previous_balance")))
+            carried_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
     supplied_due_date = _parse_date(reading.get("due_date") or reading.get("schedule_due_date"))
@@ -492,11 +516,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         self._db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "meter.db"))
 
     def _connect(self):
-        conn = sqlite3.connect(self._db_path, timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 15000")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return connect_sqlite(self._db_path)
 
     @staticmethod
     def _deserialize_row(row: sqlite3.Row) -> dict:

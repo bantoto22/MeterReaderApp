@@ -16,6 +16,7 @@ from src.handheld_sync import (
     format_sync_error,
 )
 from src.receipt import apply_authoritative_bill, build_receipt_text, build_reprint_receipt_text
+from src.sqlite_support import connect_sqlite
 import src.database as database
 
 
@@ -163,6 +164,46 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Stage: Updating the device cache", diagnostic)
         self.assertIn("local SQLite database is busy", diagnostic)
         self.assertIn("Recommended action:", diagnostic)
+
+    def test_sqlite_writers_are_serialized_for_the_full_transaction(self):
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        first = connect_sqlite(db_path)
+        errors = []
+        try:
+            first.execute("CREATE TABLE lock_test (value INTEGER)")
+            first.commit()
+            first.execute("INSERT INTO lock_test VALUES (1)")
+
+            def second_writer():
+                connection = None
+                try:
+                    connection = connect_sqlite(db_path)
+                    connection.execute("INSERT INTO lock_test VALUES (2)")
+                    connection.commit()
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    if connection is not None:
+                        connection.close()
+
+            worker = threading.Thread(target=second_writer)
+            worker.start()
+            time.sleep(0.1)
+            first.commit()
+            worker.join(timeout=3)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(first.execute("SELECT COUNT(*) FROM lock_test").fetchone()[0], 2)
+        finally:
+            first.close()
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
 
     def test_reprinting_a_duplicate_keeps_exactly_one_duplicate_header(self):
         first = build_reprint_receipt_text(
@@ -1170,6 +1211,40 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["previous_penalty"], 0.0)
         self.assertEqual(payload["penalty"], 3.0)
         self.assertEqual(payload["total_after_due_date"], 33.0)
+
+    def test_bill_payload_carries_latest_rolled_backend_total_exactly_once(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "9b079ca5-48f6-49e6-8a61-032692182c40",
+                "consumer_id": 100,
+                "present_reading": 7,
+                "previous_reading": 5,
+                "consumption": 2,
+                "reading_date": "2026-09-06",
+                "due_date": "2026-07-28",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "late_fee": 10,
+                "amount_due": 83,
+                "penalty": 5,
+                "total_after_due_date": 88,
+                "prior_bill_due_date": "2026-07-28",
+                "due_date": "2026-07-28",
+                "bill_status": "Unpaid",
+            },
+            100,
+        )
+
+        self.assertEqual(payload["class_cost"], 20.0)
+        self.assertEqual(payload["previous_balance"], 83.0)
+        self.assertEqual(payload["previous_penalty"], 5.0)
+        self.assertEqual(payload["amount_due"], 108.0)
+        self.assertEqual(payload["penalty"], 2.0)
+        self.assertEqual(payload["total_after_due_date"], 110.0)
 
     def test_bill_payload_includes_fees_but_never_penalizes_them(self):
         payload = _build_bill_payload(
