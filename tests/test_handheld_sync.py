@@ -13,9 +13,15 @@ from src.handheld_sync import (
     SQLiteLocalSyncStore,
     SyncConfig,
     _build_bill_payload,
+    _flatten_backend_bill_context,
     format_sync_error,
 )
-from src.receipt import apply_authoritative_bill, build_receipt_text, build_reprint_receipt_text
+from src.receipt import (
+    apply_authoritative_bill,
+    build_receipt_text,
+    build_reprint_receipt_text,
+    recalculate_receipt_penalty_text,
+)
 from src.sqlite_support import connect_sqlite
 import src.database as database
 
@@ -164,6 +170,55 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Stage: Updating the device cache", diagnostic)
         self.assertIn("local SQLite database is busy", diagnostic)
         self.assertIn("Recommended action:", diagnostic)
+
+    def test_nested_backend_bill_values_override_context_estimates(self):
+        context = _flatten_backend_bill_context({
+            "consumer_id": 100,
+            "amount_due": 20,
+            "penalty": 0,
+            "bill": {
+                "amount_due": 500,
+                "penalty": 50,
+                "previous_penalty": 0,
+                "total_after_due_date": 550,
+                "due_date": "2026-09-22",
+                "late_fee": 10,
+            },
+        })
+
+        self.assertEqual(context["amount_due"], 500)
+        self.assertEqual(context["penalty"], 50)
+        self.assertEqual(context["total_after_due_date"], 550)
+        self.assertEqual(context["due_date"], "2026-09-22")
+        self.assertEqual(context["late_fee"], 10)
+
+    def test_main_system_dynamic_bill_fields_map_to_handheld_names(self):
+        context = _flatten_backend_bill_context({
+            "Consumer": {"consumer_id": 100, "name": "Test Consumer"},
+            "Bill": {
+                "Amount_Due": 720,
+                "Penalties": 50,
+                "Previous_Penalty": 20,
+                "Total_After_Due_Date": 770,
+                "Overdue_Penalty": 50,
+                "Late_Fee_Percentage": 10,
+                "Is_Overdue": True,
+                "Status": "Overdue",
+                "Due_Date": "2026-09-01",
+                "Water_Charge": 500,
+            },
+        })
+
+        self.assertEqual(context["amount_due"], 720)
+        self.assertEqual(context["penalty"], 50)
+        self.assertEqual(context["previous_penalty"], 20)
+        self.assertEqual(context["total_after_due_date"], 770)
+        self.assertEqual(context["overdue_penalty"], 50)
+        self.assertEqual(context["late_fee"], 10)
+        self.assertTrue(context["is_overdue"])
+        self.assertEqual(context["status"], "Overdue")
+        self.assertEqual(context["bill_status"], "Overdue")
+        self.assertEqual(context["water_charge"], 500)
 
     def test_sqlite_writers_are_serialized_for_the_full_transaction(self):
         handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
@@ -449,6 +504,76 @@ class HandheldSyncTests(unittest.TestCase):
             next_bill = store.get_or_create_bill_reservation(8, "2026-09-06")
             self.assertNotEqual(next_bill["bill_sync_id"], first["bill_sync_id"])
             self.assertNotEqual(next_bill["reading_sync_id"], first["reading_sync_id"])
+        finally:
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_scheduled_bill_reference_is_pre_reserved_then_available_offline(self):
+        class ReservationRemote(FakeRemoteStore):
+            def __init__(self):
+                super().__init__()
+                self.online = True
+                self.reservation_calls = []
+
+            def reserve_billing_reference(self, bill_sync_id, bill_date):
+                self.reservation_calls.append((bill_sync_id, bill_date))
+                return {
+                    "success": True,
+                    "billing_reference": "SLR2026000125",
+                    "reservation": {
+                        "bill_sync_id": bill_sync_id,
+                        "bill_date": bill_date,
+                        "status": "Reserved",
+                    },
+                }
+
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        try:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = db_path
+            store.ensure_schema()
+            remote = ReservationRemote()
+            dal = HandheldSyncDataAccess(store, remote)
+            scheduled = [{
+                "consumer_id": 8,
+                "schedule_id": 401,
+                "schedule_date": "2026-09-06",
+                "schedule_due_date": "2026-09-22",
+                "billing_cycle": "September 2026",
+                "late_fee": 10,
+            }]
+
+            remote.assigned_consumers = scheduled
+            downloaded = dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
+            first = dict(dal.last_pre_reservation_result)
+            dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
+            repeated = dict(dal.last_pre_reservation_result)
+            self.assertEqual(downloaded, scheduled)
+            self.assertEqual(first["reserved"], 1)
+            self.assertEqual(first["ready"], 1)
+            self.assertEqual(repeated["reserved"], 0)
+            self.assertEqual(len(remote.reservation_calls), 1)
+
+            remote.online = False
+            offline = dal.prepareBillingReference(
+                8,
+                "2026-09-06",
+                schedule_id=401,
+                billing_cycle="September 2026",
+                due_date="2026-09-22",
+                late_fee=10,
+            )
+            self.assertEqual(offline["billing_reference"], "SLR2026000125")
+            self.assertEqual(offline["schedule_id"], 401)
+            self.assertEqual(offline["billing_cycle"], "September 2026")
+            self.assertEqual(offline["bill_date"], "2026-09-06")
+            self.assertEqual(offline["due_date"], "2026-09-22")
+            self.assertEqual(offline["late_fee"], 10)
         finally:
             gc.collect()
             try:
@@ -1135,11 +1260,35 @@ class HandheldSyncTests(unittest.TestCase):
                 "late_fee": None,
             },
             99,
+            as_of_date=date(2026, 7, 8),
         )
 
         self.assertEqual(payload["amount_due"], 100.0)
         self.assertEqual(payload["penalty"], 0.0)
         self.assertEqual(payload["total_after_due_date"], 100.0)
+
+    def test_bill_payload_generates_non_null_due_date_when_source_is_null(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "non-null-due-date",
+                "consumer_id": 42,
+                "present_reading": 10,
+                "previous_reading": 0,
+                "consumption": 10,
+                "reading_date": "2026-09-07",
+                "due_date": None,
+                "schedule_due_date": None,
+            },
+            {
+                "minimum_cubic": 10,
+                "minimum_rate": 100,
+                "due_days": 15,
+                "due_date": None,
+            },
+            101,
+        )
+
+        self.assertEqual(payload["due_date"], "2026-09-22 00:00:00")
 
     def test_bill_payload_sums_each_unpaid_month_without_compounding(self):
         payload = _build_bill_payload(
@@ -1177,6 +1326,7 @@ class HandheldSyncTests(unittest.TestCase):
                 ],
             },
             99,
+            as_of_date=date(2026, 7, 8),
         )
 
         self.assertEqual(payload["amount_due"], 86.2)
@@ -1240,11 +1390,44 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["class_cost"], 20.0)
+        # Without an explicit previous_penalty field, the rolled amount cannot
+        # be split safely; preserve the backend total exactly as supplied.
         self.assertEqual(payload["previous_balance"], 83.0)
         self.assertEqual(payload["previous_penalty"], 5.0)
         self.assertEqual(payload["amount_due"], 108.0)
         self.assertEqual(payload["penalty"], 2.0)
         self.assertEqual(payload["total_after_due_date"], 110.0)
+
+    def test_bill_payload_recalculates_stale_zero_penalty_using_water_charge_only(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "dynamic-current-penalty",
+                "consumer_id": 42,
+                "present_reading": 50,
+                "previous_reading": 0,
+                "consumption": 50,
+                "reading_date": "2026-08-15",
+                "due_date": "2026-09-01",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "late_fee": 10,
+                "previous_balance": 200,
+                "previous_penalty": 20,
+                "penalty": 0,
+            },
+            102,
+            as_of_date=date(2026, 9, 7),
+        )
+
+        self.assertEqual(payload["water_charge"], 500.0)
+        self.assertEqual(payload["previous_penalty"], 20.0)
+        self.assertEqual(payload["amount_due"], 720.0)
+        self.assertEqual(payload["penalty"], 50.0)
+        self.assertEqual(payload["total_after_due_date"], 770.0)
 
     def test_bill_payload_includes_fees_but_never_penalizes_them(self):
         payload = _build_bill_payload(
@@ -1310,6 +1493,100 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["previous_balance"], 140.0)
         self.assertEqual(payload["previous_penalty"], 10.0)
         self.assertEqual(payload["amount_due"], 150.0)
+
+    def test_unpaid_bill_penalties_accept_all_backend_field_shapes(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "penalty-shapes-current",
+                "consumer_id": 42,
+                "present_reading": 1,
+                "previous_reading": 1,
+                "consumption": 0,
+                "reading_date": "2026-09-07",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "late_fee": 10,
+                "unpaid_bills": [
+                    {"amount_due": 30, "penalty": 3, "status": "Outstanding"},
+                    {"current_month_amount": 50, "current_penalty": 5, "bill_status": "Unpaid"},
+                    {
+                        "amount_due": 20,
+                        "total_after_due_date": 22,
+                        "payment_status": "Outstanding",
+                    },
+                    {
+                        "bill_amount": 40,
+                        "due_date": "2026-08-01",
+                        "penalty_percent": 5,
+                        "status": "Unpaid",
+                    },
+                ],
+            },
+            103,
+        )
+
+        self.assertEqual(payload["previous_balance"], 140.0)
+        self.assertEqual(payload["previous_penalty"], 12.0)
+        self.assertEqual(payload["amount_due"], 152.0)
+
+    def test_rolled_backend_penalty_is_kept_when_prior_due_date_is_missing(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "missing-date-current",
+                "consumer_id": 42,
+                "present_reading": 0,
+                "previous_reading": 0,
+                "consumption": 0,
+                "reading_date": "2026-09-07",
+            },
+            {
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "amount_due": 83,
+                "penalty": 5,
+                "total_after_due_date": 88,
+                "bill_status": "Unpaid",
+            },
+            104,
+        )
+
+        self.assertEqual(payload["previous_balance"], 83.0)
+        self.assertEqual(payload["previous_penalty"], 5.0)
+        self.assertEqual(payload["amount_due"], 88.0)
+
+    def test_empty_unpaid_list_falls_back_and_displays_previous_penalty_separately(self):
+        payload = _build_bill_payload(
+            {
+                "reading_id": "empty-unpaid-current",
+                "consumer_id": 42,
+                "present_reading": 0,
+                "previous_reading": 0,
+                "consumption": 0,
+                "reading_date": "2026-09-07",
+            },
+            _flatten_backend_bill_context({
+                "unpaid_bills": [],
+                "bill": {
+                    "amount_due": 500,
+                    "previous_penalty": 40,
+                    "penalty": 50,
+                    "total_after_due_date": 550,
+                    "status": "Unpaid",
+                },
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+            }),
+            105,
+        )
+
+        self.assertEqual(payload["previous_balance"], 460.0)
+        self.assertEqual(payload["previous_penalty"], 90.0)
+        self.assertEqual(payload["amount_due"], 550.0)
 
     def test_receipt_total_uses_current_reading_bill_not_stale_amount_due(self):
         text = build_receipt_text(
@@ -1404,6 +1681,7 @@ class HandheldSyncTests(unittest.TestCase):
             exception="None",
             reader_name="Reader",
             reading_date="2026-07-06",
+            as_of_date=date(2026, 7, 6),
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
@@ -1438,6 +1716,7 @@ class HandheldSyncTests(unittest.TestCase):
             exception="None",
             reader_name="Reader",
             reading_date="2026-07-06",
+            as_of_date=date(2026, 7, 6),
         )
 
         self.assertIn("Current Bill: PHP    10.00", text)
@@ -1513,6 +1792,7 @@ class HandheldSyncTests(unittest.TestCase):
             exception="None",
             reader_name="Reader",
             reading_date="2026-07-09",
+            as_of_date=date(2026, 7, 9),
         )
 
         self.assertIn("Current Bill: PHP    30.00", text)
@@ -1575,7 +1855,8 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         text = build_receipt_text(
-            consumer, previous=0, present=1, exception="None", reader_name="Reader", reading_date="2026-03-08"
+            consumer, previous=0, present=1, exception="None", reader_name="Reader",
+            reading_date="2026-03-08", as_of_date=date(2026, 3, 8),
         )
 
         self.assertIn("Current Bill: PHP    40.00", text)
@@ -1583,6 +1864,77 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Prev Pen(10%): PHP     4.20", text)
         self.assertIn("TOTAL DUE   : PHP    86.20", text)
         self.assertIn("AFTER DUE   : PHP    86.20", text)
+
+    def test_receipt_prioritizes_exact_authoritative_bill_response_values(self):
+        consumer = apply_authoritative_bill(
+            {
+                "id": 100,
+                "acct_no": "01-02-1234",
+                "name": "Test Consumer",
+                "classification_id": 1,
+                "classification_name": "Residential",
+                "meter_no": "MTR-100",
+                "minimum_cubic": 0,
+                "minimum_rate": 0,
+                "excess_rate_per_cubic": 10,
+                "due_days": 15,
+                "late_fee": 10,
+            },
+            {
+                "water_charge": 500,
+                "amount_due": 720,
+                "penalty": 0,
+                "previous_penalty": 20,
+                "total_after_due_date": 720,
+                "due_date": "2026-09-01",
+                "status": "Unpaid",
+            },
+        )
+
+        text = build_receipt_text(
+            consumer,
+            previous=0,
+            present=1,
+            exception="None",
+            reading_date="2026-09-07",
+            as_of_date=date(2026, 9, 7),
+        )
+
+        self.assertIn("Due Pen(10%): PHP    50.00", text)
+        self.assertIn("Prev Pen(10%): PHP    20.00", text)
+        self.assertIn("TOTAL DUE   : PHP   720.00", text)
+        self.assertIn("AFTER DUE   : PHP   770.00", text)
+        self.assertIn("Due Date   : 2026-09-01", text)
+
+    def test_reprint_recalculates_stored_zero_penalty_after_due_date(self):
+        original = "\n".join([
+            "Current Bill: PHP   500.00",
+            "Due Pen(10%): PHP     0.00",
+            "Prev Pen(10%): PHP    20.00",
+            "TOTAL DUE   : PHP   720.00",
+            "AFTER DUE   : PHP   720.00",
+            "Due Date   : 2026-09-01",
+        ])
+
+        refreshed = recalculate_receipt_penalty_text(
+            original,
+            bill_status="Unpaid",
+            late_fee=10,
+            as_of_date=date(2026, 9, 7),
+        )
+
+        self.assertIn("Due Pen(10%): PHP    50.00", refreshed)
+        self.assertIn("Prev Pen(10%): PHP    20.00", refreshed)
+        self.assertIn("AFTER DUE   : PHP   770.00", refreshed)
+
+        paid = recalculate_receipt_penalty_text(
+            original,
+            bill_status="Paid",
+            late_fee=10,
+            as_of_date=date(2026, 9, 7),
+        )
+        self.assertIn("Due Pen(10%): PHP     0.00", paid)
+        self.assertIn("AFTER DUE   : PHP   720.00", paid)
 
     def test_assignment_account_numbers_order_search_and_reading_metadata(self):
         original_db_path = database._db_path
@@ -1732,6 +2084,7 @@ class HandheldSyncTests(unittest.TestCase):
             exception="None",
             reader_name="Reader",
             reading_date="2026-07-06",
+            as_of_date=date(2026, 7, 6),
         )
 
         self.assertIn("Coverage   : 2026-07-02 to", text)

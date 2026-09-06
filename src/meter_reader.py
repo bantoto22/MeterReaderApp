@@ -38,7 +38,13 @@ try:
         save_receipt_print,
         seed_default_users,
     )
-    from .receipt import build_receipt_text, can_use_system_printer, send_to_system_printer, show_receipt
+    from .receipt import (
+        build_receipt_text,
+        can_use_system_printer,
+        recalculate_receipt_penalty_text,
+        send_to_system_printer,
+        show_receipt,
+    )
     from .handheld_sync import HandheldSyncDataAccess, SyncConfig
 except Exception:
     from database import (
@@ -56,7 +62,13 @@ except Exception:
         save_receipt_print,
         seed_default_users,
     )
-    from receipt import build_receipt_text, can_use_system_printer, send_to_system_printer, show_receipt
+    from receipt import (
+        build_receipt_text,
+        can_use_system_printer,
+        recalculate_receipt_penalty_text,
+        send_to_system_printer,
+        show_receipt,
+    )
     try:
         from handheld_sync import HandheldSyncDataAccess, SyncConfig
     except Exception:
@@ -3613,7 +3625,14 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         return saved_id
 
     def _deliver_receipt(self, consumer, previous, present, exception, reader_name, reading_id=None, print_action="print", receipt_text=None):
-        receipt_text = receipt_text or build_receipt_text(consumer, previous, present, exception, reader_name)
+        if receipt_text:
+            receipt_text = recalculate_receipt_penalty_text(
+                receipt_text,
+                bill_status=str(consumer.get("bill_status") or "Unpaid"),
+                late_fee=consumer.get("late_fee"),
+            )
+        else:
+            receipt_text = build_receipt_text(consumer, previous, present, exception, reader_name)
         self._persist_receipt_print(consumer, previous, present, exception, reader_name, receipt_text, print_action, reading_id)
         if can_use_system_printer():
             try:

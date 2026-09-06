@@ -9,10 +9,24 @@ import shutil
 import subprocess
 import tempfile
 import tkinter as tk
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 FONT_FAMILY = "Montserrat"
 RAW_PRINTER_DEVICE = "/dev/usb/lp0"
 RECEIPT_WIDTH = 32
+
+
+def manila_current_date(now: datetime.datetime | None = None) -> datetime.date:
+    """Return the billing calendar date in Asia/Manila, even on offline devices."""
+    try:
+        manila = ZoneInfo("Asia/Manila")
+    except ZoneInfoNotFoundError:
+        manila = datetime.timezone(datetime.timedelta(hours=8), name="Asia/Manila")
+    if now is None:
+        return datetime.datetime.now(manila).date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    return now.astimezone(manila).date()
 
 
 def _format_reading(value: float | int | str) -> str:
@@ -197,6 +211,72 @@ def _calculate_penalty(
     return applied_penalty, total_after_due_date, penalty_source, bill_status
 
 
+def recalculate_receipt_penalty_text(
+    receipt_text: str,
+    *,
+    bill_status: str = "Unpaid",
+    late_fee: float | int | str | None = None,
+    as_of_date: datetime.date | None = None,
+) -> str:
+    """Refresh penalty lines in a stored receipt before opening or reprinting it."""
+    lines = str(receipt_text or "").splitlines()
+
+    def money_from(label: str) -> float | None:
+        for line in lines:
+            if line.strip().startswith(label) and "PHP" in line:
+                try:
+                    return float(line.rsplit("PHP", 1)[1].strip().replace(",", ""))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    due_date = None
+    for line in lines:
+        if line.strip().startswith("Due Date") and ":" in line:
+            try:
+                due_date = _parse_date(line.split(":", 1)[1])
+            except ValueError:
+                due_date = None
+            break
+    water_charge = money_from("Current Bill")
+    amount_due = money_from("TOTAL DUE")
+    if due_date is None or water_charge is None or amount_due is None:
+        return str(receipt_text or "")
+
+    effective_late_fee = None
+    if late_fee not in (None, ""):
+        try:
+            effective_late_fee = max(0.0, float(late_fee))
+        except (TypeError, ValueError):
+            effective_late_fee = None
+    if effective_late_fee is None:
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("Due Pen(") and "%)" in stripped:
+                try:
+                    effective_late_fee = max(0.0, float(stripped.split("(", 1)[1].split("%", 1)[0]))
+                except (TypeError, ValueError):
+                    pass
+                break
+    if effective_late_fee is None:
+        effective_late_fee = 10.0
+
+    today = as_of_date or manila_current_date()
+    overdue = str(bill_status or "Unpaid").strip().lower() != "paid" and today > due_date
+    current_penalty = round(water_charge * effective_late_fee / 100.0, 2) if overdue else 0.0
+    total_after_due = round(amount_due + current_penalty, 2)
+    refreshed: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Due Pen("):
+            refreshed.append(_money_line(f"Due Pen({effective_late_fee:g}%)", current_penalty))
+        elif stripped.startswith("AFTER DUE"):
+            refreshed.append(_money_line("AFTER DUE", total_after_due))
+        else:
+            refreshed.append(line)
+    return "\n".join(refreshed)
+
+
 def _optional_money(consumer: dict, field_name: str) -> float:
     value = consumer.get(field_name)
     if value in (None, ""):
@@ -272,10 +352,32 @@ def _consumer_fee(consumer: dict, fee_name: str) -> float:
 
 def apply_authoritative_bill(consumer: dict, bill: dict) -> dict:
     """Overlay a backend-calculated bill onto consumer display metadata."""
+    normalized_bill = dict(bill)
+    aliases = {
+        "amount_due": ("Amount_Due",),
+        "penalty": ("Penalty", "Penalties"),
+        "previous_penalty": ("Previous_Penalty",),
+        "total_after_due_date": ("Total_After_Due_Date",),
+        "overdue_penalty": ("Overdue_Penalty",),
+        "late_fee": ("Late_Fee_Percentage", "Late_Fee"),
+        "is_overdue": ("Is_Overdue",),
+        "status": ("Status",),
+        "due_date": ("Due_Date",),
+        "water_charge": ("Water_Charge",),
+        "class_cost": ("Class_Cost",),
+        "billing_reference": ("Billing_Reference",),
+    }
+    for canonical, source_names in aliases.items():
+        if normalized_bill.get(canonical) not in (None, ""):
+            continue
+        for source_name in source_names:
+            if normalized_bill.get(source_name) not in (None, ""):
+                normalized_bill[canonical] = normalized_bill[source_name]
+                break
     snapshot = dict(consumer)
-    snapshot.update(bill)
-    if bill.get("status") not in (None, ""):
-        snapshot["bill_status"] = bill["status"]
+    snapshot.update(normalized_bill)
+    if normalized_bill.get("status") not in (None, ""):
+        snapshot["bill_status"] = normalized_bill["status"]
     snapshot["_authoritative_bill"] = True
     return snapshot
 
@@ -312,6 +414,7 @@ def build_receipt_text(
     exception: str,
     reader_name: str = "Field Reader",
     reading_date: str | datetime.date | None = None,
+    as_of_date: datetime.date | None = None,
 ) -> str:
     _require_billing_profile(consumer)
     consumption = present - previous
@@ -335,7 +438,8 @@ def build_receipt_text(
                     break
 
     now = datetime.datetime.now()
-    reference_date = _parse_date(str(reading_date)) if reading_date not in (None, "") else now.date()
+    reference_date = _parse_date(str(reading_date)) if reading_date not in (None, "") else manila_current_date()
+    penalty_date = as_of_date or manila_current_date()
     date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
     due_days = _require_int(consumer, "due_days")
@@ -352,23 +456,11 @@ def build_receipt_text(
     due_date_value = consumer.get("due_date")
     due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
     due_date = due_date_obj.isoformat()
-    if authoritative:
-        penalty = (
-            _optional_money(consumer, "current_penalty")
-            if consumer.get("current_penalty") not in (None, "")
-            else _optional_money(consumer, "penalty")
-        )
-        after_due = (
-            _optional_money(consumer, "total_after_due_date")
-            if consumer.get("total_after_due_date") not in (None, "")
-            else round(amount_due + penalty, 2)
-        )
-        penalty_source = "backend bill"
-        bill_status = str(consumer.get("status") or consumer.get("bill_status") or "Unpaid")
-    else:
-        penalty, after_due, penalty_source, bill_status = _calculate_penalty(
-            consumer, current_bill, amount_due, due_date_obj, reference_date
-        )
+    # Recompute every time the receipt is built. Stored zero values become stale
+    # when a bill crosses its due date while the handheld is offline.
+    penalty, after_due, penalty_source, bill_status = _calculate_penalty(
+        consumer, current_bill, amount_due, due_date_obj, penalty_date
+    )
     bill_status = previous_bill_status
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
@@ -417,9 +509,9 @@ def build_receipt_text(
         _money_line("Water Meter Fee", water_meter_fee),
         _money_line("Connection Fee", connection_fee),
         _money_line("Membership Fee", membership_fee),
-        _money_line("Due Pen(10%)", penalty),
+        _money_line(f"Due Pen({late_fee_percent:g}%)", penalty),
         _money_line("Previous", carried_previous_bill),
-        _money_line("Prev Pen(10%)", previous_penalty),
+        _money_line(f"Prev Pen({late_fee_percent:g}%)", previous_penalty),
         border,
         _money_line("TOTAL DUE", amount_due),
         _money_line("AFTER DUE", after_due),

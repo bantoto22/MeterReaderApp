@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from urllib import error, parse, request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from .sqlite_support import connect_sqlite
@@ -31,6 +32,18 @@ except ImportError:
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
+
+
+def _manila_current_date(now: datetime | None = None) -> date:
+    try:
+        manila = ZoneInfo("Asia/Manila")
+    except ZoneInfoNotFoundError:
+        manila = timezone(timedelta(hours=8), name="Asia/Manila")
+    if now is None:
+        return datetime.now(manila).date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(manila).date()
 
 try:
     from dotenv import load_dotenv
@@ -180,6 +193,47 @@ def _reading_date(value) -> date:
     return parsed or datetime.now().date()
 
 
+def _flatten_backend_bill_context(payload: dict) -> dict:
+    """Expose authoritative nested bill values at the context's top level."""
+    context = dict(payload or {})
+    wrapped = context.get("data") or context.get("Data")
+    if isinstance(wrapped, dict):
+        context.update(wrapped)
+    consumer = context.get("consumer") or context.get("Consumer")
+    if isinstance(consumer, dict):
+        context = {**consumer, **context}
+    bill = context.get("bill") or context.get("Bill")
+    if isinstance(bill, dict):
+        context.update(bill)
+        context["bill"] = dict(bill)
+
+    aliases = {
+        "amount_due": ("Amount_Due",),
+        "penalty": ("Penalty", "Penalties"),
+        "previous_penalty": ("Previous_Penalty",),
+        "total_after_due_date": ("Total_After_Due_Date",),
+        "overdue_penalty": ("Overdue_Penalty",),
+        "late_fee": ("Late_Fee_Percentage", "Late_Fee"),
+        "is_overdue": ("Is_Overdue",),
+        "status": ("Status",),
+        "due_date": ("Due_Date",),
+        "water_charge": ("Water_Charge",),
+        "class_cost": ("Class_Cost",),
+        "billing_reference": ("Billing_Reference",),
+        "sync_id": ("Sync_ID",),
+    }
+    for canonical, source_names in aliases.items():
+        if context.get(canonical) not in (None, ""):
+            continue
+        for source_name in source_names:
+            if context.get(source_name) not in (None, ""):
+                context[canonical] = context[source_name]
+                break
+    if context.get("status") not in (None, ""):
+        context["bill_status"] = context["status"]
+    return context
+
+
 def _device_schedule_window(today: date | None = None) -> tuple[str, str]:
     anchor = today or datetime.now().date()
     current_month_start = anchor.replace(day=1)
@@ -266,31 +320,56 @@ def _fee_value(source: dict, fee_name: str) -> float:
     return 0.0
 
 
-def _calculate_visible_penalty(
-    amount_due,
-    due_date_value,
-    bill_status,
-    existing_penalty,
-    late_fee,
-    reference_date: date,
-) -> tuple[float, float]:
-    amount_due_val = max(0.0, _safe_float(amount_due))
-    stored_penalty = max(0.0, _safe_float(existing_penalty))
-    late_fee_percent = _safe_float(late_fee, 10.0) or 10.0
-    due_date_obj = _parse_date(due_date_value)
-    status_text = str(bill_status or "Unpaid").strip().lower()
-    is_overdue = status_text != "paid" and due_date_obj is not None and reference_date > due_date_obj
-    if is_overdue:
-        computed_penalty = round(amount_due_val * (late_fee_percent / 100.0), 2)
-        applied_penalty = max(stored_penalty, computed_penalty)
-    else:
-        applied_penalty = stored_penalty
-    total_after_due_date = round(amount_due_val + applied_penalty, 2)
-    return applied_penalty, total_after_due_date
+def _first_money(source: dict, field_names: tuple[str, ...]) -> float | None:
+    for field_name in field_names:
+        if source.get(field_name) not in (None, ""):
+            return max(0.0, _safe_float(source.get(field_name)))
+    return None
 
 
-def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) -> dict:
-    reference_date = _reading_date(reading.get("reading_date"))
+def _unpaid_bill_base_amount(unpaid_bill: dict) -> float:
+    explicit = _first_money(unpaid_bill, ("original_amount", "current_month_amount", "monthly_amount"))
+    if explicit is not None:
+        return explicit
+
+    water_charge = _first_money(unpaid_bill, ("water_charge", "class_cost"))
+    if water_charge is not None:
+        return round(water_charge + sum(_fee_value(unpaid_bill, name) for name in _FEE_ALIASES), 2)
+
+    amount_due = _first_money(unpaid_bill, ("amount_due", "total_amount", "bill_amount"))
+    if amount_due is None:
+        return 0.0
+    previous_balance = _first_money(unpaid_bill, ("previous_balance",))
+    previous_penalty = _first_money(unpaid_bill, ("previous_penalty",))
+    if previous_balance is not None or previous_penalty is not None:
+        return max(0.0, round(amount_due - (previous_balance or 0.0) - (previous_penalty or 0.0), 2))
+    return amount_due
+
+
+def _stored_bill_penalty(unpaid_bill: dict) -> float:
+    stored = _first_money(
+        unpaid_bill,
+        ("own_penalty", "current_penalty", "penalty", "penalty_amount", "late_penalty", "late_fee_amount"),
+    ) or 0.0
+    amount_due = _first_money(unpaid_bill, ("amount_due", "total_amount", "bill_amount"))
+    total_after_due = _first_money(
+        unpaid_bill,
+        ("total_after_due_date", "amount_after_due_date", "pay_through"),
+    )
+    if amount_due is not None and total_after_due is not None:
+        stored = max(stored, round(max(0.0, total_after_due - amount_due), 2))
+    return stored
+
+
+def _build_bill_payload(
+    reading: dict,
+    context: dict,
+    remote_reading_id: int,
+    *,
+    as_of_date: date | None = None,
+) -> dict:
+    reference_date = _reading_date(reading.get("bill_date") or reading.get("reading_date"))
+    penalty_date = as_of_date or _manila_current_date()
     present_reading = _safe_int(reading.get("present_reading"))
     consumption = _safe_int(reading.get("consumption"))
     previous_reading = _safe_int(reading.get("previous_reading"), present_reading - consumption)
@@ -306,7 +385,10 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     concessionaire_fees = round(water_meter_fee + connection_fee + membership_fee, 2)
 
     due_days = _safe_int(context.get("due_days"), 15) or 15
-    late_fee_percent = _safe_float(context.get("late_fee"), 10.0) or 10.0
+    configured_late_fee = context.get("late_fee")
+    if configured_late_fee in (None, ""):
+        configured_late_fee = context.get("penalty_percent")
+    late_fee_percent = max(0.0, _safe_float(configured_late_fee, 10.0))
     carried_balance = 0.0
     carried_penalty = 0.0
 
@@ -314,19 +396,29 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     # unpaid monthly bill; a rolled-up latest bill must never be treated as new
     # principal or have another penalty applied to it.
     unpaid_bills = context.get("unpaid_bills")
+    used_itemized_unpaid_bills = False
     if isinstance(unpaid_bills, list):
-        current_sync_id = str(reading.get("reading_id") or "").strip()
+        current_bill_sync_id = str(reading.get("bill_sync_id") or "").strip()
         for unpaid_bill in unpaid_bills:
             if not isinstance(unpaid_bill, dict):
                 continue
-            if str(unpaid_bill.get("status") or "Unpaid").strip().lower() == "paid":
+            prior_status = str(
+                unpaid_bill.get("status")
+                or unpaid_bill.get("bill_status")
+                or unpaid_bill.get("payment_status")
+                or "Unpaid"
+            ).strip().lower()
+            if prior_status == "paid":
                 continue
-            if current_sync_id and str(unpaid_bill.get("bill_id") or "").strip() == current_sync_id:
+            unpaid_sync_id = str(unpaid_bill.get("sync_id") or unpaid_bill.get("bill_sync_id") or "").strip()
+            if current_bill_sync_id and unpaid_sync_id == current_bill_sync_id:
                 continue
-            original_amount = max(0.0, _safe_float(unpaid_bill.get("original_amount")))
-            own_penalty = max(0.0, _safe_float(unpaid_bill.get("own_penalty")))
-            unpaid_due_date = _parse_date(unpaid_bill.get("due_date"))
-            if own_penalty == 0 and unpaid_due_date is not None and reference_date > unpaid_due_date:
+            original_amount = _unpaid_bill_base_amount(unpaid_bill)
+            own_penalty = _stored_bill_penalty(unpaid_bill)
+            unpaid_due_date = _parse_date(
+                unpaid_bill.get("due_date") or unpaid_bill.get("payment_due_date")
+            )
+            if unpaid_due_date is not None and penalty_date > unpaid_due_date:
                 prior_fees = sum(_fee_value(unpaid_bill, name) for name in _FEE_ALIASES)
                 penalty_base = next(
                     (
@@ -336,25 +428,44 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
                     ),
                     max(0.0, original_amount - prior_fees),
                 )
-                own_penalty = round(penalty_base * (late_fee_percent / 100.0), 2)
+                bill_late_fee = _first_money(unpaid_bill, ("late_fee", "late_fee_percent", "penalty_percent"))
+                effective_late_fee = late_fee_percent if bill_late_fee is None else bill_late_fee
+                if penalty_base > 0:
+                    own_penalty = round(penalty_base * (effective_late_fee / 100.0), 2)
+            elif unpaid_due_date is not None:
+                own_penalty = 0.0
+            if original_amount > 0 or own_penalty > 0:
+                used_itemized_unpaid_bills = True
             carried_balance += original_amount
             carried_penalty += own_penalty
-    else:
+    if not used_itemized_unpaid_bills:
         # Older context responses expose only the latest bill's rolled totals.
         # Carry that aggregate exactly once: amount_due already contains all
         # earlier principal and penalties, while the latest bill's own penalty
         # is the difference to total_after_due_date (or the stored penalty).
         prior_status = str(context.get("bill_status") or context.get("status") or "Unpaid").strip().lower()
         if prior_status != "paid" and context.get("amount_due") not in (None, ""):
-            carried_balance = max(0.0, _safe_float(context.get("amount_due")))
+            rolled_amount_due = max(0.0, _safe_float(context.get("amount_due")))
+            embedded_previous_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
+            carried_balance = max(0.0, round(rolled_amount_due - embedded_previous_penalty, 2))
             prior_due_date = _parse_date(context.get("prior_bill_due_date") or context.get("due_date"))
-            if prior_due_date is not None and reference_date > prior_due_date:
-                total_after_due = max(0.0, _safe_float(context.get("total_after_due_date")))
-                aggregate_difference = max(0.0, round(total_after_due - carried_balance, 2))
-                carried_penalty = max(
-                    aggregate_difference,
-                    max(0.0, _safe_float(context.get("penalty"))),
-                )
+            total_after_due = max(0.0, _safe_float(context.get("total_after_due_date")))
+            stored_current_penalty = max(
+                max(0.0, round(total_after_due - rolled_amount_due, 2)),
+                max(0.0, _safe_float(context.get("current_penalty"))),
+                max(0.0, _safe_float(context.get("penalty"))),
+            )
+            current_penalty = stored_current_penalty
+            carried_penalty = round(embedded_previous_penalty + current_penalty, 2)
+            if prior_due_date is not None:
+                penalty_base = _first_money(context, ("water_charge", "class_cost"))
+                if penalty_date > prior_due_date and penalty_base is not None:
+                    carried_penalty = round(
+                        embedded_previous_penalty + (penalty_base * (late_fee_percent / 100.0)),
+                        2,
+                    )
+                elif penalty_date <= prior_due_date:
+                    carried_penalty = embedded_previous_penalty
         elif prior_status != "paid":
             carried_balance = max(0.0, _safe_float(context.get("previous_balance")))
             carried_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
@@ -366,7 +477,7 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
     amount_due = round(current_charge + concessionaire_fees + carried_balance + carried_penalty, 2)
     current_penalty = (
         round(current_charge * (late_fee_percent / 100.0), 2)
-        if reference_date > due_date_obj
+        if penalty_date > due_date_obj
         else 0.0
     )
     total_amount = amount_due
@@ -692,7 +803,11 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             bill_sync_id TEXT PRIMARY KEY,
             reading_sync_id TEXT NOT NULL,
             consumer_id INTEGER NOT NULL,
+            schedule_id INTEGER,
+            billing_cycle TEXT,
             bill_date TEXT NOT NULL,
+            due_date TEXT,
+            late_fee REAL,
             billing_reference TEXT,
             status TEXT NOT NULL DEFAULT 'Pending',
             bill_id INTEGER,
@@ -793,6 +908,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             )
             self._ensure_columns(
                 conn,
+                "local_billing_reference_reservations",
+                {
+                    "schedule_id": "INTEGER",
+                    "billing_cycle": "TEXT",
+                    "due_date": "TEXT",
+                    "late_fee": "REAL",
+                },
+            )
+            self._ensure_columns(
+                conn,
                 "reading_schedule",
                 {
                     "schedule_date": "TEXT",
@@ -851,7 +976,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 start_date = str(
                     item.get("Start_Date", item.get("start_date", item.get("Schedule_Date", item.get("schedule_date")))) or ""
                 ).split("T", 1)[0].split(" ", 1)[0]
-                due_date = str(item.get("Due_Date", item.get("due_date", start_date)) or "").split("T", 1)[0].split(" ", 1)[0]
+                due_date = str(
+                    item.get("Due_Date") or item.get("due_date") or start_date
+                ).split("T", 1)[0].split(" ", 1)[0]
                 schedule_date = start_date
                 billing_month = str(item.get("Billing_Month", item.get("billing_month")) or "").strip() or None
                 zone_name = str(item.get("Zone_Name", item.get("zone_name")) or "").strip()
@@ -1007,38 +1134,84 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         consumer_id: int,
         bill_date: str,
         reading_sync_id: str | None = None,
+        *,
+        schedule_id: int | str | None = None,
+        billing_cycle: str | None = None,
+        due_date: str | None = None,
+        late_fee: float | int | str | None = None,
     ) -> dict:
         normalized_date = date.fromisoformat(str(bill_date)).isoformat()
+        normalized_schedule_id = _safe_int(schedule_id, None) if schedule_id not in (None, "") else None
+        normalized_cycle = str(billing_cycle or "").strip() or None
+        parsed_due_date = _parse_date(due_date)
+        normalized_due_date = parsed_due_date.isoformat() if parsed_due_date else None
+        normalized_late_fee = _safe_float(late_fee, None) if late_fee not in (None, "") else None
         with self._connect() as conn:
-            row = conn.execute(
-                """
+            if normalized_schedule_id is not None:
+                lookup_sql = """
                 SELECT bill_sync_id, reading_sync_id, consumer_id, bill_date,
+                       schedule_id, billing_cycle, due_date, late_fee,
+                       billing_reference, status, bill_id
+                FROM local_billing_reference_reservations
+                WHERE consumer_id = ? AND schedule_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+                lookup_params = (int(consumer_id), normalized_schedule_id)
+            else:
+                lookup_sql = """
+                SELECT bill_sync_id, reading_sync_id, consumer_id, bill_date,
+                       schedule_id, billing_cycle, due_date, late_fee,
                        billing_reference, status, bill_id
                 FROM local_billing_reference_reservations
                 WHERE consumer_id = ? AND bill_date = ? AND status IN ('Pending', 'Reserved')
                 ORDER BY created_at DESC
                 LIMIT 1
-                """,
-                (int(consumer_id), normalized_date),
-            ).fetchone()
+                """
+                lookup_params = (int(consumer_id), normalized_date)
+            row = conn.execute(lookup_sql, lookup_params).fetchone()
             if row:
-                return dict(row)
+                conn.execute(
+                    """
+                    UPDATE local_billing_reference_reservations
+                    SET billing_cycle = COALESCE(?, billing_cycle),
+                        due_date = COALESCE(?, due_date),
+                        late_fee = COALESCE(?, late_fee),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE bill_sync_id = ?
+                    """,
+                    (normalized_cycle, normalized_due_date, normalized_late_fee, row["bill_sync_id"]),
+                )
+                conn.commit()
+                refreshed = conn.execute(
+                    "SELECT * FROM local_billing_reference_reservations WHERE bill_sync_id = ?",
+                    (row["bill_sync_id"],),
+                ).fetchone()
+                return dict(refreshed)
             bill_sync_id = str(uuid.uuid4())
             stable_reading_sync_id = str(reading_sync_id or uuid.uuid4())
             conn.execute(
                 """
                 INSERT INTO local_billing_reference_reservations (
-                    bill_sync_id, reading_sync_id, consumer_id, bill_date, status
-                ) VALUES (?, ?, ?, ?, 'Pending')
+                    bill_sync_id, reading_sync_id, consumer_id, schedule_id,
+                    billing_cycle, bill_date, due_date, late_fee, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
                 """,
-                (bill_sync_id, stable_reading_sync_id, int(consumer_id), normalized_date),
+                (
+                    bill_sync_id, stable_reading_sync_id, int(consumer_id), normalized_schedule_id,
+                    normalized_cycle, normalized_date, normalized_due_date, normalized_late_fee,
+                ),
             )
             conn.commit()
         return {
             "bill_sync_id": bill_sync_id,
             "reading_sync_id": stable_reading_sync_id,
             "consumer_id": int(consumer_id),
+            "schedule_id": normalized_schedule_id,
+            "billing_cycle": normalized_cycle,
             "bill_date": normalized_date,
+            "due_date": normalized_due_date,
+            "late_fee": normalized_late_fee,
             "billing_reference": None,
             "status": "Pending",
             "bill_id": None,
@@ -1407,7 +1580,11 @@ class BackendApiClient:
         )
         if status >= 400 or status == 0:
             raise self._request_failure(status, "/api/handheld/consumers", data, "Backend assigned-consumer lookup failed.")
-        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        return [
+            _flatten_backend_bill_context(row)
+            for row in data
+            if isinstance(row, dict)
+        ] if isinstance(data, list) else []
 
     def get_consumer_context(self, consumer_id: int) -> dict:
         status, data = self._req("GET", f"/api/handheld/consumers/{int(consumer_id)}/context")
@@ -1416,7 +1593,7 @@ class BackendApiClient:
         if status >= 400 or status == 0 or not isinstance(data, dict):
             path = f"/api/handheld/consumers/{int(consumer_id)}/context"
             raise self._request_failure(status, path, data, "Backend consumer-context lookup failed.")
-        return data
+        return _flatten_backend_bill_context(data)
 
     def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
         status, data = self._req(
@@ -1481,6 +1658,9 @@ class HandheldSyncDataAccess:
         self.operation_lock = threading.RLock()
         self._worker_lock = threading.Lock()
         self._runtime_audit: list[dict] = []
+        self.last_pre_reservation_result = {
+            "ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": [],
+        }
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -1527,6 +1707,62 @@ class HandheldSyncDataAccess:
                 continue
         return {}
 
+    def preReserveAssignedBills(self, consumers: list[dict]) -> dict:
+        """Reserve stable references for known scheduled bills while connectivity exists."""
+        result = {"ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": []}
+        if not self.remote or not self.remote.is_online():
+            self.last_pre_reservation_result = result
+            return result
+        for item in consumers or []:
+            if not isinstance(item, dict):
+                result["skipped"] += 1
+                continue
+            consumer_id = item.get("consumer_id", item.get("id"))
+            schedule_id = item.get("schedule_id", item.get("Schedule_ID"))
+            bill_date = (
+                item.get("bill_date")
+                or item.get("schedule_date")
+                or item.get("start_date")
+                or item.get("Schedule_Date")
+                or item.get("Start_Date")
+            )
+            billing_cycle = item.get("billing_cycle") or item.get("billing_month") or item.get("Billing_Month")
+            due_date = item.get("schedule_due_date") or item.get("due_date") or item.get("Due_Date")
+            late_fee = item.get("late_fee")
+            if late_fee in (None, ""):
+                late_fee = item.get("penalty_percent", item.get("Late_Fee_Percentage"))
+            if consumer_id in (None, "") or schedule_id in (None, "") or not _parse_date(bill_date):
+                result["skipped"] += 1
+                continue
+            try:
+                existing = self.local.get_or_create_bill_reservation(
+                    int(consumer_id),
+                    _parse_date(bill_date).isoformat(),
+                    schedule_id=schedule_id,
+                    billing_cycle=billing_cycle,
+                    due_date=due_date,
+                    late_fee=late_fee,
+                )
+                already_ready = bool(existing.get("billing_reference"))
+                prepared = self.prepareBillingReference(
+                    int(consumer_id),
+                    str(existing["bill_date"]),
+                    schedule_id=schedule_id,
+                    billing_cycle=billing_cycle,
+                    due_date=due_date,
+                    late_fee=late_fee,
+                )
+                if prepared.get("billing_reference"):
+                    result["ready"] += 1
+                    if not already_ready:
+                        result["reserved"] += 1
+            except Exception as exc:
+                result["failed"] += 1
+                result["errors"].append(f"Consumer {consumer_id}, schedule {schedule_id}: {exc}")
+        self._audit(None, "success" if not result["failed"] else "failed", "Prepared offline billing references", result)
+        self.last_pre_reservation_result = result
+        return result
+
     def loadAssignedConsumers(
         self,
         meter_reader_id: int | str | None = None,
@@ -1570,11 +1806,17 @@ class HandheldSyncDataAccess:
                 )
                 if consumers:
                     self.local.cache_consumers(consumers)
+                    reservation_result = self.preReserveAssignedBills(consumers)
                     self.local.log_audit(
                         None,
                         "success",
                         "Loaded assigned consumers from Backend API",
-                        {"count": len(consumers), "schedule_count": len(schedules)},
+                        {
+                            "count": len(consumers),
+                            "schedule_count": len(schedules),
+                            "offline_references_ready": reservation_result["ready"],
+                            "offline_reference_failures": reservation_result["failed"],
+                        },
                     )
                     return consumers
                 self.local.log_audit(
@@ -1618,16 +1860,33 @@ class HandheldSyncDataAccess:
             )
             return result
 
-    def prepareBillingReference(self, consumer_id: int, bill_date: str) -> dict:
+    def prepareBillingReference(
+        self,
+        consumer_id: int,
+        bill_date: str,
+        *,
+        schedule_id: int | str | None = None,
+        billing_cycle: str | None = None,
+        due_date: str | None = None,
+        late_fee: float | int | str | None = None,
+    ) -> dict:
         with self.operation_lock:
-            draft = self.local.get_or_create_bill_reservation(int(consumer_id), bill_date)
+            draft = self.local.get_or_create_bill_reservation(
+                int(consumer_id),
+                bill_date,
+                schedule_id=schedule_id,
+                billing_cycle=billing_cycle,
+                due_date=due_date,
+                late_fee=late_fee,
+            )
             bill_sync_id = str(draft["bill_sync_id"])
             normalized_date = str(draft["bill_date"])
             if draft.get("billing_reference"):
                 return draft
             if not self.remote or not self.remote.is_online():
                 raise RuntimeError(
-                    "The Backend API must be online before a billing reference can be reserved or printed."
+                    "No pre-reserved billing reference is available for this scheduled bill. "
+                    "Connect briefly and sync assigned routes before going offline."
                 )
             result = self.remote.reserve_billing_reference(bill_sync_id, normalized_date)
             billing_reference = str(result.get("billing_reference") or "")

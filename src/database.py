@@ -711,7 +711,9 @@ def replace_reading_schedules_from_sync(
         start_date = _normalize_schedule_date(
             row.get("Start_Date", row.get("start_date", row.get("Schedule_Date", row.get("schedule_date"))))
         )
-        due_date = _normalize_schedule_date(row.get("Due_Date", row.get("due_date", start_date)))
+        due_date = _normalize_schedule_date(
+            row.get("Due_Date") or row.get("due_date") or start_date
+        )
         schedule_date = start_date
         billing_month = str(row.get("Billing_Month", row.get("billing_month")) or "").strip() or None
         remote_zone_id = row.get("Zone_ID", row.get("zone_id"))
@@ -1208,6 +1210,11 @@ def save_reading(
     except (TypeError, ValueError):
         normalized_assignment_order = None
     captured = captured_at or datetime.now().astimezone().isoformat()
+    effective_reading_date = _normalize_schedule_date(reading_date) or date.today().isoformat()
+    effective_schedule_date = _normalize_schedule_date(schedule_date) or effective_reading_date
+    effective_schedule_due_date = (
+        _normalize_schedule_date(schedule_due_date) or effective_schedule_date
+    )
     cur.execute(
         """
         INSERT INTO readings (
@@ -1218,9 +1225,9 @@ def save_reading(
         ) VALUES (?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0, reading_date,
+            consumer_id, present_reading, consumption, exception, 1 if is_flagged else 0, effective_reading_date,
             int(schedule_id) if schedule_id not in (None, "") else None,
-            _normalize_schedule_date(schedule_date), _normalize_schedule_date(schedule_due_date),
+            effective_schedule_date, effective_schedule_due_date,
             str(billing_cycle or "").strip() or None,
             str(reading_route_id) if reading_route_id not in (None, "") else None,
             normalized_assignment_order,
@@ -1228,7 +1235,6 @@ def save_reading(
             str(sync_reading_id or "").strip() or None, captured,
         ),
     )
-    effective_reading_date = str(reading_date).strip() if reading_date else date.today().isoformat()
     conn.execute(
         """
         UPDATE consumers
@@ -1351,10 +1357,17 @@ def save_receipt_print(
 
 def update_consumer_due_date(consumer_id: int, due_date: str) -> None:
     """Persist a manually adjusted due date for a consumer's local billing snapshot."""
+    normalized_due_date = _normalize_schedule_date(due_date)
+    if not normalized_due_date:
+        raise ValueError("A due date is required.")
+    try:
+        normalized_due_date = date.fromisoformat(normalized_due_date).isoformat()
+    except ValueError as exc:
+        raise ValueError("Due date must use YYYY-MM-DD format.") from exc
     conn = get_connection()
     conn.execute(
         "UPDATE consumers SET due_date = ? WHERE id = ?",
-        (str(due_date).strip(), int(consumer_id)),
+        (normalized_due_date, int(consumer_id)),
     )
     conn.commit()
     conn.close()

@@ -137,6 +137,7 @@ try:
         build_reprint_receipt_text,
         can_use_system_printer,
         print_test_receipt,
+        recalculate_receipt_penalty_text,
         send_to_system_printer,
     )
 except ImportError:
@@ -146,6 +147,7 @@ except ImportError:
         build_reprint_receipt_text,
         can_use_system_printer,
         print_test_receipt,
+        recalculate_receipt_penalty_text,
         send_to_system_printer,
     )
 
@@ -1833,12 +1835,19 @@ class AppBridge(QObject):
             pull_error = str(sync_result.get("pull_error") or "").strip()
             errors = [str(item).strip() for item in sync_result.get("errors", []) if str(item).strip()]
             pull_line = f"\nPulled: {self._last_pull_count}\nMirrored: {self._last_pull_mirror}"
+            reference_line = (
+                f"\nOffline references ready: {sync_result.get('offline_references_ready', 0)}"
+                f"\nReference failures: {sync_result.get('offline_reference_failures', 0)}"
+            )
             error_line = f"\nPull warning: {pull_error}" if pull_error else ""
             first_error_line = f"\n\nFirst problem:\n{errors[0]}" if errors else ""
-            has_problems = bool(pull_error or errors or sync_result.get("failed") or sync_result.get("conflicts"))
+            has_problems = bool(
+                pull_error or errors or sync_result.get("failed") or sync_result.get("conflicts")
+                or sync_result.get("offline_reference_failures")
+            )
             self.alertRequested.emit(
                 "Sync Finished with Problems" if has_problems else "Sync Complete",
-                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{error_line}{first_error_line}",
+                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{reference_line}{error_line}{first_error_line}",
             )
 
     def _save_to_sync_layer(
@@ -1869,6 +1878,25 @@ class AppBridge(QObject):
         consumer = self._consumer or {}
         route = self._selected_route()
         schedule = self._schedule_for_consumer(consumer)
+        effective_reading_date = _normalize_iso_date(reading_date) or datetime.now().date().isoformat()
+        effective_due_date = (
+            _normalize_iso_date(due_date)
+            or _normalize_iso_date(consumer.get("due_date"))
+            or self._default_due_date_for_consumer(consumer)
+        )
+        if not effective_due_date:
+            raise ValueError("A valid due date is required before saving a bill.")
+        effective_schedule_date = (
+            _normalize_iso_date(schedule_date)
+            or _normalize_iso_date(route.get("startDate"))
+            or _normalize_iso_date(self.selectedBillingDate)
+            or effective_reading_date
+        )
+        effective_schedule_due_date = (
+            _normalize_iso_date(schedule_due_date)
+            or _normalize_iso_date(route.get("dueDate"))
+            or effective_due_date
+        )
         payload = {
             "reading_id": sync_reading_id or str(uuid.uuid4()),
             "consumer_id": consumer_id,
@@ -1882,6 +1910,7 @@ class AppBridge(QObject):
             "excess_rate_per_cubic": consumer.get("excess_rate_per_cubic"),
             "due_days": consumer.get("due_days"),
             "late_fee": consumer.get("late_fee"),
+            "penalty_percent": consumer.get("penalty_percent"),
             "water_meter_fee": consumer.get("water_meter_fee"),
             "meter_maintenance_fee": consumer.get("water_meter_fee", consumer.get("meter_maintenance_fee")),
             "connection_fee": consumer.get("connection_fee"),
@@ -1889,7 +1918,7 @@ class AppBridge(QObject):
             "amount_due": consumer.get("amount_due"),
             "previous_balance": consumer.get("previous_balance"),
             "prior_bill_due_date": consumer.get("due_date"),
-            "due_date": due_date or consumer.get("due_date"),
+            "due_date": effective_due_date,
             "penalty": consumer.get("penalty"),
             "previous_penalty": consumer.get("previous_penalty"),
             "total_after_due_date": consumer.get("total_after_due_date"),
@@ -1901,11 +1930,11 @@ class AppBridge(QObject):
             "consumption": consumption,
             "exception": exception,
             "is_flagged": bool(flagged),
-            "reading_date": reading_date or datetime.now().date().isoformat(),
+            "reading_date": effective_reading_date,
             "captured_at": captured_at or datetime.now().astimezone().isoformat(),
             "schedule_id": int(schedule_id) if schedule_id not in (None, "") else (int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None),
-            "schedule_date": schedule_date or route.get("startDate") or self.selectedBillingDate,
-            "schedule_due_date": schedule_due_date or route.get("dueDate") or route.get("startDate") or self.selectedBillingDate,
+            "schedule_date": effective_schedule_date,
+            "schedule_due_date": effective_schedule_due_date,
             "billing_cycle": billing_cycle or route.get("billingMonth") or consumer.get("billing_month"),
             "reading_route_id": reading_route_id if reading_route_id not in (None, "") else consumer.get("reading_route_id"),
             "assignment_order": assignment_order if assignment_order not in (None, "") else consumer.get("assignment_order"),
@@ -1913,7 +1942,7 @@ class AppBridge(QObject):
             "reading_sync_status": "pending",
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "bill_sync_id": bill_sync_id,
-            "bill_date": bill_date or reading_date or datetime.now().date().isoformat(),
+            "bill_date": _normalize_iso_date(bill_date) or effective_reading_date,
             "billing_reference": billing_reference,
         }
 
@@ -2265,7 +2294,8 @@ class AppBridge(QObject):
                 and latest_reading_date == row_reading_date
             )
         if latest_entry and latest_receipt_matches_current_row:
-            receipt = latest_entry["receipt_text"]
+            receipt = self._refresh_saved_receipt_penalty(latest_entry)
+            latest_entry = {**latest_entry, "receipt_text": receipt}
         else:
             if _has_receipt_context_gaps(row) and self._sync_dal:
                 try:
@@ -2419,22 +2449,37 @@ class AppBridge(QObject):
         schedule = self._schedule_for_consumer(self._consumer)
         reading_date = datetime.now().date().isoformat()
         captured_at = datetime.now().astimezone().isoformat()
-        if not self._sync_dal:
-            raise RuntimeError("Backend sync is unavailable. A billing reference cannot be reserved or printed.")
-        reservation = self._sync_dal.prepareBillingReference(self._consumer["id"], reading_date)
-        sync_reading_id = str(reservation.get("reading_sync_id") or "")
-        bill_sync_id = str(reservation.get("bill_sync_id") or "")
-        billing_reference = str(reservation.get("billing_reference") or "").strip()
         schedule_id = int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None
         schedule_date = str(route.get("startDate") or self.selectedBillingDate)
         schedule_due_date = str(route.get("dueDate") or schedule_date)
         billing_cycle = str(route.get("billingMonth") or self._consumer.get("billing_month") or "")
+        if not self._sync_dal:
+            raise RuntimeError("The local billing-reference store is unavailable.")
+        reservation = self._sync_dal.prepareBillingReference(
+            self._consumer["id"],
+            schedule_date,
+            schedule_id=schedule_id,
+            billing_cycle=billing_cycle,
+            due_date=schedule_due_date,
+            late_fee=self._consumer.get("late_fee", self._consumer.get("penalty_percent")),
+        )
+        sync_reading_id = str(reservation.get("reading_sync_id") or "")
+        bill_sync_id = str(reservation.get("bill_sync_id") or "")
+        billing_reference = str(reservation.get("billing_reference") or "").strip()
+        bill_date = str(reservation.get("bill_date") or schedule_date)
         reading_route_id = self._consumer.get("reading_route_id")
         assignment_order = self._consumer.get("assignment_order")
-        due_date = _normalize_iso_date(self._due_date) or self._default_due_date_for_consumer(self._consumer)
+        due_date = (
+            _normalize_iso_date(reservation.get("due_date"))
+            or _normalize_iso_date(schedule_due_date)
+            or _normalize_iso_date(self._due_date)
+            or self._default_due_date_for_consumer(self._consumer)
+        )
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
         consumer_snapshot["billing_reference"] = billing_reference
+        if reservation.get("late_fee") not in (None, ""):
+            consumer_snapshot["late_fee"] = reservation["late_fee"]
         flagged = consumption > 500 or exception != "None"
         if _build_bill_payload is None:
             raise RuntimeError("Billing calculation is unavailable.")
@@ -2446,6 +2491,7 @@ class AppBridge(QObject):
                 "present_reading": present,
                 "consumption": consumption,
                 "reading_date": reading_date,
+                "bill_date": bill_date,
                 "due_date": due_date,
             },
             self._consumer,
@@ -2475,6 +2521,7 @@ class AppBridge(QObject):
             "consumption": consumption,
             "exception": exception,
             "reading_date": reading_date,
+            "bill_date": bill_date,
             "due_date": due_date,
             "schedule_id": schedule_id,
             "schedule_date": schedule_date,
@@ -2542,6 +2589,16 @@ class AppBridge(QObject):
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
 
+    def _refresh_saved_receipt_penalty(self, entry: dict) -> str:
+        """Recalculate a stored receipt using current Manila date and cached backend context."""
+        context = get_consumer_by_id(entry.get("consumer_id")) if entry.get("consumer_id") else None
+        context = context or {}
+        return recalculate_receipt_penalty_text(
+            entry.get("receipt_text") or "",
+            bill_status=str(context.get("bill_status") or "Unpaid"),
+            late_fee=context.get("late_fee"),
+        )
+
     @Slot(int)
     def setBatteryLevel(self, level: int) -> None:
         self._battery_level = max(0, min(100, level))
@@ -2565,13 +2622,15 @@ class AppBridge(QObject):
             self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
             return
         original_printed_at = str(self._last_receipt_entry.get("printed_at") or "")
+        refreshed_receipt = self._refresh_saved_receipt_penalty(self._last_receipt_entry)
+        source_entry = {**self._last_receipt_entry, "receipt_text": refreshed_receipt}
         preview_text = build_reprint_receipt_text(
-            self._last_receipt_entry["receipt_text"],
+            refreshed_receipt,
             original_printed_at=original_printed_at,
         )
         job = {
             "job_type": "reprint",
-            "source_entry": dict(self._last_receipt_entry),
+            "source_entry": source_entry,
             "receipt_text": preview_text,
         }
         self._open_print_preview("Reprint Preview", preview_text, "Proceed to Reprint", job)
@@ -2606,6 +2665,12 @@ class AppBridge(QObject):
                             date_to,
                         )
                         pulled = len(consumers)
+                        reservation_result = getattr(self._sync_dal, "last_pre_reservation_result", {}) or {}
+                        result = {
+                            **result,
+                            "offline_references_ready": int(reservation_result.get("ready", 0)),
+                            "offline_reference_failures": int(reservation_result.get("failed", 0)),
+                        }
                         stage = "Updating the device consumer cache"
                         mirrored = replace_consumers_from_sync(consumers)
                     except Exception as pull_exc:
@@ -2686,6 +2751,14 @@ class AppBridge(QObject):
                     exception = str(job["exception"])
                     reading_date = str(job.get("reading_date") or datetime.now().date().isoformat())
                     due_date = str(job.get("due_date") or consumer.get("due_date") or "")
+                    receipt_text = build_receipt_text(
+                        consumer,
+                        previous,
+                        present,
+                        exception,
+                        job.get("reader_name") or self._reader_name,
+                        reading_date=reading_date,
+                    )
                     reading_id = int(job.get("reading_id") or 0)
                     if not reading_id:
                         flagged = consumption > 500 or exception != "None"
@@ -2705,7 +2778,7 @@ class AppBridge(QObject):
                             schedule_id=job.get("schedule_id"), schedule_date=job.get("schedule_date"),
                             schedule_due_date=job.get("schedule_due_date"), billing_cycle=job.get("billing_cycle"),
                             reading_route_id=job.get("reading_route_id"), assignment_order=job.get("assignment_order"),
-                            bill_sync_id=job.get("bill_sync_id"), bill_date=reading_date,
+                            bill_sync_id=job.get("bill_sync_id"), bill_date=job.get("bill_date"),
                             billing_reference=job.get("billing_reference"),
                             wait_for_result=True,
                         )
@@ -2775,8 +2848,13 @@ class AppBridge(QObject):
                     )
                     return
 
-                send_to_system_printer(receipt_text)
                 source_entry = dict(job["source_entry"])
+                refreshed_source = self._refresh_saved_receipt_penalty(source_entry)
+                receipt_text = build_reprint_receipt_text(
+                    refreshed_source,
+                    original_printed_at=str(source_entry.get("printed_at") or ""),
+                )
+                send_to_system_printer(receipt_text)
                 saved_id = None
                 history_error = None
                 try:
@@ -2958,6 +3036,10 @@ class AppBridge(QObject):
     @Slot(int)
     def openPrintHistoryDetail(self, receipt_print_id: int) -> None:
         self._print_history_detail = get_receipt_print_by_id(receipt_print_id)
+        if self._print_history_detail:
+            self._print_history_detail["receipt_text"] = self._refresh_saved_receipt_penalty(
+                self._print_history_detail
+            )
         self.printHistoryDetailChanged.emit()
 
     @Slot()
@@ -2972,8 +3054,10 @@ class AppBridge(QObject):
         if self._paper_status.lower() in {"out", "jam"}:
             self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
             return
+        refreshed_receipt = self._refresh_saved_receipt_penalty(self._print_history_detail)
+        source_entry = {**self._print_history_detail, "receipt_text": refreshed_receipt}
         preview_text = build_reprint_receipt_text(
-            self._print_history_detail["receipt_text"],
+            refreshed_receipt,
             original_printed_at=str(self._print_history_detail.get("printed_at") or ""),
         )
         self._open_print_preview(
@@ -2982,7 +3066,7 @@ class AppBridge(QObject):
             "Proceed to Reprint",
             {
                 "job_type": "reprint",
-                "source_entry": dict(self._print_history_detail),
+                "source_entry": source_entry,
                 "receipt_text": preview_text,
             },
         )
