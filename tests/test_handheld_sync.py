@@ -15,7 +15,7 @@ from src.handheld_sync import (
     _build_bill_payload,
     format_sync_error,
 )
-from src.receipt import apply_authoritative_bill, build_receipt_text
+from src.receipt import apply_authoritative_bill, build_receipt_text, build_reprint_receipt_text
 import src.database as database
 
 
@@ -163,6 +163,25 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Stage: Updating the device cache", diagnostic)
         self.assertIn("local SQLite database is busy", diagnostic)
         self.assertIn("Recommended action:", diagnostic)
+
+    def test_reprinting_a_duplicate_keeps_exactly_one_duplicate_header(self):
+        first = build_reprint_receipt_text(
+            "ORIGINAL BILL\nBilling Ref: SLR2026000125",
+            original_printed_at="2026-09-06 08:00:00",
+            reprint_at=datetime(2026, 9, 6, 9, 0),
+        )
+        second = build_reprint_receipt_text(
+            first,
+            original_printed_at="2026-09-06 09:00:00",
+            reprint_at=datetime(2026, 9, 6, 10, 0),
+        )
+
+        self.assertEqual(second.count("DUPLICATE COPY"), 1)
+        self.assertEqual(second.count("Original Print Date:"), 1)
+        self.assertEqual(second.count("Reprint Date:"), 1)
+        self.assertIn("Original Print Date: 2026-09-06 08:00:00", second)
+        self.assertIn("Reprint Date: 2026-09-06 10:00 AM", second)
+        self.assertEqual(second.count("Billing Ref: SLR2026000125"), 1)
 
     def test_backend_error_includes_http_status_and_route(self):
         class MissingRouteClient(BackendApiClient):
@@ -316,6 +335,7 @@ class HandheldSyncTests(unittest.TestCase):
                 if path == "/api/login":
                     return 200, {
                         "success": True,
+                        "token": "meter-reader-token",
                         "user": {"id": 12, "username": "reader", "fullName": "Meter Reader", "role_id": 3},
                     }
                 if path.endswith("/context"):
@@ -328,19 +348,30 @@ class HandheldSyncTests(unittest.TestCase):
                         "late_fee": 10,
                     }
                 if path == "/api/handheld/reading-bundles":
-                    return 200, {"meterreading": {"reading_id": 44}, "bill": {"bill_id": 55}}
+                    return 200, {
+                        "meterreading": {"reading_id": 44},
+                        "bill": {
+                            "bill_id": 55,
+                            "sync_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "billing_reference": "SLR2026000125",
+                        },
+                    }
                 return 404, {"message": "not found"}
 
         client = FakeBackendApiClient()
+        client._device_id = "METER-READER-01"
         user = client.authenticate_meter_reader("reader", "secret")
         result = client.save_reading_bundle(
             {
-                "reading_id": "stable-sync-id",
+                "reading_id": "94efb622-6798-4ddc-bf90-a56b1f03116e",
                 "consumer_id": 8,
                 "previous_reading": 100,
                 "present_reading": 112,
                 "consumption": 12,
                 "reading_date": "2026-08-02",
+                "bill_sync_id": "550e8400-e29b-41d4-a716-446655440000",
+                "bill_date": "2026-08-02",
+                "billing_reference": "SLR2026000125",
             }
         )
 
@@ -349,8 +380,40 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["bill"]["bill_id"], 55)
         bundle_call = next(call for call in client.calls if call[1] == "/api/handheld/reading-bundles")
         self.assertEqual(bundle_call[3]["reading"]["meter_reader_id"], 12)
-        self.assertNotIn("bill", bundle_call[3])
+        self.assertEqual(bundle_call[3]["bill"]["sync_id"], "550e8400-e29b-41d4-a716-446655440000")
+        self.assertEqual(bundle_call[3]["bill"]["billing_reference"], "SLR2026000125")
+        self.assertNotIn("billing_reference", bundle_call[3]["reading"])
         self.assertFalse(any(call[1].endswith("/context") for call in client.calls))
+
+    def test_local_bill_reservation_reuses_ids_until_backend_marks_it_used(self):
+        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        db_path = handle.name
+        handle.close()
+        try:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = db_path
+            store.ensure_schema()
+
+            first = store.get_or_create_bill_reservation(8, "2026-09-06")
+            retried = store.get_or_create_bill_reservation(8, "2026-09-06")
+            self.assertEqual(retried["bill_sync_id"], first["bill_sync_id"])
+            self.assertEqual(retried["reading_sync_id"], first["reading_sync_id"])
+
+            store.save_reserved_reference(first["bill_sync_id"], "SLR2026000125")
+            reserved = store.get_or_create_bill_reservation(8, "2026-09-06")
+            self.assertEqual(reserved["billing_reference"], "SLR2026000125")
+            self.assertEqual(reserved["status"], "Reserved")
+
+            store.mark_bill_reservation_used(first["bill_sync_id"], 456)
+            next_bill = store.get_or_create_bill_reservation(8, "2026-09-06")
+            self.assertNotEqual(next_bill["bill_sync_id"], first["bill_sync_id"])
+            self.assertNotEqual(next_bill["reading_sync_id"], first["reading_sync_id"])
+        finally:
+            gc.collect()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
 
     def test_backend_api_base_url_accepts_api_suffix_without_double_prefix(self):
         class ApiSuffixedClient(BackendApiClient):
@@ -902,6 +965,7 @@ class HandheldSyncTests(unittest.TestCase):
                     reading_id=reading_id, acct_no="HISTORY-1",
                     consumer_name="History Consumer", meter_no="MTR-HISTORY",
                     zone_name="History Zone",
+                    print_action="reprint" if index == 14 else "print",
                 )
 
             all_rows = database.list_receipt_print_history()
@@ -913,6 +977,12 @@ class HandheldSyncTests(unittest.TestCase):
             self.assertEqual(len(august_rows), 5)
             self.assertEqual(database.list_receipt_print_months(), ["2026-08", "2026-07"])
             self.assertEqual(len(database.list_receipt_print_history("body 12", month="2026-08")), 1)
+            self.assertEqual(len(database.list_receipt_print_history(print_action="print")), 14)
+            self.assertEqual(len(database.list_receipt_print_history(print_action="reprint")), 1)
+            self.assertEqual(
+                len(database.list_receipt_print_history(month="2026-08", print_action="reprint")),
+                1,
+            )
         finally:
             database._db_path = original_db_path
             try:

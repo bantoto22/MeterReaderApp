@@ -391,6 +391,7 @@ def _build_bill_payload(reading: dict, context: dict, remote_reading_id: int) ->
 class SyncConfig:
     backend_api_base_url: str = ""
     sync_enabled: bool = False
+    device_id: str = ""
 
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "SyncConfig":
@@ -401,7 +402,7 @@ class SyncConfig:
             _load_env_fallback(env_path)
 
         sync_enabled = os.getenv("HANDHELD_SYNC_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
-        required = ["BACKEND_API_BASE_URL"]
+        required = ["BACKEND_API_BASE_URL", "HANDHELD_DEVICE_ID"]
 
         missing = [k for k in required if not os.getenv(k)]
         if (fail_fast or sync_enabled) and missing:
@@ -414,6 +415,7 @@ class SyncConfig:
         return cls(
             backend_api_base_url=os.getenv("BACKEND_API_BASE_URL", "").rstrip("/"),
             sync_enabled=sync_enabled,
+            device_id=os.getenv("HANDHELD_DEVICE_ID", "").strip(),
         )
 
 
@@ -468,6 +470,20 @@ class LocalSyncStore:
         raise NotImplementedError
 
     def get_recent_audit(self, limit: int = 20) -> list[dict]:
+        raise NotImplementedError
+
+    def get_or_create_bill_reservation(
+        self,
+        consumer_id: int,
+        bill_date: str,
+        reading_sync_id: str | None = None,
+    ) -> dict:
+        raise NotImplementedError
+
+    def save_reserved_reference(self, bill_sync_id: str, billing_reference: str) -> None:
+        raise NotImplementedError
+
+    def mark_bill_reservation_used(self, bill_sync_id: str, bill_id: int | str | None = None) -> None:
         raise NotImplementedError
 
 
@@ -651,6 +667,22 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS local_billing_reference_reservations (
+            bill_sync_id TEXT PRIMARY KEY,
+            reading_sync_id TEXT NOT NULL,
+            consumer_id INTEGER NOT NULL,
+            bill_date TEXT NOT NULL,
+            billing_reference TEXT,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            bill_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            used_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_local_bill_reservation_lookup
+          ON local_billing_reference_reservations (consumer_id, bill_date, status);
 
         CREATE TABLE IF NOT EXISTS handheld_assignments_cache (
             schedule_id INTEGER NOT NULL,
@@ -950,6 +982,75 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             rows = conn.execute(base, params).fetchall()
         return sorted((dict(row) for row in rows), key=_cached_assignment_sort_key)
 
+    def get_or_create_bill_reservation(
+        self,
+        consumer_id: int,
+        bill_date: str,
+        reading_sync_id: str | None = None,
+    ) -> dict:
+        normalized_date = date.fromisoformat(str(bill_date)).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT bill_sync_id, reading_sync_id, consumer_id, bill_date,
+                       billing_reference, status, bill_id
+                FROM local_billing_reference_reservations
+                WHERE consumer_id = ? AND bill_date = ? AND status IN ('Pending', 'Reserved')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (int(consumer_id), normalized_date),
+            ).fetchone()
+            if row:
+                return dict(row)
+            bill_sync_id = str(uuid.uuid4())
+            stable_reading_sync_id = str(reading_sync_id or uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO local_billing_reference_reservations (
+                    bill_sync_id, reading_sync_id, consumer_id, bill_date, status
+                ) VALUES (?, ?, ?, ?, 'Pending')
+                """,
+                (bill_sync_id, stable_reading_sync_id, int(consumer_id), normalized_date),
+            )
+            conn.commit()
+        return {
+            "bill_sync_id": bill_sync_id,
+            "reading_sync_id": stable_reading_sync_id,
+            "consumer_id": int(consumer_id),
+            "bill_date": normalized_date,
+            "billing_reference": None,
+            "status": "Pending",
+            "bill_id": None,
+        }
+
+    def save_reserved_reference(self, bill_sync_id: str, billing_reference: str) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE local_billing_reference_reservations
+                SET billing_reference = ?, status = 'Reserved', updated_at = CURRENT_TIMESTAMP
+                WHERE bill_sync_id = ?
+                """,
+                (billing_reference, bill_sync_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("The local billing reservation draft no longer exists.")
+            conn.commit()
+
+    def mark_bill_reservation_used(self, bill_sync_id: str, bill_id: int | str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE local_billing_reference_reservations
+                SET status = 'Used', bill_id = ?, used_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bill_sync_id = ?
+                """,
+                (bill_id, bill_sync_id),
+            )
+            conn.commit()
+
     def enqueue_operation(
         self,
         operation: str,
@@ -1088,6 +1189,8 @@ class BackendApiClient:
             self._api_url = f"{base_url}/api" if base_url else ""
         self._url = self._api_url or self._root_url
         self._meter_reader_id: int | None = None
+        self._session_token = ""
+        self._device_id = str(cfg.device_id or "").strip()
 
     def _req(
         self,
@@ -1108,11 +1211,14 @@ class BackendApiClient:
             if clean_query:
                 url += "?" + parse.urlencode(clean_query)
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._session_token:
+            headers["Authorization"] = f"Bearer {self._session_token}"
         req = request.Request(
             url,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=headers,
         )
         try:
             with request.urlopen(req, timeout=5) as resp:
@@ -1153,6 +1259,19 @@ class BackendApiClient:
             raise PermissionError("This account is not an active Meter Reader.")
         account_id = user.get("id") or user.get("account_id")
         self._meter_reader_id = int(account_id) if account_id not in (None, "") else None
+        token_sources = (data, data.get("data") if isinstance(data.get("data"), dict) else {}, user)
+        self._session_token = next(
+            (
+                str(source.get(key)).strip()
+                for source in token_sources
+                for key in (
+                    "token", "access_token", "accessToken", "auth_token", "authToken",
+                    "session_token", "sessionToken", "jwt",
+                )
+                if source.get(key) not in (None, "")
+            ),
+            "",
+        )
         return {
             "id": account_id,
             "account_id": account_id,
@@ -1163,7 +1282,70 @@ class BackendApiClient:
             "role_id": user.get("role_id"),
             "account_status": "Active",
             "reader_id": str(account_id or ""),
+            "session_token": self._session_token,
         }
+
+    def set_authenticated_session(self, token: str | None, meter_reader_id: int | str | None = None) -> None:
+        self._session_token = str(token or "").strip()
+        self._meter_reader_id = int(meter_reader_id) if meter_reader_id not in (None, "") else None
+
+    @staticmethod
+    def _validate_reserved_reference(bill_sync_id: str, bill_date: str, billing_reference: str) -> None:
+        try:
+            normalized_date = date.fromisoformat(str(bill_date))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("bill_date must use YYYY-MM-DD format.") from exc
+        try:
+            parsed_sync_id = uuid.UUID(str(bill_sync_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("bill_sync_id must be a UUID v4 value.") from exc
+        if parsed_sync_id.version != 4:
+            raise ValueError("bill_sync_id must be a UUID v4 value.")
+        if not re.fullmatch(r"SLR[0-9]{10}", str(billing_reference or "")):
+            raise ValueError("The backend returned an invalid billing_reference.")
+        if billing_reference[3:7] != f"{normalized_date.year:04d}":
+            raise ValueError("The billing reference year does not match bill_date.")
+
+    def reserve_billing_reference(self, bill_sync_id: str, bill_date: str) -> dict:
+        if not self._session_token:
+            raise PermissionError("A current Meter Reader session is required to reserve a billing reference. Log in online again.")
+        if not self._device_id:
+            raise RuntimeError("HANDHELD_DEVICE_ID is not configured for this device.")
+        try:
+            normalized_date = date.fromisoformat(str(bill_date)).isoformat()
+            parsed_sync_id = uuid.UUID(str(bill_sync_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("A UUID v4 bill_sync_id and YYYY-MM-DD bill_date are required.") from exc
+        if parsed_sync_id.version != 4:
+            raise ValueError("bill_sync_id must be a UUID v4 value.")
+        request_payload = {
+            "bill_sync_id": str(parsed_sync_id),
+            "bill_date": normalized_date,
+            "device_id": self._device_id,
+        }
+        status, data = self._req(
+            "POST",
+            "/api/handheld/billing-references/reserve",
+            payload=request_payload,
+        )
+        if status == 409:
+            raise ValueError(self._message(data, "Billing-reference reservation conflicts with the pending bill."))
+        if status >= 400 or status == 0 or not isinstance(data, dict) or not data.get("success"):
+            raise self._request_failure(
+                status,
+                "/api/handheld/billing-references/reserve",
+                data,
+                "Billing-reference reservation failed.",
+            )
+        billing_reference = str(data.get("billing_reference") or "").strip()
+        self._validate_reserved_reference(str(parsed_sync_id), normalized_date, billing_reference)
+        reservation = data.get("reservation") if isinstance(data.get("reservation"), dict) else {}
+        if reservation:
+            if str(reservation.get("bill_sync_id") or "") != str(parsed_sync_id):
+                raise ValueError("The backend reservation returned a different bill_sync_id.")
+            if str(reservation.get("bill_date") or "")[:10] != normalized_date:
+                raise ValueError("The backend reservation returned a different bill_date.")
+        return {**data, "billing_reference": billing_reference}
 
     def load_reading_schedules(
         self,
@@ -1232,15 +1414,36 @@ class BackendApiClient:
         merged = dict(payload)
         if self._meter_reader_id is not None:
             merged.setdefault("meter_reader_id", self._meter_reader_id)
+        bill_sync_id = str(merged.get("bill_sync_id") or "").strip()
+        bill_date = str(merged.get("bill_date") or merged.get("reading_date") or "").strip()[:10]
+        billing_reference = str(merged.get("billing_reference") or "").strip()
+        self._validate_reserved_reference(bill_sync_id, bill_date, billing_reference)
+        bill = _build_bill_payload(merged, merged, 0)
+        bill.pop("reading_id", None)
+        bill.update({
+            "sync_id": bill_sync_id,
+            "bill_date": bill_date,
+            "billing_reference": billing_reference,
+        })
+        reading_payload = dict(merged)
+        for device_only_field in ("bill_sync_id", "bill_date", "billing_reference"):
+            reading_payload.pop(device_only_field, None)
         status, data = self._req(
             "POST",
             "/api/handheld/reading-bundles",
-            payload={"reading": merged},
+            payload={"reading": reading_payload, "bill": bill},
         )
+        if status == 409:
+            raise ValueError(self._message(data, "The reserved billing reference conflicts with this bill."))
         if status >= 400 or status == 0 or not isinstance(data, dict):
             raise self._request_failure(status, "/api/handheld/reading-bundles", data, "Backend reading sync failed.")
         if not isinstance(data.get("bill"), dict):
             raise RuntimeError("Backend reading sync succeeded but did not return the authoritative response.bill.")
+        saved_bill = data["bill"]
+        if str(saved_bill.get("sync_id") or "") != bill_sync_id:
+            raise RuntimeError("Backend reading sync returned a bill with a different sync_id.")
+        if str(saved_bill.get("billing_reference") or "") != billing_reference:
+            raise RuntimeError("Backend reading sync returned a different billing_reference.")
         return data
 
     def upsert_meter_reading(self, payload: dict) -> dict:
@@ -1372,6 +1575,56 @@ class HandheldSyncDataAccess:
             raise RuntimeError("Backend API is unavailable for meter reader login.")
         return self.remote.authenticate_meter_reader(username, password)
 
+    def setAuthenticatedSession(self, token: str | None, meter_reader_id: int | str | None = None) -> None:
+        if self.remote and hasattr(self.remote, "set_authenticated_session"):
+            self.remote.set_authenticated_session(token, meter_reader_id)
+
+    def reserveBillingReference(self, bill_sync_id: str, bill_date: str) -> dict:
+        with self.operation_lock:
+            if not self.remote or not self.remote.is_online():
+                raise RuntimeError(
+                    "The Backend API must be online before a billing reference can be reserved or printed."
+                )
+            result = self.remote.reserve_billing_reference(bill_sync_id, bill_date)
+            self._audit(
+                None,
+                "success",
+                "Reserved billing reference from Backend API",
+                {
+                    "bill_sync_id": bill_sync_id,
+                    "bill_date": bill_date,
+                    "billing_reference": result.get("billing_reference"),
+                },
+            )
+            return result
+
+    def prepareBillingReference(self, consumer_id: int, bill_date: str) -> dict:
+        with self.operation_lock:
+            draft = self.local.get_or_create_bill_reservation(int(consumer_id), bill_date)
+            bill_sync_id = str(draft["bill_sync_id"])
+            normalized_date = str(draft["bill_date"])
+            if draft.get("billing_reference"):
+                return draft
+            if not self.remote or not self.remote.is_online():
+                raise RuntimeError(
+                    "The Backend API must be online before a billing reference can be reserved or printed."
+                )
+            result = self.remote.reserve_billing_reference(bill_sync_id, normalized_date)
+            billing_reference = str(result.get("billing_reference") or "")
+            self.local.save_reserved_reference(bill_sync_id, billing_reference)
+            prepared = {
+                **draft,
+                "billing_reference": billing_reference,
+                "status": "Reserved",
+            }
+            self._audit(
+                None,
+                "success",
+                "Reserved and persisted billing reference from Backend API",
+                prepared,
+            )
+            return prepared
+
     @staticmethod
     def _normalize_reading(payload: dict) -> dict:
         reading = dict(payload)
@@ -1403,6 +1656,12 @@ class HandheldSyncDataAccess:
         try:
             remote = self.remote.save_reading_bundle(reading)
             self.local.mark_target_synced(queued["id"], "backend")
+            if reading.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
+                saved_bill = remote.get("bill") if isinstance(remote, dict) else {}
+                self.local.mark_bill_reservation_used(
+                    str(reading["bill_sync_id"]),
+                    saved_bill.get("bill_id") if isinstance(saved_bill, dict) else None,
+                )
             _update_local_reading_state(reading.get("reading_id"), "synced", "valid")
             self.local.log_audit(
                 queued["id"],
@@ -1416,6 +1675,16 @@ class HandheldSyncDataAccess:
                 "reading": reading,
                 "errors": [],
                 "queue": queued,
+            }
+        except ValueError as exc:
+            self.local.mark_conflict(queued["id"], str(exc), target="backend")
+            _update_local_reading_state(reading.get("reading_id"), "conflict", "rejected")
+            self.local.log_audit(queued["id"], "conflict", f"Backend API rejected the reserved bill: {exc}", reading)
+            return {
+                "status": "conflict",
+                "queue": queued,
+                "reading": reading,
+                "errors": [str(exc)],
             }
         except Exception as exc:
             self.local.mark_target_failed(queued["id"], "backend", str(exc))
@@ -1524,8 +1793,14 @@ class HandheldSyncDataAccess:
                     conflicts += 1
                     continue
 
-                self.remote.save_reading_bundle(payload)
+                remote_result = self.remote.save_reading_bundle(payload)
                 self.local.mark_target_synced(queue_id, "backend")
+                if payload.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
+                    saved_bill = remote_result.get("bill") if isinstance(remote_result, dict) else {}
+                    self.local.mark_bill_reservation_used(
+                        str(payload["bill_sync_id"]),
+                        saved_bill.get("bill_id") if isinstance(saved_bill, dict) else None,
+                    )
                 _update_local_reading_state(payload.get("reading_id"), "synced", "valid")
                 self._audit(
                     queue_id,

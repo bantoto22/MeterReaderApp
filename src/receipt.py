@@ -385,6 +385,7 @@ def build_receipt_text(
         _center_text("SAN LORENZO RUIZ WATERWORKS"),
         _center_text("Water Billing System"),
         border,
+        _field_line("Billing Ref", consumer.get("billing_reference", "N/A"), width=11),
         _center_text(str(consumer.get("acct_no", "N/A"))),
         _center_text(str(consumer.get("name", "N/A"))),
         divider,
@@ -470,6 +471,28 @@ def build_reprint_receipt_text(
     original_printed_at: str | None = None,
     reprint_at: datetime.datetime | None = None,
 ) -> str:
+    # A reprint can itself be selected from print history. Unwrap any existing
+    # duplicate-copy envelope so the marker and timestamps never accumulate.
+    body_lines = str(original_receipt_text or "").splitlines()
+    preserved_original_printed_at = ""
+    while body_lines and body_lines[0].strip().upper() == "DUPLICATE COPY":
+        index = 1
+        while index < len(body_lines) and not body_lines[index].strip():
+            index += 1
+        if index < len(body_lines) and body_lines[index].startswith("Original Print Date:"):
+            preserved_original_printed_at = (
+                preserved_original_printed_at
+                or body_lines[index].partition(":")[2].strip()
+            )
+            index += 1
+        if index < len(body_lines) and body_lines[index].startswith("Reprint Date:"):
+            index += 1
+        while index < len(body_lines) and not body_lines[index].strip():
+            index += 1
+        body_lines = body_lines[index:]
+
+    canonical_receipt_text = "\n".join(body_lines).rstrip()
+    original_printed_at = preserved_original_printed_at or original_printed_at
     reprint_at = reprint_at or datetime.datetime.now()
     header_lines = [
         "DUPLICATE COPY",
@@ -478,7 +501,7 @@ def build_reprint_receipt_text(
     if original_printed_at:
         header_lines.append(f"Original Print Date: {original_printed_at}")
     header_lines.append(f"Reprint Date: {reprint_at.strftime('%Y-%m-%d %I:%M %p')}")
-    header_lines.extend(["", original_receipt_text.rstrip(), "", "", "", ""])
+    header_lines.extend(["", canonical_receipt_text, "", "", "", ""])
     return "\n".join(header_lines)
 
 

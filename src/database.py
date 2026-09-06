@@ -1396,8 +1396,9 @@ def list_receipt_print_history(
     search_text: str = "",
     month: str | None = None,
     limit: int | None = None,
+    print_action: str | None = None,
 ) -> list[dict]:
-    """Return persisted receipt history, optionally filtered by reading month."""
+    """Return receipt history filtered by search text, reading month, and print type."""
     conn = get_connection()
     sql = """
         SELECT
@@ -1438,6 +1439,10 @@ def list_receipt_print_history(
     if normalized_month:
         conditions.append("strftime('%Y-%m', COALESCE(r.reading_date, rp.printed_at)) = ?")
         params.append(normalized_month)
+    normalized_action = str(print_action or "").strip().lower()
+    if normalized_action in {"print", "reprint"}:
+        conditions.append("LOWER(COALESCE(rp.print_action, 'print')) = ?")
+        params.append(normalized_action)
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY datetime(rp.printed_at) DESC, rp.id DESC"

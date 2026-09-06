@@ -502,12 +502,27 @@ Rectangle {
                     onActivated: { if (bridgeObj) bridgeObj.setPrintHistoryMonth(currentValue) }
                 }
 
-                Text {
-                    text: bridgeObj ? (bridgeObj.printHistoryRecords.length + " records") : "0 records"
-                    font.family: "Montserrat"
-                    font.pixelSize: TouchMetrics.helperText
-                    color: "#526176"
+                ComboBox {
+                    id: historyPrintAction
+                    Layout.fillWidth: true
+                    textRole: "label"
+                    valueRole: "value"
+                    model: bridgeObj ? bridgeObj.printHistoryActionOptions : []
+                    currentIndex: {
+                        if (!bridgeObj) return 0
+                        var values = bridgeObj.printHistoryActionOptions.map(function(item) { return item.value })
+                        return Math.max(0, values.indexOf(bridgeObj.selectedPrintHistoryAction))
+                    }
+                    onActivated: { if (bridgeObj) bridgeObj.setPrintHistoryAction(currentValue) }
                 }
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignRight
+                text: bridgeObj ? (bridgeObj.printHistoryRecords.length + " records") : "0 records"
+                font.family: "Montserrat"
+                font.pixelSize: TouchMetrics.helperText
+                color: "#526176"
             }
 
             ListView {

@@ -99,7 +99,9 @@ The device does not store third-party cloud keys or PostgreSQL credentials.
 ### Offline Operation
 
 - Each meter reader must sign in online at least once so the device can cache a salted password hash and assigned route data.
-- While offline, the reader can sign in, browse cached schedules and consumers, record readings, and print receipts.
+- While offline, the reader can sign in and browse cached schedules and consumers. A new bill cannot be previewed or
+  printed until the backend reserves its shared billing reference. Offline printing requires a future backend feature
+  that preallocates non-overlapping reference blocks to devices.
 - Offline readings remain in the local SQLite queue and upload automatically or through `Sync Now` when the backend API becomes reachable.
 - An invalid or inactive account response from the backend is never bypassed with stale cached credentials.
 
@@ -110,6 +112,14 @@ The device uses the same public HTTPS Funnel as the web app:
 ```text
 Device -> https://aspire.tail3de291.ts.net/api -> Node backend:3001 -> PostgreSQL:5432
 ```
+
+### Billing-reference lifecycle
+
+Set a unique, stable `HANDHELD_DEVICE_ID` in `.env`. Before showing a new receipt, the device persists stable reading
+and bill UUIDs locally, calls `POST /api/handheld/billing-references/reserve`, and stores the returned
+`SLRYYYY######` reference. Timeouts reuse the same UUIDs. The reading-bundle upload sends that exact reference and
+separate bill UUID. After the backend confirms the saved bill, the local reservation becomes `Used`; the printed
+reference remains permanently assigned to that bill and is never reused. Reprints retain the original reference.
 
 ### Handheld UI
 

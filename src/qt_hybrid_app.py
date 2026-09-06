@@ -690,6 +690,7 @@ class AppBridge(QObject):
         self._print_history_detail = None
         self._print_history_months = []
         self._selected_print_history_month = ""
+        self._selected_print_history_action = ""
         self._print_history_search = ""
 
         self._overall_percentage = 0
@@ -798,6 +799,11 @@ class AppBridge(QObject):
         self._reader_name = user.get('full_name') or user.get('name', 'User')
         self._reader_id = str(user.get('account_id') or user.get('id') or '')
         self._meter_reader_account_id = str(user.get('account_id') or user.get('id') or "").strip()
+        if self._sync_dal:
+            self._sync_dal.setAuthenticatedSession(
+                user.get("session_token"),
+                self._meter_reader_account_id or None,
+            )
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
         self._last_receipt_entry = get_latest_receipt_print()
@@ -820,6 +826,8 @@ class AppBridge(QObject):
 
     def clear_user(self) -> None:
         clear_current_meter_reader()
+        if self._sync_dal:
+            self._sync_dal.setAuthenticatedSession(None, None)
         self._reader_name = "User"
         self._reader_id = ""
         self._meter_reader_account_id = ""
@@ -1352,6 +1360,18 @@ class AppBridge(QObject):
     def selectedPrintHistoryMonth(self) -> str:
         return self._selected_print_history_month
 
+    @Property(list, notify=printHistoryFiltersChanged)
+    def printHistoryActionOptions(self) -> list:
+        return [
+            {"label": "All bills", "value": ""},
+            {"label": "Originals", "value": "print"},
+            {"label": "Reprints", "value": "reprint"},
+        ]
+
+    @Property(str, notify=printHistoryFiltersChanged)
+    def selectedPrintHistoryAction(self) -> str:
+        return self._selected_print_history_action
+
     @Property(str, notify=printHistoryDetailChanged)
     def printHistoryDetailTitle(self) -> str:
         if not self._print_history_detail:
@@ -1831,6 +1851,9 @@ class AppBridge(QObject):
         billing_cycle: str | None = None,
         reading_route_id: int | str | None = None,
         assignment_order: int | str | None = None,
+        bill_sync_id: str | None = None,
+        bill_date: str | None = None,
+        billing_reference: str | None = None,
         wait_for_result: bool = False,
     ) -> dict | None:
         if not self._sync_dal:
@@ -1879,6 +1902,9 @@ class AppBridge(QObject):
             "reading_status": "valid",
             "reading_sync_status": "pending",
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "bill_sync_id": bill_sync_id,
+            "bill_date": bill_date or reading_date or datetime.now().date().isoformat(),
+            "billing_reference": billing_reference,
         }
 
         def _save() -> dict | None:
@@ -2382,7 +2408,12 @@ class AppBridge(QObject):
         schedule = self._schedule_for_consumer(self._consumer)
         reading_date = datetime.now().date().isoformat()
         captured_at = datetime.now().astimezone().isoformat()
-        sync_reading_id = str(uuid.uuid4())
+        if not self._sync_dal:
+            raise RuntimeError("Backend sync is unavailable. A billing reference cannot be reserved or printed.")
+        reservation = self._sync_dal.prepareBillingReference(self._consumer["id"], reading_date)
+        sync_reading_id = str(reservation.get("reading_sync_id") or "")
+        bill_sync_id = str(reservation.get("bill_sync_id") or "")
+        billing_reference = str(reservation.get("billing_reference") or "").strip()
         schedule_id = int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None
         schedule_date = str(route.get("startDate") or self.selectedBillingDate)
         schedule_due_date = str(route.get("dueDate") or schedule_date)
@@ -2392,6 +2423,7 @@ class AppBridge(QObject):
         due_date = _normalize_iso_date(self._due_date) or self._default_due_date_for_consumer(self._consumer)
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
+        consumer_snapshot["billing_reference"] = billing_reference
         flagged = consumption > 500 or exception != "None"
         if due_date:
             update_consumer_due_date(self._consumer["id"], due_date)
@@ -2409,8 +2441,16 @@ class AppBridge(QObject):
             schedule_id=schedule_id, schedule_date=schedule_date,
             schedule_due_date=schedule_due_date, billing_cycle=billing_cycle,
             reading_route_id=reading_route_id, assignment_order=assignment_order,
+            bill_sync_id=bill_sync_id, bill_date=reading_date,
+            billing_reference=billing_reference,
             wait_for_result=True,
         )
+        if not sync_result:
+            raise RuntimeError("The reserved bill could not be persisted to the local retry queue.")
+        if sync_result.get("status") == "conflict":
+            errors = sync_result.get("errors") or []
+            detail = str(errors[0]) if errors else "The reserved reference conflicts with the submitted bill."
+            raise RuntimeError(f"The bill was not printed because the backend rejected it. {detail}")
         authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
         if authoritative_bill:
             consumer_snapshot = apply_authoritative_bill(consumer_snapshot, authoritative_bill)
@@ -2442,6 +2482,8 @@ class AppBridge(QObject):
             "reading_route_id": reading_route_id,
             "assignment_order": assignment_order,
             "sync_reading_id": sync_reading_id,
+            "bill_sync_id": bill_sync_id,
+            "billing_reference": billing_reference,
             "captured_at": captured_at,
             "authoritative_bill": authoritative_bill,
             "receipt_text": receipt,
@@ -2826,6 +2868,7 @@ class AppBridge(QObject):
         rows = list_receipt_print_history(
             search_text=self._print_history_search,
             month=self._selected_print_history_month or None,
+            print_action=self._selected_print_history_action or None,
         )
         self._print_history_records = [
             {
@@ -2853,6 +2896,16 @@ class AppBridge(QObject):
             return
         if self._selected_print_history_month != normalized:
             self._selected_print_history_month = normalized
+            self.printHistoryFiltersChanged.emit()
+        self.refreshPrintHistory(self._print_history_search)
+
+    @Slot(str)
+    def setPrintHistoryAction(self, print_action: str) -> None:
+        normalized = str(print_action or "").strip().lower()
+        if normalized not in {"", "print", "reprint"}:
+            return
+        if self._selected_print_history_action != normalized:
+            self._selected_print_history_action = normalized
             self.printHistoryFiltersChanged.emit()
         self.refreshPrintHistory(self._print_history_search)
 
