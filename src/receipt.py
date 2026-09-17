@@ -11,9 +11,15 @@ import tempfile
 import tkinter as tk
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+try:
+    from .reader_identity import reader_display_name
+except ImportError:
+    from reader_identity import reader_display_name
+
 FONT_FAMILY = "Montserrat"
 RAW_PRINTER_DEVICE = "/dev/usb/lp0"
 RECEIPT_WIDTH = 32
+LABEL_WIDTH = 15
 
 
 def manila_current_date(now: datetime.datetime | None = None) -> datetime.date:
@@ -48,23 +54,23 @@ def _receipt_line(char: str = "-") -> str:
     return char * RECEIPT_WIDTH
 
 
-def _field_line(label: str, value, width: int = 11) -> str:
-    return f" {label:<{width}}: {value}"
+def _field_line(label: str, value) -> str:
+    return "\n".join(_wrap_field_lines(label, value))
 
 
 def _money_line(label: str, value: float) -> str:
-    return f" {label:<12}: PHP {value:>8.2f}"
+    return _field_line(label, f"PHP {value:>8.2f}")
 
 
 def _percent_line(label: str, value: float) -> str:
-    return f" {label:<11}: {value:>8.2f}%"
+    return _field_line(label, f"{value:>8.2f}%")
 
 
-def _wrap_field_lines(label: str, value, width: int = 11, indent: int | None = None) -> list[str]:
+def _wrap_field_lines(label: str, value) -> list[str]:
     text = str(value if value not in (None, "") else "N/A")
-    prefix = f" {label:<{width}}: "
+    prefix = f" {label:<{LABEL_WIDTH}}: "
     remaining = max(8, RECEIPT_WIDTH - len(prefix))
-    continuation_indent = " " * (indent if indent is not None else len(prefix))
+    continuation_indent = " " * len(prefix)
     lines: list[str] = []
     current = text.strip()
     first = True
@@ -151,6 +157,10 @@ def _billing_month_text(consumer: dict, reference_date: datetime.date) -> str:
 
 
 def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
+    schedule_start = _display_date(consumer.get("schedule_date"), default="")
+    schedule_end = _display_date(consumer.get("schedule_due_date"), default="")
+    if schedule_start and schedule_end:
+        return f"{schedule_start} to {schedule_end}"
     start_keys = (
         "date_covered_from",
         "billing_period_from",
@@ -412,10 +422,11 @@ def build_receipt_text(
     previous: float,
     present: float,
     exception: str,
-    reader_name: str = "Field Reader",
+    reader_name: str = "",
     reading_date: str | datetime.date | None = None,
     as_of_date: datetime.date | None = None,
 ) -> str:
+    reader_name = reader_display_name({"full_name": reader_name})
     _require_billing_profile(consumer)
     consumption = present - previous
     calculated_current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
@@ -477,9 +488,9 @@ def build_receipt_text(
         _center_text("SAN LORENZO RUIZ WATERWORKS"),
         _center_text("Water Billing System"),
         border,
-        _field_line("Billing Ref", consumer.get("billing_reference", "N/A"), width=11),
-        _center_text(str(consumer.get("acct_no", "N/A"))),
-        _center_text(str(consumer.get("name", "N/A"))),
+        _field_line("Billing Ref", consumer.get("billing_reference", "N/A")),
+        _field_line("Account No", consumer.get("acct_no") or "N/A"),
+        _field_line("Name", str(consumer.get("name") or "").strip().title() or "N/A"),
         divider,
     ]
     lines.extend(_wrap_field_lines("Address", address))
@@ -487,14 +498,14 @@ def build_receipt_text(
         _field_line("Meter No", consumer.get("meter_no", "N/A")),
         _field_line("Class", consumer.get("classification_name", "N/A")),
         divider,
-        _field_line("Bill Month", billing_month, width=11),
+        _field_line("Bill Month", billing_month),
     ]
-    lines.extend(_wrap_field_lines("Coverage", billing_period, width=11))
+    lines.extend(_wrap_field_lines("Coverage", billing_period))
     lines += [
-        _field_line("Present", _format_reading(present), width=11),
-        _field_line("Previous", _format_reading(previous), width=11),
-        _field_line("Use", f"{_format_reading(consumption)} m3", width=11),
-        _field_line("Prev Bill", previous_bill, width=11),
+        _field_line("Present", _format_reading(present)),
+        _field_line("Previous", _format_reading(previous)),
+        _field_line("Use", f"{_format_reading(consumption)} m3"),
+        _field_line("Prev Bill", previous_bill),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
@@ -519,7 +530,7 @@ def build_receipt_text(
         border,
         _field_line("Date", date_str),
         _field_line("Time", time_str),
-        _field_line("Reader", reader_name),
+        _field_line("Reader", reader_name) if reader_name else f" {'Reader':<{LABEL_WIDTH}}:",
         divider,
         _center_text("Thank you!"),
         border,
@@ -761,6 +772,6 @@ def preview_receipt(parent, receipt_text: str):
     return win
 
 
-def show_receipt(parent, consumer: dict, previous: int, present: int, exception: str, reader_name: str = "Field Reader"):
+def show_receipt(parent, consumer: dict, previous: int, present: int, exception: str, reader_name: str = ""):
     receipt_text = build_receipt_text(consumer, previous, present, exception, reader_name)
     return preview_receipt(parent, receipt_text)

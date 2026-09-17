@@ -25,6 +25,11 @@ from urllib import error, parse, request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
+    from .reader_identity import reader_display_name
+except ImportError:
+    from reader_identity import reader_display_name
+
+try:
     from .sqlite_support import connect_sqlite
 except ImportError:
     from sqlite_support import connect_sqlite
@@ -471,6 +476,19 @@ def _build_bill_payload(
             carried_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
+    # Coverage belongs to the linked assignment, even when read or printed later.
+    coverage_start = (
+        _parse_date(reading.get("schedule_date"))
+        or _parse_date(reading.get("date_covered_from"))
+        or _parse_date(context.get("date_covered_from"))
+        or reference_date
+    )
+    coverage_end = (
+        _parse_date(reading.get("schedule_due_date"))
+        or _parse_date(reading.get("date_covered_to"))
+        or _parse_date(context.get("date_covered_to"))
+        or reference_date
+    )
     supplied_due_date = _parse_date(reading.get("due_date") or reading.get("schedule_due_date"))
     due_date_obj = supplied_due_date or (reference_date + timedelta(days=due_days))
     due_date = datetime.combine(due_date_obj, datetime.min.time())
@@ -493,8 +511,8 @@ def _build_bill_payload(
         "reading_id": int(remote_reading_id),
         "billing_officer_id": None,
         "billing_month": bill_date.strftime("%B %Y"),
-        "date_covered_from": bill_date.isoformat(sep=" "),
-        "date_covered_to": bill_date.isoformat(sep=" "),
+        "date_covered_from": datetime.combine(coverage_start, datetime.min.time()).isoformat(sep=" "),
+        "date_covered_to": datetime.combine(coverage_end, datetime.min.time()).isoformat(sep=" "),
         "bill_date": bill_date.isoformat(sep=" "),
         "due_date": due_date.isoformat(sep=" "),
         "disconnection_date": None,
@@ -1469,8 +1487,8 @@ class BackendApiClient:
             "id": account_id,
             "account_id": account_id,
             "username": user.get("username"),
-            "name": user.get("fullName") or user.get("full_name") or user.get("username"),
-            "full_name": user.get("fullName") or user.get("full_name") or user.get("username"),
+            "name": reader_display_name(user),
+            "full_name": reader_display_name(user),
             "contact_number": str(user.get("contact_number") or "").strip(),
             "role_id": user.get("role_id"),
             "account_status": "Active",

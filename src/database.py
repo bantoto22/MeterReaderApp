@@ -12,6 +12,11 @@ from datetime import date, datetime
 from decimal import Decimal
 
 try:
+    from .reader_identity import reader_display_name
+except ImportError:
+    from reader_identity import reader_display_name
+
+try:
     from .sqlite_support import connect_sqlite
 except ImportError:
     from sqlite_support import connect_sqlite
@@ -422,8 +427,8 @@ def authenticate_user(username: str, password: str) -> dict | None:
             conn.commit()
         user = {
             'username': row['username'],
-            'name': row['full_name'] or row['name'],
-            'full_name': row['full_name'] or row['name'],
+            'name': reader_display_name(dict(row)),
+            'full_name': reader_display_name(dict(row)),
             'id': row['account_id'] if row['account_id'] not in (None, "") else row['reader_id'],
             'account_id': row['account_id'],
             'reader_id': row['reader_id'],
@@ -443,7 +448,7 @@ def cache_meter_reader_credentials(user: dict, password: str) -> None:
     if not username or password in (None, ""):
         return
 
-    full_name = str(user.get("full_name") or user.get("name") or username).strip()
+    full_name = reader_display_name(user)
     reader_id = str(user.get("reader_id") or user.get("account_id") or user.get("id") or username).strip()
     account_id = user.get("account_id", user.get("id"))
     try:
@@ -548,7 +553,7 @@ def save_current_meter_reader(user: dict) -> None:
         (
             user.get("account_id"),
             user.get("username"),
-            user.get("full_name") or user.get("name"),
+            reader_display_name(user),
             user.get("contact_number"),
             user.get("role_id"),
             user.get("account_status"),
@@ -1306,7 +1311,7 @@ def save_receipt_print(
     present_reading: float,
     consumption: float,
     exception: str = "None",
-    reader_name: str = "Field Reader",
+    reader_name: str = "",
     reading_id: int | None = None,
     print_action: str = "print",
     acct_no: str | None = None,
@@ -1344,7 +1349,7 @@ def save_receipt_print(
             present_reading,
             consumption,
             exception or "None",
-            reader_name or "Field Reader",
+            reader_name,
             receipt_text,
             print_action or "print",
         ),

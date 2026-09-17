@@ -14,6 +14,11 @@ from pathlib import Path
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
 try:
+    from .reader_identity import reader_display_name
+except ImportError:
+    from reader_identity import reader_display_name
+
+try:
     from .qt_compat import (
         CPU_ARCH,
         QApplication,
@@ -801,7 +806,7 @@ class AppBridge(QObject):
         return self._last_receipt is not None
 
     def set_user(self, user: dict) -> None:
-        self._reader_name = user.get('full_name') or user.get('name', 'User')
+        self._reader_name = reader_display_name(user)
         self._reader_id = str(user.get('account_id') or user.get('id') or '')
         self._meter_reader_account_id = str(user.get('account_id') or user.get('id') or "").strip()
         if self._sync_dal:
@@ -819,7 +824,7 @@ class AppBridge(QObject):
 
     @Slot()
     def showWelcomeToast(self) -> None:
-        self.welcomeToastRequested.emit(f"Welcome, {self._reader_name}!")
+        self.welcomeToastRequested.emit(f"Welcome, {self._reader_name}!" if self._reader_name else "Welcome!")
 
     def _set_operation_busy(self, busy: bool, message: str = "") -> None:
         if self._operation_busy != busy:
@@ -2450,9 +2455,9 @@ class AppBridge(QObject):
         reading_date = datetime.now().date().isoformat()
         captured_at = datetime.now().astimezone().isoformat()
         schedule_id = int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None
-        schedule_date = str(route.get("startDate") or self.selectedBillingDate)
-        schedule_due_date = str(route.get("dueDate") or schedule_date)
-        billing_cycle = str(route.get("billingMonth") or self._consumer.get("billing_month") or "")
+        schedule_date = str(schedule.get("startDate") or route.get("startDate") or self.selectedBillingDate)
+        schedule_due_date = str(schedule.get("dueDate") or route.get("dueDate") or schedule_date)
+        billing_cycle = str(schedule.get("billingMonth") or route.get("billingMonth") or self._consumer.get("billing_month") or "")
         if not self._sync_dal:
             raise RuntimeError("The local billing-reference store is unavailable.")
         reservation = self._sync_dal.prepareBillingReference(
@@ -2478,6 +2483,8 @@ class AppBridge(QObject):
         consumer_snapshot = dict(self._consumer)
         consumer_snapshot["due_date"] = due_date
         consumer_snapshot["billing_reference"] = billing_reference
+        consumer_snapshot["schedule_date"] = schedule_date
+        consumer_snapshot["schedule_due_date"] = schedule_due_date
         if reservation.get("late_fee") not in (None, ""):
             consumer_snapshot["late_fee"] = reservation["late_fee"]
         flagged = consumption > 500 or exception != "None"
@@ -2493,6 +2500,8 @@ class AppBridge(QObject):
                 "reading_date": reading_date,
                 "bill_date": bill_date,
                 "due_date": due_date,
+                "schedule_date": schedule_date,
+                "schedule_due_date": schedule_due_date,
             },
             self._consumer,
             0,
@@ -3291,6 +3300,21 @@ def run_qt_hybrid() -> int:
     app.setStyle("Fusion")
     win = HybridMainWindow()
     win.show()
+    # Include the title bar and window borders when fitting the touchscreen.
+    def fit_window_to_screen():
+        available = win.screen().availableGeometry()
+        frame = win.frameGeometry()
+        border_width = max(0, frame.width() - win.width())
+        border_height = max(0, frame.height() - win.height())
+        win.resize(
+            min(win.width(), max(1, available.width() - border_width)),
+            min(win.height(), max(1, available.height() - border_height)),
+        )
+        frame = win.frameGeometry()
+        win.move(
+            max(available.left(), min(frame.left(), available.right() - frame.width() + 1)),
+            max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1)),
+        )
+
+    QTimer.singleShot(0, fit_window_to_screen)
     return app.exec()
-
-

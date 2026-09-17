@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from PIL import Image, ImageTk
 
 try:
+    from .reader_identity import reader_display_name
+except ImportError:
+    from reader_identity import reader_display_name
+
+try:
     import ttkbootstrap as tb
 except ImportError:
     tb = None
@@ -2728,7 +2733,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                 data["previous"],
                 data["present"],
                 data["exception"],
-                self._current_user["name"] if self._current_user else "Field Reader",
+                reader_display_name(self._current_user),
                 latest_entry.get("reading_id") if latest_entry else data.get("reading_id"),
                 "reprint",
                 receipt_text,
@@ -3457,7 +3462,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                 "previous": previous,
                 "consumption": consumption,
                 "exception": exception,
-                "reader_name": self._current_user["name"] if self._current_user else "Field Reader",
+                "reader_name": reader_display_name(self._current_user),
                 "timestamp": time.time()
             }
             self._current_consumer["previous_reading"] = present
@@ -3496,7 +3501,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "previous": previous,
             "consumption": consumption,
             "exception": exception,
-            "reader_name": self._current_user["name"] if self._current_user else "Field Reader",
+            "reader_name": reader_display_name(self._current_user),
             "timestamp": time.time()
         }
         self.after(0, self._refresh_zone_stats)
@@ -3584,7 +3589,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "previous": entry.get("previous_reading"),
             "consumption": entry.get("consumption"),
             "exception": entry.get("exception") or "None",
-            "reader_name": entry.get("reader_name") or "Field Reader",
+            "reader_name": entry.get("reader_name") or "",
             "receipt_text": entry.get("receipt_text"),
             "timestamp": timestamp,
         }
@@ -3651,7 +3656,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         present = int(self.present_var.get())
         previous = consumer["_original_previous"]
         exception = self.exception_var.get()
-        reader_name = self._current_user["name"] if self._current_user else "Field Reader"
+        reader_name = reader_display_name(self._current_user)
         reading_id = self._last_receipt_data.get("reading_id") if self._last_receipt_data else None
         self.after(0, self._dismiss_overlay)
         self.after(100, lambda: self._deliver_receipt(consumer, previous, present, exception, reader_name, reading_id, "print"))
@@ -3682,7 +3687,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         if result:
             latest_entry = get_latest_receipt_print(consumer["id"])
             receipt_text = latest_entry["receipt_text"] if latest_entry else data.get("receipt_text")
-            reader_name = self._current_user["name"] if self._current_user else "Field Reader"
+            reader_name = reader_display_name(self._current_user)
             self._deliver_receipt(
                 consumer,
                 data["previous"],

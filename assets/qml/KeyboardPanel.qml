@@ -186,11 +186,15 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        height: (root.width <= 420 ? TouchMetrics.compactKeyboardHeight : TouchMetrics.keyboardHeight) + 40
+        height: Math.max(
+            (root.width <= 420 ? TouchMetrics.compactKeyboardHeight : TouchMetrics.keyboardHeight) + 40,
+            keyboardLayout.implicitHeight + 2 * TouchMetrics.keyboardMargin
+        )
         color: "#DDE7F2"
         border.color: "#CBD5E1"
 
         ColumnLayout {
+            id: keyboardLayout
             anchors.fill: parent
             anchors.margins: TouchMetrics.keyboardMargin
             spacing: TouchMetrics.keyboardSpacing
@@ -279,36 +283,43 @@ Item {
                 }
             }
 
-            // Bottom accessory bar for hide keyboard button and home indicator
+            // Reserve a full touch target; do not depend on a symbol font.
             Item {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 32
+                Layout.minimumHeight: TouchMetrics.keyboardButtonHeight
+                Layout.preferredHeight: TouchMetrics.keyboardButtonHeight
+                Layout.maximumHeight: TouchMetrics.keyboardButtonHeight
                 
-                Button {
+                KeyboardButton {
+                    objectName: "hideKeyboardButton"
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    width: 48
-                    height: 32
-                    text: "﹀"
-                    focusPolicy: Qt.NoFocus
-                    background: Item {} // Transparent background
-                    contentItem: Text {
-                        text: parent.text
-                        color: "#0F172A"
-                        font.pixelSize: 24
-                        font.bold: true
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
+                    width: 60
+                    height: TouchMetrics.keyboardButtonHeight
+                    Accessible.name: "Hide keypad"
+                    specialKey: true
+                    baseColor: "#E2E8F0"
+                    contentItem: Item {
+                        Canvas {
+                            anchors.centerIn: parent
+                            width: 24
+                            height: 24
+                            onPaint: {
+                                var context = getContext("2d")
+                                context.clearRect(0, 0, width, height)
+                                context.strokeStyle = "#0F172A"
+                                context.lineWidth = 3
+                                context.lineCap = "round"
+                                context.lineJoin = "round"
+                                context.beginPath()
+                                context.moveTo(3, 8)
+                                context.lineTo(12, 17)
+                                context.lineTo(21, 8)
+                                context.stroke()
+                            }
+                        }
                     }
                     onClicked: root.hideKeyboard()
-                }
-                
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 120
-                    height: 4
-                    radius: 2
-                    color: "#94A3B8"
                 }
             }
         }

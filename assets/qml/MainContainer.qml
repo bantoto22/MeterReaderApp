@@ -251,9 +251,17 @@ Rectangle {
         height: Math.min(parent.height - 48, 660)
         modal: true
         standardButtons: Dialog.Close
-        contentItem: ScrollView {
+        onOpened: receiptScroll.contentY = 0
+        contentItem: Flickable {
+            id: receiptScroll
+            objectName: "receiptScroll"
             clip: true
             contentWidth: receiptPaper.width
+            contentHeight: receiptPaper.height
+            boundsBehavior: Flickable.StopAtBounds
+            boundsMovement: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
+            ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
 
             Rectangle {
                 id: receiptPaper
@@ -301,6 +309,7 @@ Rectangle {
         height: Math.min(parent.height - 48, 680)
         modal: true
         standardButtons: Dialog.NoButton
+        onOpened: previewScroll.contentY = 0
 
         background: Rectangle {
             radius: 22
@@ -312,11 +321,19 @@ Rectangle {
         contentItem: ColumnLayout {
             spacing: 12
 
-            ScrollView {
+            Flickable {
+                id: previewScroll
+                objectName: "previewScroll"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.minimumHeight: 0
                 clip: true
                 contentWidth: previewPaper.width
+                contentHeight: previewPaper.height
+                boundsBehavior: Flickable.StopAtBounds
+                boundsMovement: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
+                ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
 
                 Rectangle {
                     id: previewPaper
@@ -386,6 +403,7 @@ Rectangle {
         modal: true
         standardButtons: Dialog.NoButton
         title: bridgeObj ? bridgeObj.printHistoryDetailTitle : "Receipt"
+        onOpened: historyDetailScroll.contentY = 0
 
         background: Rectangle {
             radius: 22
@@ -397,11 +415,19 @@ Rectangle {
         contentItem: ColumnLayout {
             spacing: 12
 
-            ScrollView {
+            Flickable {
+                id: historyDetailScroll
+                objectName: "historyDetailScroll"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.minimumHeight: 0
                 clip: true
                 contentWidth: historyDetailPaper.width
+                contentHeight: historyDetailPaper.height
+                boundsBehavior: Flickable.StopAtBounds
+                boundsMovement: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
+                ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded; interactive: true }
 
                 Rectangle {
                     id: historyDetailPaper
