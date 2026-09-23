@@ -115,9 +115,30 @@ The device uses the same public HTTPS Funnel as the web app:
 Device -> https://aspire.tail3de291.ts.net/api -> Node backend:3001 -> PostgreSQL:5432
 ```
 
+### Device provisioning and heartbeat
+
+Provision each Raspberry Pi with its own permanent `HANDHELD_DEVICE_ID` in `.env`
+(for example, `SLR-RPI-001`) and a friendly `SLR_DEVICE_LABEL` (for example,
+`Reader Unit 01`). `SLR_DEVICE_ID` is accepted as an alternative to the existing
+`HANDHELD_DEVICE_ID`; if both are set, they must match. Do not copy a provisioned
+ID to another Pi. Keep the `.env` file across app updates. The ID accepts up to
+120 letters, numbers, dots, hyphens, or underscores; the label accepts up to
+200 characters. The app refuses to start if the ID or backend URL is missing.
+
+After an online Meter Reader login, the app sends an authenticated device
+heartbeat immediately and every 60 seconds, plus one when Wi-Fi reconnects.
+It stops on logout or shutdown. A 401 response returns the reader to login;
+other heartbeat failures are recorded in sync logs and never block readings.
+The backend should show **Active** if a heartbeat arrived within the past
+three minutes, **Inactive** after three minutes, and **No registered device**
+before the first heartbeat. The device does not send a reader ID in the
+heartbeat; the backend must associate it with the authenticated account.
+The backend heartbeat endpoint and status display must be deployed separately
+from this Raspberry Pi app.
+
 ### Billing-reference lifecycle
 
-Set a unique, stable `HANDHELD_DEVICE_ID` in `.env`. Before showing a new receipt, the device persists stable reading
+Before showing a new receipt, the device persists stable reading
 and bill UUIDs locally, calls `POST /api/handheld/billing-references/reserve`, and stores the returned
 `SLRYYYY######` reference. Timeouts reuse the same UUIDs. The reading-bundle upload sends that exact reference and
 separate bill UUID. After the backend confirms the saved bill, the local reservation becomes `Used`; the printed

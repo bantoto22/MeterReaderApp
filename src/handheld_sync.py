@@ -39,6 +39,8 @@ except ImportError:
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
+# Bump this with each device-app release; it is sent in the heartbeat user_agent.
+APP_VERSION = "1.0.0"
 
 
 def _manila_current_date(now: datetime | None = None) -> date:
@@ -537,6 +539,7 @@ class SyncConfig:
     backend_api_base_url: str = ""
     sync_enabled: bool = False
     device_id: str = ""
+    device_label: str = ""
 
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "SyncConfig":
@@ -547,7 +550,32 @@ class SyncConfig:
             _load_env_fallback(env_path)
 
         sync_enabled = os.getenv("HANDHELD_SYNC_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
-        required = ["BACKEND_API_BASE_URL", "HANDHELD_DEVICE_ID"]
+        configured_id = os.getenv("HANDHELD_DEVICE_ID", "").strip()
+        alternate_id = os.getenv("SLR_DEVICE_ID", "").strip()
+        if configured_id and alternate_id and configured_id != alternate_id:
+            raise RuntimeError("HANDHELD_DEVICE_ID and SLR_DEVICE_ID must match when both are set.")
+        device_id = configured_id or alternate_id
+        if not device_id:
+            raise RuntimeError("A permanent HANDHELD_DEVICE_ID (or SLR_DEVICE_ID) is required in .env.")
+        if len(device_id) > 120 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", device_id):
+            raise RuntimeError("Device ID must be at most 120 characters using letters, numbers, dots, hyphens, or underscores.")
+        device_label = os.getenv("SLR_DEVICE_LABEL", "").strip() or device_id
+        if len(device_label) > 200:
+            raise RuntimeError("SLR_DEVICE_LABEL must be at most 200 characters.")
+        backend_url = os.getenv("BACKEND_API_BASE_URL", "").rstrip("/")
+        try:
+            parsed_url = parse.urlsplit(backend_url)
+            backend_host = parsed_url.hostname
+        except ValueError as exc:
+            raise RuntimeError("BACKEND_API_BASE_URL is invalid.") from exc
+        if backend_url and (
+            not parsed_url.netloc
+            or (parsed_url.scheme != "https" and not (
+                parsed_url.scheme == "http" and backend_host in {"localhost", "127.0.0.1", "::1"}
+            ))
+        ):
+            raise RuntimeError("BACKEND_API_BASE_URL must use HTTPS outside local development.")
+        required = ["BACKEND_API_BASE_URL"]
 
         missing = [k for k in required if not os.getenv(k)]
         if (fail_fast or sync_enabled) and missing:
@@ -558,9 +586,10 @@ class SyncConfig:
             )
 
         return cls(
-            backend_api_base_url=os.getenv("BACKEND_API_BASE_URL", "").rstrip("/"),
+            backend_api_base_url=backend_url,
             sync_enabled=sync_enabled,
-            device_id=os.getenv("HANDHELD_DEVICE_ID", "").strip(),
+            device_id=device_id,
+            device_label=device_label,
         )
 
 
@@ -1394,6 +1423,7 @@ class BackendApiClient:
         self._meter_reader_id: int | None = None
         self._session_token = ""
         self._device_id = str(cfg.device_id or "").strip()
+        self._device_label = str(cfg.device_label or cfg.device_id or "").strip()
 
     def _req(
         self,
@@ -1403,6 +1433,7 @@ class BackendApiClient:
         query: dict | None = None,
         payload: dict | list | None = None,
         api_route: bool = True,
+        timeout: float = 5,
     ) -> tuple[int, object]:
         base_url = self._api_url if api_route else self._root_url
         normalized_path = path if path.startswith("/") else f"/{path}"
@@ -1424,7 +1455,7 @@ class BackendApiClient:
             headers=headers,
         )
         try:
-            with request.urlopen(req, timeout=5) as resp:
+            with request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8").strip()
                 return resp.getcode(), json.loads(raw) if raw else {}
         except error.HTTPError as exc:
@@ -1499,6 +1530,22 @@ class BackendApiClient:
     def set_authenticated_session(self, token: str | None, meter_reader_id: int | str | None = None) -> None:
         self._session_token = str(token or "").strip()
         self._meter_reader_id = int(meter_reader_id) if meter_reader_id not in (None, "") else None
+
+    def send_device_heartbeat(self) -> tuple[int, object]:
+        """Send presence with the same URL, token, and certificate checks as other API calls."""
+        if not self._session_token:
+            raise PermissionError("A current Meter Reader session is required for device presence.")
+        if not self._device_id:
+            raise RuntimeError("HANDHELD_DEVICE_ID is not configured for this device.")
+        return self._req(
+            "POST", "/api/handheld/device-heartbeat",
+            payload={
+                "device_id": self._device_id,
+                "device_label": self._device_label,
+                "user_agent": f"slr-reader/{APP_VERSION} raspberry-pi",
+            },
+            timeout=10,
+        )
 
     @staticmethod
     def _validate_reserved_reference(bill_sync_id: str, bill_date: str, billing_reference: str) -> None:
@@ -1858,6 +1905,11 @@ class HandheldSyncDataAccess:
     def setAuthenticatedSession(self, token: str | None, meter_reader_id: int | str | None = None) -> None:
         if self.remote and hasattr(self.remote, "set_authenticated_session"):
             self.remote.set_authenticated_session(token, meter_reader_id)
+
+    def sendDeviceHeartbeat(self) -> tuple[int, object]:
+        if not self.remote:
+            raise RuntimeError("Backend API is unavailable for device presence.")
+        return self.remote.send_device_heartbeat()
 
     def reserveBillingReference(self, bill_sync_id: str, bill_date: str) -> dict:
         with self.operation_lock:

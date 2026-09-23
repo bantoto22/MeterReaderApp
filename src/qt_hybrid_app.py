@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -534,6 +535,10 @@ class LoginBridge(QObject):
         self.errorMessageChanged.emit()
         self.loginFailed.emit()
 
+    def show_session_expired(self) -> None:
+        self._error_message = "Session expired. Please log in again."
+        self.errorMessageChanged.emit()
+
 
 class AppBridge(QObject):
     # Tab property
@@ -616,6 +621,8 @@ class AppBridge(QObject):
     printExecutionFinished = Signal(object)
     printPreparationFinished = Signal(object)
     assignedDatasetFinished = Signal(object)
+    heartbeatResult = Signal(int, int, object)
+    sessionExpired = Signal()
 
     # Circular progress / dashboard stats
     overallPercentageChanged = Signal()
@@ -640,6 +647,13 @@ class AppBridge(QObject):
         self._zone_refreshing: set[str] = set()
         self._zone_refresh_attempted: set[str] = set()
         self._assigned_dataset_refreshing = False
+        self._heartbeat_generation = 0
+        self._heartbeat_in_flight = False
+        self._heartbeat_thread = None
+        self._heartbeat_authenticated = False
+        self._heartbeat_retry_count = 0
+        self._heartbeat_next_allowed = 0.0
+        self._heartbeat_config_invalid = False
         self._progress_details_visible = False
         self._operation_busy = False
         self._operation_busy_message = ""
@@ -651,6 +665,7 @@ class AppBridge(QObject):
 
         self._assigned_routes = []
         self._selected_route_id = ""
+        self._route_selected_by_user = False
         self._selected_route_billing_date = ""
         self._zones = []
         self._selected_zone = ""
@@ -689,6 +704,7 @@ class AppBridge(QObject):
         self._sync_logs = "No sync activity yet."
         self._backend_logs = "No Backend API activity yet."
         self._sync_dal = None
+        self._heartbeat_dal = None
         self._wifi_status = "Status: Checking..."
         self._wifi_status_color = "#526176"
         self._wifi_networks = []
@@ -726,6 +742,11 @@ class AppBridge(QObject):
         self.printExecutionFinished.connect(self._finish_print_execution)
         self.printPreparationFinished.connect(self._finish_print_preparation)
         self.assignedDatasetFinished.connect(self._finish_assigned_consumer_dataset)
+        self.heartbeatResult.connect(self._finish_heartbeat)
+
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(60_000)
+        self._heartbeat_timer.timeout.connect(self._start_heartbeat)
 
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(5_000)
@@ -807,7 +828,8 @@ class AppBridge(QObject):
     def canReprint(self) -> bool:
         return self._last_receipt is not None
 
-    def set_user(self, user: dict) -> None:
+    def set_user(self, user: dict, login_dal=None) -> None:
+        self.stop_heartbeat()
         self._reader_name = reader_display_name(user)
         self._reader_id = str(user.get('account_id') or user.get('id') or '')
         self._meter_reader_account_id = str(user.get('account_id') or user.get('id') or "").strip()
@@ -816,13 +838,95 @@ class AppBridge(QObject):
                 user.get("session_token"),
                 self._meter_reader_account_id or None,
             )
+        self._heartbeat_dal = self._sync_dal or login_dal
+        if self._heartbeat_dal and self._heartbeat_dal is not self._sync_dal:
+            self._heartbeat_dal.setAuthenticatedSession(
+                user.get("session_token"), self._meter_reader_account_id or None,
+            )
         self.readerNameChanged.emit()
         self.readerIdChanged.emit()
         self._last_receipt_entry = get_latest_receipt_print()
         self._last_receipt = self._last_receipt_entry["receipt_text"] if self._last_receipt_entry else None
         self.canReprintChanged.emit()
+        self._route_selected_by_user = False
         self._refresh_local_assignment_views()
+        self._heartbeat_authenticated = bool(user.get("session_token") and self._heartbeat_dal)
+        if self._heartbeat_authenticated:
+            self._heartbeat_config_invalid = False
+            self._heartbeat_timer.start()
+            self._start_heartbeat()
         QTimer.singleShot(100, self._start_assigned_consumer_dataset_refresh)
+
+    def _start_heartbeat(self) -> None:
+        if (not self._heartbeat_authenticated or self._heartbeat_in_flight
+                or self._heartbeat_config_invalid
+                or time.monotonic() < self._heartbeat_next_allowed):
+            return
+        self._heartbeat_in_flight = True
+        generation = self._heartbeat_generation
+        dal = self._heartbeat_dal
+
+        def _task() -> None:
+            try:
+                status, response = dal.sendDeviceHeartbeat()
+            except Exception as exc:
+                status, response = 0, {"error": str(exc)}
+            self.heartbeatResult.emit(generation, status, response)
+
+        self._heartbeat_thread = threading.Thread(
+            target=_task, daemon=True, name="device-heartbeat"
+        )
+        self._heartbeat_thread.start()
+
+    def _finish_heartbeat(self, generation: int, status: int, response: object) -> None:
+        if generation != self._heartbeat_generation or not self._heartbeat_authenticated:
+            return
+        self._heartbeat_in_flight = False
+        if 200 <= status < 300:
+            self._heartbeat_retry_count = 0
+            self._heartbeat_next_allowed = 0.0
+            return
+
+        detail = ""
+        if isinstance(response, dict):
+            detail = str(response.get("message") or response.get("error") or "")
+        token = str(getattr(getattr(self._heartbeat_dal, "remote", None), "_session_token", "") or "")
+        if token:
+            detail = detail.replace(token, "[redacted]")
+        detail = detail[:200].strip()
+        if status == 401:
+            self._heartbeat_timer.stop()
+            self._heartbeat_authenticated = False
+            self._heartbeat_dal._audit(None, "failed", "Device heartbeat: Meter Reader session expired.")
+            self.sessionExpired.emit()
+        elif status == 400:
+            self._heartbeat_timer.stop()
+            self._heartbeat_config_invalid = True
+            self._heartbeat_dal._audit(None, "failed", f"Device heartbeat configuration error: {detail or 'HTTP 400'}")
+        elif status == 429 or status >= 500:
+            self._heartbeat_retry_count += 1
+            delay = min(300, 60 * (2 ** min(self._heartbeat_retry_count, 3)))
+            self._heartbeat_next_allowed = time.monotonic() + delay
+            self._heartbeat_dal._audit(None, "failed", f"Device heartbeat HTTP {status}; retry in {delay}s.")
+        else:
+            warning = detail or (f"HTTP {status}" if status else "network unavailable")
+            self._heartbeat_dal._audit(None, "failed", f"Device heartbeat warning: {warning}")
+
+    def stop_heartbeat(self) -> None:
+        self._heartbeat_timer.stop()
+        self._heartbeat_authenticated = False
+        self._heartbeat_generation += 1
+        worker = self._heartbeat_thread
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=11)
+        self._heartbeat_thread = None
+        self._heartbeat_in_flight = False
+        self._heartbeat_retry_count = 0
+        self._heartbeat_next_allowed = 0.0
+        self._heartbeat_config_invalid = False
+        if self._heartbeat_dal:
+            self._heartbeat_dal.setAuthenticatedSession(None, None)
+            self._heartbeat_dal = None
 
     @Slot()
     def showWelcomeToast(self) -> None:
@@ -837,6 +941,7 @@ class AppBridge(QObject):
             self.operationBusyMessageChanged.emit()
 
     def clear_user(self) -> None:
+        self.stop_heartbeat()
         clear_current_meter_reader()
         if self._sync_dal:
             self._sync_dal.setAuthenticatedSession(None, None)
@@ -847,6 +952,7 @@ class AppBridge(QObject):
         self._selected_zone = ""
         self._assigned_routes = []
         self._selected_route_id = ""
+        self._route_selected_by_user = False
         self._selected_route_billing_date = ""
         self._zone_consumers = []
         self._search_suggestions = []
@@ -891,6 +997,8 @@ class AppBridge(QObject):
                 meter_reader_id=self._meter_reader_account_id or None,
                 schedule_id=schedule_id,
             ):
+                if schedule.get("isCarryOver") and row.get("is_read"):
+                    continue
                 item = dict(row)
                 item["schedule_id"] = int(schedule_id)
                 item["is_carry_over"] = bool(schedule.get("isCarryOver"))
@@ -911,7 +1019,7 @@ class AppBridge(QObject):
                 query,
                 zone_name,
                 limit=max(limit, 50),
-                unread_only=unread_only,
+                unread_only=unread_only or bool(schedule.get("isCarryOver")),
                 schedule_date=self.selectedBillingDate,
                 meter_reader_id=self._meter_reader_account_id or None,
                 schedule_id=schedule_id,
@@ -1010,6 +1118,7 @@ class AppBridge(QObject):
         if not route or route_id == self._selected_route_id:
             return
         self._selected_route_id = route_id
+        self._route_selected_by_user = True
         self._zones = list(route.get("zones") or [])
         self._selected_zone = "All zones" if self._zones else ""
         self._selected_route_billing_date = str(route.get("billingDate") or route.get("startDate") or "")
@@ -1491,6 +1600,7 @@ class AppBridge(QObject):
             self._emit_sync_state()
             return
         try:
+            was_backend_online = self._backend_status == "Online"
             snapshot = self._sync_dal.get_sync_snapshot()
             self._sync_status = str(snapshot.get("status", "Offline"))
             self._sync_status_color = "#10B981" if self._sync_status == "Online" else "#526176"
@@ -1499,6 +1609,8 @@ class AppBridge(QObject):
                 self._sync_status_color = "#EF4444"
             self._sync_pending_count = int(snapshot.get("pending_count", 0))
             self._backend_status = "Online" if snapshot.get("backend_online") else "Offline"
+            if self._backend_status == "Online" and not was_backend_online:
+                self._start_heartbeat()
             self._backend_pending_count = int(snapshot.get("backend_pending_count", 0))
             self._backend_last_sync = str(snapshot.get("backend_last_sync_time") or "Never")
             self._save_target = _friendly_save_target_text(str(snapshot.get("save_target", "Local SQLite only")))
@@ -1554,6 +1666,8 @@ class AppBridge(QObject):
         self._assigned_routes = _group_route_rows(routes)
         valid_ids = {str(route.get("scheduleId")) for route in self._assigned_routes}
         if self._selected_route_id not in valid_ids:
+            self._route_selected_by_user = False
+        if not self._route_selected_by_user:
             self._selected_route_id = str(self._assigned_routes[0].get("scheduleId")) if self._assigned_routes else ""
         selected_route = self._selected_route()
         if selected_route:
@@ -1998,6 +2112,7 @@ class AppBridge(QObject):
         self.wifiStatusColorChanged.emit()
         is_connected = status.startswith("Status: Connected")
         if is_connected and not was_connected:
+            self._start_heartbeat()
             self._start_reconnect_sync()
 
     def _start_reconnect_sync(self) -> None:
@@ -3287,26 +3402,38 @@ class HybridMainWindow(QMainWindow):
 
         self.login_page.bridge.loginSuccess.connect(self._on_login_success)
         self.main_page.bridge.logoutRequested.connect(self._on_logout_requested)
+        self.main_page.bridge.sessionExpired.connect(self._on_session_expired)
 
     def _on_login_success(self, user: dict) -> None:
         self.stack.setCurrentWidget(self.main_page)
         QTimer.singleShot(0, lambda: self._complete_login_success(user))
 
     def _complete_login_success(self, user: dict) -> None:
-        self.main_page.bridge.set_user(user)
+        self.main_page.bridge.set_user(user, self.login_page.bridge._sync_dal)
         self.main_page.bridge.showWelcomeToast()
 
     def _on_logout_requested(self) -> None:
         self.main_page.bridge.clear_user()
+        login_dal = self.login_page.bridge._sync_dal
+        if login_dal:
+            login_dal.setAuthenticatedSession(None, None)
         self.login_page.bridge.clearInputsRequested.emit()
         self.stack.setCurrentWidget(self.login_page)
 
+    def _on_session_expired(self) -> None:
+        self._on_logout_requested()
+        self.login_page.bridge.show_session_expired()
+
 def run_qt_hybrid() -> int:
+    if SyncConfig is None:
+        raise RuntimeError("Sync module is unavailable.")
+    SyncConfig.from_env(fail_fast=True)
     init_db()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setFont(QFont("Montserrat", 10))
     app.setStyle("Fusion")
     win = HybridMainWindow()
+    app.aboutToQuit.connect(win.main_page.bridge.stop_heartbeat)
     win.show()
     # Include the title bar and window borders when fitting the touchscreen.
     def fit_window_to_screen():
