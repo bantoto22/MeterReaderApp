@@ -60,12 +60,14 @@ XAUTHORITY=/home/pi/.Xauthority \
 python3 main.py
 ```
 
-## Default Login Credentials
+## Login
 
-| Username | Password | Name        | ID     |
-|----------|----------|-------------|--------|
-| reader1  | pass123  | Juan Santos | MR-001 |
-| reader2  | pass456  | Maria Cruz  | MR-002 |
+Use an active Meter Reader account from the backend. The device does not create
+default accounts. The old `reader1` and `reader2` demo logins are no longer supported.
+
+The first login requires a reachable backend. After a successful online login,
+the same credentials work offline on that device. Connection failures use the
+cached account; an explicit rejection of credentials or account access does not.
 
 ## Features
 

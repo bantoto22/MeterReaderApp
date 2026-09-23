@@ -14,8 +14,10 @@ from pathlib import Path
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
 try:
+    from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
 except ImportError:
+    from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
 
 try:
@@ -500,8 +502,8 @@ class LoginBridge(QObject):
             except PermissionError as exc:
                 self.loginAttemptFinished.emit(False, None, str(exc) or "This account is not an active Meter Reader.")
                 return
-            except ValueError:
-                self.loginAttemptFinished.emit(False, None, "Invalid username or password.")
+            except ValueError as exc:
+                self.loginAttemptFinished.emit(False, None, str(exc) or "Invalid username or password.")
                 return
             except Exception as exc:
                 offline_error = str(exc) or "Unable to verify this account right now."
@@ -1876,6 +1878,7 @@ class AppBridge(QObject):
         bill_sync_id: str | None = None,
         bill_date: str | None = None,
         billing_reference: str | None = None,
+        previous_reading_date_snapshot: str | None = None,
         wait_for_result: bool = False,
     ) -> dict | None:
         if not self._sync_dal:
@@ -1931,6 +1934,7 @@ class AppBridge(QObject):
             "unpaid_bills": consumer.get("unpaid_bills"),
             "meter_reader_id": self._meter_reader_account_id or None,
             "previous_reading": consumer.get("previous_reading"),
+            "previous_reading_date": previous_reading_date_snapshot,
             "present_reading": present,
             "consumption": consumption,
             "exception": exception,
@@ -2481,6 +2485,7 @@ class AppBridge(QObject):
             or self._default_due_date_for_consumer(self._consumer)
         )
         consumer_snapshot = dict(self._consumer)
+        consumer_snapshot["previous_reading_date"] = previous_reading_date(self._consumer)
         consumer_snapshot["due_date"] = due_date
         consumer_snapshot["billing_reference"] = billing_reference
         consumer_snapshot["schedule_date"] = schedule_date
@@ -2495,6 +2500,7 @@ class AppBridge(QObject):
                 "reading_id": sync_reading_id,
                 "consumer_id": self._consumer["id"],
                 "previous_reading": previous,
+                "previous_reading_date": consumer_snapshot["previous_reading_date"],
                 "present_reading": present,
                 "consumption": consumption,
                 "reading_date": reading_date,
@@ -2530,6 +2536,7 @@ class AppBridge(QObject):
             "consumption": consumption,
             "exception": exception,
             "reading_date": reading_date,
+            "previous_reading_date": consumer_snapshot["previous_reading_date"],
             "bill_date": bill_date,
             "due_date": due_date,
             "schedule_id": schedule_id,
@@ -2789,6 +2796,7 @@ class AppBridge(QObject):
                             reading_route_id=job.get("reading_route_id"), assignment_order=job.get("assignment_order"),
                             bill_sync_id=job.get("bill_sync_id"), bill_date=job.get("bill_date"),
                             billing_reference=job.get("billing_reference"),
+                            previous_reading_date_snapshot=job.get("previous_reading_date"),
                             wait_for_result=True,
                         )
                         if not sync_result:

@@ -12,8 +12,10 @@ import tkinter as tk
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
+    from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
 except ImportError:
+    from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
 
 FONT_FAMILY = "Montserrat"
@@ -157,45 +159,8 @@ def _billing_month_text(consumer: dict, reference_date: datetime.date) -> str:
 
 
 def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
-    schedule_start = _display_date(consumer.get("schedule_date"), default="")
-    schedule_end = _display_date(consumer.get("schedule_due_date"), default="")
-    if schedule_start and schedule_end:
-        return f"{schedule_start} to {schedule_end}"
-    start_keys = (
-        "date_covered_from",
-        "billing_period_from",
-        "previous_reading_date",
-        "last_reading_date",
-        "latest_reading_date",
-    )
-    end_keys = (
-        "date_covered_to",
-        "billing_period_to",
-        "current_reading_date",
-        "reading_date",
-    )
-    start_value = "N/A"
-    for key in start_keys:
-        start_value = _display_date(consumer.get(key), default="N/A")
-        if start_value != "N/A":
-            break
-    end_value = _display_date(None, default=reference_date.isoformat())
-    for key in end_keys:
-        candidate = _display_date(consumer.get(key), default="")
-        if candidate:
-            end_value = candidate
-            break
-    if start_value == "N/A":
-        raw_billing_month = str(consumer.get("billing_month") or "").strip()
-        if raw_billing_month:
-            try:
-                month_anchor = datetime.datetime.strptime(raw_billing_month, "%B %Y").date()
-                start_value = month_anchor.replace(day=1).isoformat()
-            except ValueError:
-                start_value = "N/A"
-    if start_value == "N/A":
-        start_value = reference_date.replace(day=1).isoformat()
-    return f"{start_value} to {end_value}"
+    start_value = previous_reading_date(consumer) or "N/A"
+    return f"{start_value} to {reference_date.isoformat()}"
 
 
 def _previous_bill_text(previous: float, carried_previous_bill: float) -> str:

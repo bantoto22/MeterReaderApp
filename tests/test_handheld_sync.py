@@ -1616,7 +1616,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Current Bill   : PHP    10.00", text)
         self.assertIn("Prev Bill      : PHP 0.00", text)
         self.assertIn("Bill Month     : July 2026", text)
-        self.assertIn("Coverage       : 2026-07-01 to", text)
+        self.assertIn("Coverage       : N/A to", text)
         self.assertIn("TOTAL DUE      : PHP    10.00", text)
         self.assertNotIn("TOTAL DUE      : PHP   339.00", text)
 

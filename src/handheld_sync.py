@@ -25,8 +25,10 @@ from urllib import error, parse, request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
+    from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
 except ImportError:
+    from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
 
 try:
@@ -476,19 +478,9 @@ def _build_bill_payload(
             carried_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
-    # Coverage belongs to the linked assignment, even when read or printed later.
-    coverage_start = (
-        _parse_date(reading.get("schedule_date"))
-        or _parse_date(reading.get("date_covered_from"))
-        or _parse_date(context.get("date_covered_from"))
-        or reference_date
-    )
-    coverage_end = (
-        _parse_date(reading.get("schedule_due_date"))
-        or _parse_date(reading.get("date_covered_to"))
-        or _parse_date(context.get("date_covered_to"))
-        or reference_date
-    )
+    # Preserve the reading interval across offline retries and later billing.
+    coverage_start = previous_reading_date(reading if "previous_reading_date" in reading else context)
+    coverage_end = _reading_date(reading.get("reading_date"))
     supplied_due_date = _parse_date(reading.get("due_date") or reading.get("schedule_due_date"))
     due_date_obj = supplied_due_date or (reference_date + timedelta(days=due_days))
     due_date = datetime.combine(due_date_obj, datetime.min.time())
@@ -511,7 +503,7 @@ def _build_bill_payload(
         "reading_id": int(remote_reading_id),
         "billing_officer_id": None,
         "billing_month": bill_date.strftime("%B %Y"),
-        "date_covered_from": datetime.combine(coverage_start, datetime.min.time()).isoformat(sep=" "),
+        "date_covered_from": f"{coverage_start} 00:00:00" if coverage_start else None,
         "date_covered_to": datetime.combine(coverage_end, datetime.min.time()).isoformat(sep=" "),
         "bill_date": bill_date.isoformat(sep=" "),
         "due_date": due_date.isoformat(sep=" "),
@@ -1463,7 +1455,15 @@ class BackendApiClient:
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
         status, data = self._req("POST", "/api/login", payload={"username": username, "password": password})
-        if status >= 400 or status == 0 or not isinstance(data, dict) or not data.get("success"):
+        # Only explicit authentication rejections should block cached login.
+        # Transport failures and unavailable endpoints must reach offline fallback.
+        if status == 403:
+            raise PermissionError(self._message(data, "This account is not an active Meter Reader."))
+        if status in (400, 401):
+            raise ValueError(self._message(data, "Invalid username or password."))
+        if not 200 <= status < 300 or not isinstance(data, dict):
+            raise self._request_failure(status, "/api/login", data, "Backend login is unavailable.")
+        if not data.get("success"):
             raise ValueError(self._message(data, "Invalid username or password."))
         user = data.get("user") if isinstance(data.get("user"), dict) else {}
         if int(user.get("role_id") or 0) != 3:
