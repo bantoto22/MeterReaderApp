@@ -5,7 +5,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.handheld_sync import BackendApiClient, HandheldSyncDataAccess, SQLiteLocalSyncStore, SyncConfig
+import src.database as database
+from src.handheld_sync import (
+    BackendApiClient, HandheldSyncDataAccess, SQLiteLocalSyncStore, SyncConfig,
+    _flatten_backend_bill_context,
+)
 from src.qt_hybrid_app import AppBridge
 
 
@@ -14,6 +18,7 @@ class _Remote:
         self.online = False
         self.saved = []
         self.context = {}
+        self.last_response = None
 
     def is_online(self):
         return self.online
@@ -23,7 +28,7 @@ class _Remote:
 
     def save_reading_bundle(self, reading):
         self.saved.append(dict(reading))
-        return {
+        self.last_response = {
             "bill": {
                 "sync_id": reading["bill_sync_id"],
                 "billing_reference": reading["billing_reference"],
@@ -32,8 +37,12 @@ class _Remote:
                 "amount_due": 220, "total_after_due_date": 220,
                 "status": "Unpaid", "setting_id": 43, "water_charge": 200,
             },
-            "billing_policy": {"source": "admin_settings", "due_date_days": 17, "late_fee": 9},
+            "billing_policy": {
+                "source": "reading_schedule", "payment_due_date": "2026-10-12",
+                "due_date_days": 17, "late_fee": 9,
+            },
         }
+        return self.last_response
 
     def get_consumer_context(self, consumer_id):
         return dict(self.context)
@@ -57,7 +66,8 @@ class ServerOwnedBillingTests(unittest.TestCase):
             "water_meter_fee": 3, "connection_fee": 2, "membership_fee": 1,
             "bill_sync_id": bill_id, "bill_date": "2026-09-25",
             "billing_reference": "SLR2026000125",
-            "schedule_due_date": "2026-09-30", "due_date": "2026-07-14",
+            "schedule_due_date": "2026-09-30",
+            "schedule_payment_due_date": "2026-10-12", "due_date": "2026-07-14",
             "penalty": 50, "previous_penalty": 10, "total_after_due_date": 200,
             "status": "Unpaid", "setting_id": 9,
             "due_days": 15, "late_fee": 10, "amount_due": 100,
@@ -67,16 +77,23 @@ class ServerOwnedBillingTests(unittest.TestCase):
         self.assertEqual(payload["bill"]["water_charge"], 100)
         self.assertEqual(payload["bill"]["meter_maintenance_fee"], 3)
         self.assertEqual(payload["reading"]["schedule_due_date"], "2026-09-30")
+        self.assertEqual(payload["reading"]["schedule_payment_due_date"], "2026-10-12")
         for section in ("reading", "bill"):
             for field in ("due_date", "previous_penalty", "penalty", "total_after_due_date", "status", "setting_id", "due_days", "late_fee", "amount_due"):
                 self.assertNotIn(field, payload[section])
 
     def test_offline_pending_then_reconnect_keeps_exact_server_bill_and_policy(self):
-        with tempfile.TemporaryDirectory(dir=os.getcwd()) as folder:
+        with tempfile.TemporaryDirectory() as folder:
             store = SQLiteLocalSyncStore(SyncConfig())
             store._db_path = os.path.join(folder, "queue.db")
             store.ensure_schema()
-            store.cache_consumers([{"id": 8, "meter_no": "09-23-2233", "name": "Test", "zone_name": "Zone 1"}])
+            consumer = {
+                "id": 8, "meter_no": "09-23-2233", "name": "Test", "zone_name": "Zone 1",
+                "schedule_id": 549, "schedule_date": "2026-09-25",
+                "schedule_due_date": "2026-09-30",
+                "schedule_payment_due_date": "2026-10-12",
+            }
+            store.cache_consumers([consumer])
             remote = _Remote()
             dal = HandheldSyncDataAccess(store, remote)
             saved = dal.saveMeterReading({
@@ -84,18 +101,21 @@ class ServerOwnedBillingTests(unittest.TestCase):
                 "present_reading": 5, "consumption": 3,
                 "bill_sync_id": "550e8400-e29b-41d4-a716-446655440000",
                 "billing_reference": "SLR2026000125", "bill_date": "2026-09-25",
+                "schedule_due_date": "2026-09-30",
+                "schedule_payment_due_date": "2026-10-12",
                 "due_date": "2026-07-14", "penalty": 30,
             })
             self.assertEqual(saved["status"], "queued")
             self.assertEqual(saved["reading"]["billing_calculation_status"], "Pending server calculation")
             self.assertNotIn("due_date", saved["reading"])
             self.assertNotIn("penalty", saved["reading"])
+            self.assertEqual(saved["reading"]["schedule_payment_due_date"], "2026-10-12")
             self.assertEqual(store.get_latest_confirmed_bill(8), {})
 
             remote.online = True
             result = dal.syncPendingReadings()
             self.assertEqual(result["synced"], 1)
-            exact_bill = remote.save_reading_bundle(remote.saved[0])["bill"]
+            exact_bill = remote.last_response["bill"]
             self.assertEqual(store.get_latest_confirmed_bill(8), exact_bill)
             remote.online = False
             cached = dal.getConsumerContext(8)
@@ -103,19 +123,122 @@ class ServerOwnedBillingTests(unittest.TestCase):
             self.assertEqual(cached["penalty_rate"], 7.5)
             self.assertEqual(cached["previous_penalty"], 13.25)
             self.assertEqual(cached["setting_id"], 43)
-            self.assertEqual(cached["billing_policy_source"], "admin_settings")
+            self.assertEqual(cached["billing_policy_source"], "reading_schedule")
+            self.assertEqual(cached["billing_policy_payment_due_date"], "2026-10-12")
+            self.assertEqual(cached["schedule_due_date"], "2026-09-30")
+            self.assertEqual(cached["schedule_payment_due_date"], "2026-10-12")
             self.assertEqual((cached["due_days"], cached["late_fee"]), (17, 9))
+            store.cache_consumers([{**consumer, "schedule_payment_due_date": "2026-10-20"}])
+            self.assertEqual(dal.getConsumerContext(8)["due_date"], "2026-10-12")
+            self.assertEqual(dal.getConsumerContext(8)["schedule_payment_due_date"], "2026-10-20")
+            self.assertEqual(store.get_latest_confirmed_bill(8), exact_bill)
             remote.online = True
-            remote.context = {"consumer_id": 8, "bill": {
-                **exact_bill, "penalty": 16.5, "total_after_due_date": 236.5,
-            }}
+            remote.context = {
+                "consumer_id": 8,
+                "billing_policy": {
+                    "source": "reading_schedule", "payment_due_date": "2026-10-20",
+                    "due_date_days": 20, "late_fee": 12,
+                },
+                "bill": {**exact_bill, "penalty": 16.5, "total_after_due_date": 236.5},
+            }
             refreshed = dal.getConsumerContext(8)
             self.assertEqual(refreshed["penalty"], 16.5)
             self.assertEqual(refreshed["penalty_rate"], 7.5)
+            self.assertEqual(refreshed["due_date"], "2026-10-12")
+            self.assertEqual(refreshed["billing_policy_payment_due_date"], "2026-10-20")
+            self.assertEqual((refreshed["due_days"], refreshed["late_fee"]), (20, 12))
             remote.online = False
             self.assertEqual(dal.getConsumerContext(8)["total_after_due_date"], 236.5)
+            self.assertEqual(len(remote.saved), 1)
             del dal, store
             gc.collect()
+
+    def test_schedule_list_date_survives_offline_and_refreshes_without_bill_math(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = os.path.join(folder, "assignments.db")
+            store.ensure_schema()
+            schedule = {
+                "schedule_id": 549, "start_date": "2026-09-25",
+                "due_date": "2026-09-30", "payment_due_date": "2026-10-12",
+                "zone_name": "Zone 1", "meter_reader_id": 12,
+            }
+            store.cache_reading_schedules([schedule], 12, None, None)
+            store.cache_consumers([{
+                "id": 8, "meter_no": "09-23-2233", "name": "Test",
+                "zone_name": "Zone 1", "schedule_id": 549,
+                "schedule_due_date": "2026-09-30", "due_days": 15,
+            }])
+            cached = store.load_cached_consumers()[0]
+            self.assertEqual(cached["schedule_payment_due_date"], "2026-10-12")
+            self.assertEqual(cached["schedule_due_date"], "2026-09-30")
+            self.assertIsNone(cached["due_date"])
+            store.cache_reading_schedules(
+                [{**schedule, "payment_due_date": "2026-10-20"}], 12, None, None,
+            )
+            self.assertEqual(store.load_cached_consumers()[0]["schedule_payment_due_date"], "2026-10-20")
+            del store
+            gc.collect()
+
+    def test_policy_payment_date_is_diagnostic_not_a_bill_due_date(self):
+        context = _flatten_backend_bill_context({
+            "consumer_id": 8,
+            "schedule_due_date": "2026-09-30",
+            "reading_schedule": {"payment_due_date": "2026-10-12"},
+            "billing_policy": {
+                "source": "reading_schedule", "payment_due_date": "2026-10-12",
+                "due_date_days": 15, "late_fee": 9,
+            },
+        })
+        self.assertEqual(context["billing_policy_payment_due_date"], "2026-10-12")
+        self.assertEqual(context["billing_policy_source"], "reading_schedule")
+        self.assertEqual(context["schedule_payment_due_date"], "2026-10-12")
+        self.assertNotIn("due_date", context)
+
+    def test_schedule_payment_date_is_cached_separately_from_end_date(self):
+        schedule = {
+            "schedule_id": 549, "start_date": "2026-09-25", "due_date": "2026-09-30",
+            "payment_due_date": "2026-10-12", "zone_name": "Zone 1",
+            "meter_reader_id": 12, "status": "Scheduled",
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(database, "_db_path", return_value=os.path.join(folder, "ui.db")):
+                database.init_db()
+                database.replace_reading_schedules_from_sync([schedule], 12, None, None)
+                database.replace_consumers_from_sync([{
+                    "id": 8, "meter_no": "09-23-2233", "name": "Test",
+                    "zone_name": "Zone 1", "schedule_id": 549,
+                }])
+                row = database.search_consumer(
+                    "09-23-2233", unread_only=False, schedule_date="2026-09-25",
+                    meter_reader_id=12, schedule_id=549,
+                )
+                self.assertEqual(row["schedule_due_date"], "2026-09-30")
+                self.assertEqual(row["schedule_payment_due_date"], "2026-10-12")
+                self.assertIsNone(row["due_date"])
+                database.replace_reading_schedules_from_sync(
+                    [{**schedule, "payment_due_date": "2026-10-20"}], 12, None, None,
+                )
+                database.replace_consumers_from_sync([{
+                    "id": 8, "meter_no": "09-23-2233", "name": "Test",
+                    "zone_name": "Zone 1", "schedule_id": 549,
+                }])
+                refreshed = database.search_consumer(
+                    "09-23-2233", unread_only=False, schedule_date="2026-09-25",
+                    meter_reader_id=12, schedule_id=549,
+                )
+                self.assertEqual(refreshed["schedule_payment_due_date"], "2026-10-20")
+                self.assertIsNone(refreshed["due_date"])
+            gc.collect()
+
+    def test_unissued_form_does_not_calculate_fallback_date(self):
+        bridge = SimpleNamespace(_consumer={})
+        self.assertEqual(AppBridge._default_due_date_for_consumer(
+            bridge, {"due_days": 15, "schedule_due_date": "2026-09-30"}, "2026-09-25",
+        ), "")
+        self.assertEqual(AppBridge._default_due_date_for_consumer(
+            bridge, {"schedule_payment_due_date": "2026-10-12"}, "2026-09-25",
+        ), "2026-10-12")
 
     def test_context_refresh_displays_saved_penalty_and_captured_rate(self):
         reference = "SLR2026000125"

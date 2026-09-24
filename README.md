@@ -168,17 +168,24 @@ backend must persist `schedule_id` on the meter reading, accept a valid late
 reading, and clear reader/biller exceptions only after that reading is committed.
 Rejected or deleted readings must leave the assignment pending.
 
-The authenticated API supplies billing-policy values for display and diagnostics.
-The Node backend owns payment due dates, penalty rates, previous penalties,
-current penalties, bill totals, status, and setting IDs. The device sends reading
-and base charge data to `/api/handheld/reading-bundles` without those final
-fields. `schedule_due_date` is only the reading assignment's End Date.
+The Billing Officer sets `reading_schedule.payment_due_date` when saving an
+assignment. The device caches it as `schedule_payment_due_date` and may show it
+for an unissued reading. `schedule_due_date` is only the assignment End Date.
+For older assignments without a payment date, the Node backend uses
+`admin_settings.due_date_days`. The device does not calculate the fallback.
+
+The backend owns issued bills' payment due dates, penalty rates, previous
+penalties, current penalties, totals, status, and setting IDs. The device sends
+reading and base charge data to `/api/handheld/reading-bundles` without those
+final fields. An issued bill keeps its saved due date and penalty rate even if
+the assignment or Admin Settings change later.
 
 An offline reading is queued in SQLite as `Pending server calculation`, with no
 bill payment due date or penalty. On successful sync, the returned `response.bill`
 is saved unchanged in the sync record and its values are mirrored into the local
-consumer cache for offline viewing. The returned `billing_policy` is retained for
-diagnostics; its values never recalculate a saved bill. When online, the device
+consumer cache for offline viewing. The returned `billing_policy` source,
+payment date, fallback days, and late fee are retained for diagnostics; they
+never recalculate a saved bill. When online, the device
 refreshes `/api/handheld/consumers/:id/context` before displaying a saved receipt
 so overdue penalties and the bill's original `penalty_rate` come from the server.
 

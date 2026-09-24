@@ -201,6 +201,7 @@ def init_db():
             schedule_date TEXT NOT NULL,
             start_date TEXT,
             due_date TEXT,
+            payment_due_date TEXT,
             billing_month TEXT,
             remote_zone_id INTEGER,
             zone_name TEXT NOT NULL,
@@ -218,6 +219,7 @@ def init_db():
             consumer_id INTEGER NOT NULL,
             schedule_date TEXT NOT NULL,
             schedule_due_date TEXT NOT NULL,
+            schedule_payment_due_date TEXT,
             billing_cycle TEXT,
             zone_name TEXT NOT NULL,
             acct_no TEXT,
@@ -289,6 +291,7 @@ def init_db():
         conn,
         "reading_assignment",
         {
+            "schedule_payment_due_date": "TEXT",
             "acct_no": "TEXT",
             "assignment_order": "INTEGER",
             "reading_route_id": "TEXT",
@@ -317,6 +320,7 @@ def init_db():
             "schedule_date": "TEXT",
             "start_date": "TEXT",
             "due_date": "TEXT",
+            "payment_due_date": "TEXT",
             "billing_month": "TEXT",
             "remote_zone_id": "INTEGER",
             "zone_name": "TEXT",
@@ -719,6 +723,9 @@ def replace_reading_schedules_from_sync(
         due_date = _normalize_schedule_date(
             row.get("Due_Date") or row.get("due_date") or start_date
         )
+        payment_due_date = _normalize_schedule_date(
+            row.get("payment_due_date") or row.get("Payment_Due_Date")
+        )
         schedule_date = start_date
         billing_month = str(row.get("Billing_Month", row.get("billing_month")) or "").strip() or None
         remote_zone_id = row.get("Zone_ID", row.get("zone_id"))
@@ -745,15 +752,16 @@ def replace_reading_schedules_from_sync(
         cur.execute(
             """
             INSERT INTO reading_schedule (
-                schedule_id, schedule_date, start_date, due_date, billing_month,
+                schedule_id, schedule_date, start_date, due_date, payment_due_date, billing_month,
                 remote_zone_id, zone_name, meter_reader_id,
                 meter_reader_name, meter_reader_contact, status, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(schedule_id) DO UPDATE SET
                 schedule_date = excluded.schedule_date,
                 start_date = excluded.start_date,
                 due_date = excluded.due_date,
+                payment_due_date = excluded.payment_due_date,
                 billing_month = excluded.billing_month,
                 remote_zone_id = excluded.remote_zone_id,
                 zone_name = excluded.zone_name,
@@ -768,6 +776,7 @@ def replace_reading_schedules_from_sync(
                 schedule_date,
                 start_date,
                 due_date,
+                payment_due_date,
                 billing_month,
                 remote_zone_id_int,
                 zone_name,
@@ -799,6 +808,7 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
                meter_reader_id,
                COALESCE(start_date, schedule_date) AS start_date,
                COALESCE(due_date, start_date, schedule_date) AS due_date,
+               payment_due_date AS schedule_payment_due_date,
                billing_month, zone_name, status,
                cached_consumer_count, cache_verified_at,
                (SELECT COUNT(*) FROM reading_assignment ra
@@ -876,7 +886,8 @@ def _attach_assignment_context(conn: sqlite3.Connection, item: dict, schedule_id
         return item
     assignment = conn.execute(
         """
-        SELECT schedule_id, consumer_id, schedule_date, schedule_due_date, billing_cycle,
+        SELECT schedule_id, consumer_id, schedule_date, schedule_due_date,
+               schedule_payment_due_date, billing_cycle,
                zone_name, acct_no, assignment_order, reading_route_id,
                is_read, reading_status, reading_sync_status
         FROM reading_assignment
@@ -1645,7 +1656,8 @@ def get_zone_consumers_with_status(
             c.amount_due, c.previous_balance, c.due_date, c.penalty, c.previous_penalty,
             c.total_after_due_date, c.bill_status, c.late_fee,
             c.water_meter_fee, c.connection_fee, c.membership_fee,
-            ra.schedule_id, ra.schedule_date, ra.schedule_due_date, ra.billing_cycle,
+            ra.schedule_id, ra.schedule_date, ra.schedule_due_date,
+            ra.schedule_payment_due_date, ra.billing_cycle,
             ra.assignment_order, ra.reading_route_id,
             ra.zone_name, ra.is_read, ra.reading_status, ra.reading_sync_status,
             r.present_reading AS reading_value, r.consumption, r.reading_date,
@@ -2128,6 +2140,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                         """
                         SELECT schedule_id, COALESCE(start_date, schedule_date) AS schedule_date,
                                COALESCE(due_date, start_date, schedule_date) AS schedule_due_date,
+                               payment_due_date AS schedule_payment_due_date,
                                billing_month, zone_name
                         FROM reading_schedule WHERE schedule_id = ? LIMIT 1
                         """,
@@ -2140,6 +2153,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     """
                     SELECT schedule_id, COALESCE(start_date, schedule_date) AS schedule_date,
                            COALESCE(due_date, start_date, schedule_date) AS schedule_due_date,
+                           payment_due_date AS schedule_payment_due_date,
                            billing_month, zone_name
                     FROM reading_schedule
                     WHERE zone_name = ? AND lower(status) NOT IN ('cancelled')
@@ -2171,12 +2185,14 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     """
                     INSERT INTO reading_assignment (
                         schedule_id, consumer_id, schedule_date, schedule_due_date,
+                        schedule_payment_due_date,
                         billing_cycle, zone_name, acct_no, assignment_order, reading_route_id,
                         is_read, reading_status, reading_sync_status, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(schedule_id, consumer_id) DO UPDATE SET
                         schedule_date = excluded.schedule_date,
                         schedule_due_date = excluded.schedule_due_date,
+                        schedule_payment_due_date = excluded.schedule_payment_due_date,
                         billing_cycle = excluded.billing_cycle,
                         zone_name = excluded.zone_name,
                         acct_no = excluded.acct_no,
@@ -2202,6 +2218,8 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     (
                         schedule_row["schedule_id"], local_consumer_id, schedule_row["schedule_date"],
                         schedule_row["schedule_due_date"],
+                        _normalize_schedule_date(c.get("schedule_payment_due_date") or c.get("Schedule_Payment_Due_Date"))
+                        or schedule_row["schedule_payment_due_date"],
                         c.get("billing_cycle") or schedule_row["billing_month"], schedule_row["zone_name"],
                         acct_no, assignment_order, reading_route_id,
                         1 if remote_is_read else 0, assignment_status, remote_sync,

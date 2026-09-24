@@ -293,6 +293,7 @@ def _group_route_rows(routes: list[dict], today: datetime.date | None = None) ->
                 "meterReaderId": meter_reader_id,
                 "startDate": start_date,
                 "dueDate": due_date,
+                "paymentDueDate": str(row.get("schedule_payment_due_date") or ""),
                 "billingMonth": billing_month,
                 "billingDate": _billing_month_date(billing_month, start_date),
                 "schedules": [],
@@ -306,6 +307,7 @@ def _group_route_rows(routes: list[dict], today: datetime.date | None = None) ->
                 "offlineReady": bool(row.get("cache_verified_at")) and int(row.get("cached_consumer_count") or 0) > 0,
                 "startDate": start_date,
                 "dueDate": due_date,
+                "paymentDueDate": str(row.get("schedule_payment_due_date") or ""),
                 "billingMonth": billing_month,
                 "unreadCount": int(row.get("unread_count") or 0),
                 "isCarryOver": False,
@@ -679,6 +681,7 @@ class AppBridge(QObject):
         self._previous_reading = "-"
         self._present_reading = ""
         self._due_date = ""
+        self._due_date_confirmed = False
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
@@ -1251,6 +1254,10 @@ class AppBridge(QObject):
     def dueDate(self) -> str:
         return self._due_date
 
+    @Property(bool, notify=dueDateChanged)
+    def dueDateIsConfirmed(self) -> bool:
+        return self._due_date_confirmed
+
     @Property(str, notify=consumptionChanged)
     def consumption(self) -> str:
         return self._consumption
@@ -1293,7 +1300,7 @@ class AppBridge(QObject):
         if self._selected_billing_month_offset != offset:
             self._selected_billing_month_offset = offset
             self.selectedBillingMonthChanged.emit()
-            if self._consumer:
+            if self._consumer and not self._due_date_confirmed:
                 self._due_date = self._default_due_date_for_consumer(self._consumer)
                 self.dueDateChanged.emit()
             self.update_stats()
@@ -1855,7 +1862,7 @@ class AppBridge(QObject):
         selected_assignment = {
             key: self._consumer.get(key)
             for key in (
-                "schedule_id", "schedule_date", "schedule_due_date", "billing_cycle",
+                "schedule_id", "schedule_date", "schedule_due_date", "schedule_payment_due_date", "billing_cycle",
                 "reading_route_id", "assignment_order", "zone_name",
             )
             if self._consumer.get(key) not in (None, "")
@@ -1898,11 +1905,18 @@ class AppBridge(QObject):
         if refreshed is None:
             return
         refreshed["schedule_id"] = int(schedule["scheduleId"]) if schedule.get("scheduleId") else None
+        if self._due_date_confirmed and self._consumer.get("id") == refreshed.get("id"):
+            confirmed_date = _normalize_iso_date(self._consumer.get("due_date"))
+            if confirmed_date:
+                refreshed["due_date"] = confirmed_date
         self._consumer = refreshed
         self._account_no = str(refreshed.get("acct_no") or refreshed["id"])
         self._consumer_name = refreshed["name"]
         self._previous_reading = _format_reading(refreshed["previous_reading"])
-        self._due_date = self._default_due_date_for_consumer(refreshed)
+        self._due_date = (
+            _normalize_iso_date(refreshed.get("due_date"))
+            if self._due_date_confirmed else self._default_due_date_for_consumer(refreshed)
+        ) or ""
         self.accountNoChanged.emit()
         self.consumerNameChanged.emit()
         self.previousReadingChanged.emit()
@@ -1922,7 +1936,8 @@ class AppBridge(QObject):
     def _default_due_date_for_consumer(self, consumer: dict | None = None, reading_date: str | None = None) -> str:
         # This form creates a new bill. A previous bill's due date cannot be
         # presented as the payment deadline for the new reading.
-        return ""
+        source = consumer or self._consumer or {}
+        return _normalize_iso_date(source.get("schedule_payment_due_date")) or ""
 
     def _load_consumer_for_new_bill(self, consumer: dict) -> None:
         self._consumer = consumer
@@ -1931,6 +1946,7 @@ class AppBridge(QObject):
         self._previous_reading = _format_reading(consumer["previous_reading"])
         self._present_reading = ""
         self._due_date = self._default_due_date_for_consumer(consumer)
+        self._due_date_confirmed = False
         self._consumption = "-"
         self._validation_color = "#94a3b8"
         self._validation_message = "-"
@@ -2027,6 +2043,10 @@ class AppBridge(QObject):
             or _normalize_iso_date(route.get("dueDate"))
             or effective_schedule_date
         )
+        schedule_payment_due_date = (
+            _normalize_iso_date(consumer.get("schedule_payment_due_date"))
+            or _normalize_iso_date(schedule.get("paymentDueDate"))
+        )
         payload = {
             "reading_id": sync_reading_id or str(uuid.uuid4()),
             "consumer_id": consumer_id,
@@ -2054,6 +2074,7 @@ class AppBridge(QObject):
             "schedule_id": int(schedule_id) if schedule_id not in (None, "") else (int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None),
             "schedule_date": effective_schedule_date,
             "schedule_due_date": effective_schedule_due_date,
+            "schedule_payment_due_date": schedule_payment_due_date,
             "billing_cycle": billing_cycle or route.get("billingMonth") or consumer.get("billing_month"),
             "reading_route_id": reading_route_id if reading_route_id not in (None, "") else consumer.get("reading_route_id"),
             "assignment_order": assignment_order if assignment_order not in (None, "") else consumer.get("assignment_order"),
@@ -2356,6 +2377,7 @@ class AppBridge(QObject):
             self._previous_reading = "-"
             self._present_reading = ""
             self._due_date = ""
+            self._due_date_confirmed = False
             self._consumption = "-"
         else:
             self._consumer = consumer
@@ -2364,6 +2386,7 @@ class AppBridge(QObject):
             self._previous_reading = _format_reading(consumer["previous_reading"])
             self._present_reading = ""
             self._due_date = self._default_due_date_for_consumer(consumer)
+            self._due_date_confirmed = False
             self._consumption = "-"
 
         self.accountNoChanged.emit()
@@ -2584,6 +2607,10 @@ class AppBridge(QObject):
             raise RuntimeError("This consumer's assigned schedule is unavailable. Sync assignments before billing.")
         schedule_date = str(schedule.get("startDate") or route.get("startDate") or self.selectedBillingDate)
         schedule_due_date = str(schedule.get("dueDate") or route.get("dueDate") or schedule_date)
+        schedule_payment_due_date = (
+            _normalize_iso_date(self._consumer.get("schedule_payment_due_date"))
+            or _normalize_iso_date(schedule.get("paymentDueDate"))
+        )
         billing_cycle = str(schedule.get("billingMonth") or route.get("billingMonth") or self._consumer.get("billing_month") or "")
         if not self._sync_dal:
             raise RuntimeError("The local billing-reference store is unavailable.")
@@ -2607,13 +2634,16 @@ class AppBridge(QObject):
         consumer_snapshot["billing_reference"] = billing_reference
         consumer_snapshot["schedule_date"] = schedule_date
         consumer_snapshot["schedule_due_date"] = schedule_due_date
+        consumer_snapshot["schedule_payment_due_date"] = schedule_payment_due_date
         flagged = consumption > 500 or exception != "None"
         receipt = (
             f"Reading Preview\nAccount: {consumer_snapshot.get('acct_no') or self._consumer['id']}\n"
             f"Consumer: {consumer_snapshot.get('name') or ''}\n"
             f"Reading Date: {reading_date}\nPrevious: {_format_reading(previous)}\n"
             f"Present: {_format_reading(present)}\nConsumption: {_format_reading(consumption)} m3\n"
-            f"Schedule End Date: {schedule_due_date}\n\nPending server calculation"
+            f"Schedule End Date: {schedule_due_date}\n"
+            + (f"Officer Payment Date: {schedule_payment_due_date} (unissued)\n" if schedule_payment_due_date else "")
+            + "\nPending server calculation"
         )
         return {
             "job_type": "original",
@@ -2632,6 +2662,7 @@ class AppBridge(QObject):
             "schedule_id": schedule_id,
             "schedule_date": schedule_date,
             "schedule_due_date": schedule_due_date,
+            "schedule_payment_due_date": schedule_payment_due_date,
             "billing_cycle": billing_cycle,
             "reading_route_id": reading_route_id,
             "assignment_order": assignment_order,
@@ -2910,6 +2941,7 @@ class AppBridge(QObject):
                             self.printExecutionFinished.emit({
                                 "success": True, "job_type": "original", "pending_calculation": True,
                                 "reading_id": reading_id, "consumer_snapshot": consumer,
+                                "schedule_payment_due_date": job.get("schedule_payment_due_date"),
                                 "previous": previous, "present": present,
                                 "consumption": consumption, "exception": exception,
                             })
@@ -3030,7 +3062,8 @@ class AppBridge(QObject):
                 self._consumer["previous_reading"] = present
                 self._previous_reading = _format_reading(present)
                 self._present_reading = ""
-                self._due_date = ""
+                self._due_date = str(result.get("schedule_payment_due_date") or "")
+                self._due_date_confirmed = False
                 self._validation_message = "Pending server calculation"
                 self.previousReadingChanged.emit()
                 self.presentReadingChanged.emit()
@@ -3071,6 +3104,7 @@ class AppBridge(QObject):
             if result.get("due_date"):
                 self._consumer["due_date"] = result["due_date"]
                 self._due_date = result["due_date"]
+                self._due_date_confirmed = True
                 self.dueDateChanged.emit()
             self._previous_reading = _format_reading(present)
             self._present_reading = ""

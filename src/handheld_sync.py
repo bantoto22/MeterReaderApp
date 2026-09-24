@@ -213,6 +213,11 @@ def _flatten_backend_bill_context(payload: dict) -> dict:
     consumer = context.get("consumer") or context.get("Consumer")
     if isinstance(consumer, dict):
         context = {**consumer, **context}
+    schedule = context.get("reading_schedule") or context.get("schedule")
+    if isinstance(schedule, dict) and context.get("schedule_payment_due_date") in (None, ""):
+        context["schedule_payment_due_date"] = (
+            schedule.get("payment_due_date") or schedule.get("Payment_Due_Date")
+        )
     bill = context.get("bill") or context.get("Bill")
     if isinstance(bill, dict):
         context.update(bill)
@@ -221,10 +226,14 @@ def _flatten_backend_bill_context(payload: dict) -> dict:
     if isinstance(policy, dict):
         if policy.get("source") not in (None, ""):
             context["billing_policy_source"] = policy["source"]
+        if "payment_due_date" in policy:
+            context["billing_policy_payment_due_date"] = policy["payment_due_date"]
         if policy.get("due_date_days") not in (None, ""):
             context["due_days"] = policy["due_date_days"]
         if policy.get("late_fee") not in (None, ""):
             context["late_fee"] = policy["late_fee"]
+    if context.get("schedule_payment_due_date") in (None, "") and context.get("Schedule_Payment_Due_Date") not in (None, ""):
+        context["schedule_payment_due_date"] = context["Schedule_Payment_Due_Date"]
 
     aliases = {
         "amount_due": ("Amount_Due",),
@@ -768,6 +777,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             _safe_int(row.get("setting_id"), None),
             row.get("billing_reference"),
             row.get("billing_policy_source"),
+            row.get("billing_policy_payment_due_date"),
             _fee_value(row, "water_meter_fee"),
             _fee_value(row, "connection_fee"),
             _fee_value(row, "membership_fee"),
@@ -875,6 +885,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             setting_id INTEGER,
             billing_reference TEXT,
             billing_policy_source TEXT,
+            billing_policy_payment_due_date TEXT,
             water_meter_fee REAL NOT NULL DEFAULT 0,
             connection_fee REAL NOT NULL DEFAULT 0,
             membership_fee REAL NOT NULL DEFAULT 0,
@@ -911,6 +922,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             zone_name TEXT,
             schedule_date TEXT,
             schedule_due_date TEXT,
+            schedule_payment_due_date TEXT,
             billing_cycle TEXT,
             is_read INTEGER NOT NULL DEFAULT 0,
             reading_status TEXT NOT NULL DEFAULT 'pending',
@@ -924,6 +936,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             schedule_date TEXT NOT NULL,
             start_date TEXT,
             due_date TEXT,
+            payment_due_date TEXT,
             billing_month TEXT,
             remote_zone_id INTEGER,
             zone_name TEXT NOT NULL,
@@ -988,10 +1001,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "setting_id": "INTEGER",
                     "billing_reference": "TEXT",
                     "billing_policy_source": "TEXT",
+                    "billing_policy_payment_due_date": "TEXT",
                     "water_meter_fee": "REAL NOT NULL DEFAULT 0",
                     "connection_fee": "REAL NOT NULL DEFAULT 0",
                     "membership_fee": "REAL NOT NULL DEFAULT 0",
                 },
+            )
+            self._ensure_columns(
+                conn,
+                "handheld_assignments_cache",
+                {"schedule_payment_due_date": "TEXT"},
             )
             self._ensure_columns(
                 conn,
@@ -1010,6 +1029,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "schedule_date": "TEXT",
                     "start_date": "TEXT",
                     "due_date": "TEXT",
+                    "payment_due_date": "TEXT",
                     "billing_month": "TEXT",
                     "remote_zone_id": "INTEGER",
                     "zone_name": "TEXT",
@@ -1037,15 +1057,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             reader_id = None
         sql = """
         INSERT INTO reading_schedule (
-            schedule_id, schedule_date, start_date, due_date, billing_month,
+            schedule_id, schedule_date, start_date, due_date, payment_due_date, billing_month,
             remote_zone_id, zone_name, meter_reader_id,
             meter_reader_name, meter_reader_contact, status, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(schedule_id) DO UPDATE SET
             schedule_date = excluded.schedule_date,
             start_date = excluded.start_date,
             due_date = excluded.due_date,
+            payment_due_date = excluded.payment_due_date,
             billing_month = excluded.billing_month,
             remote_zone_id = excluded.remote_zone_id,
             zone_name = excluded.zone_name,
@@ -1066,6 +1087,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 due_date = str(
                     item.get("Due_Date") or item.get("due_date") or start_date
                 ).split("T", 1)[0].split(" ", 1)[0]
+                payment_due_date = _parse_date(item.get("payment_due_date") or item.get("Payment_Due_Date"))
                 schedule_date = start_date
                 billing_month = str(item.get("Billing_Month", item.get("billing_month")) or "").strip() or None
                 zone_name = str(item.get("Zone_Name", item.get("zone_name")) or "").strip()
@@ -1088,6 +1110,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                         schedule_date,
                         start_date,
                         due_date,
+                        payment_due_date.isoformat() if payment_due_date else None,
                         billing_month,
                         remote_zone_id,
                         zone_name,
@@ -1109,10 +1132,11 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             billing_month, date_covered_from, date_covered_to,
             amount_due, previous_balance, due_date, penalty, previous_penalty, total_after_due_date,
             bill_status, late_fee, penalty_rate, setting_id, billing_reference, billing_policy_source,
+            billing_policy_payment_due_date,
             water_meter_fee, connection_fee, membership_fee,
             previous_reading, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             meter_no = excluded.meter_no,
             acct_no = excluded.acct_no,
@@ -1141,6 +1165,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             setting_id = COALESCE(excluded.setting_id, handheld_consumers_cache.setting_id),
             billing_reference = COALESCE(excluded.billing_reference, handheld_consumers_cache.billing_reference),
             billing_policy_source = COALESCE(excluded.billing_policy_source, handheld_consumers_cache.billing_policy_source),
+            billing_policy_payment_due_date = excluded.billing_policy_payment_due_date,
             water_meter_fee = excluded.water_meter_fee,
             connection_fee = excluded.connection_fee,
             membership_fee = excluded.membership_fee,
@@ -1167,9 +1192,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                         """
                         INSERT INTO handheld_assignments_cache (
                             schedule_id, consumer_id, acct_no, assignment_order, reading_route_id,
-                            zone_name, schedule_date, schedule_due_date, billing_cycle,
+                            zone_name, schedule_date, schedule_due_date, schedule_payment_due_date, billing_cycle,
                             is_read, reading_status, reading_sync_status, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(schedule_id, consumer_id) DO UPDATE SET
                             acct_no = excluded.acct_no,
                             assignment_order = excluded.assignment_order,
@@ -1177,6 +1202,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                             zone_name = excluded.zone_name,
                             schedule_date = excluded.schedule_date,
                             schedule_due_date = excluded.schedule_due_date,
+                            schedule_payment_due_date = excluded.schedule_payment_due_date,
                             billing_cycle = excluded.billing_cycle,
                             is_read = excluded.is_read,
                             reading_status = excluded.reading_status,
@@ -1189,6 +1215,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                             item.get("zone_name"),
                             item.get("schedule_date", item.get("Schedule_Date")),
                             item.get("schedule_due_date", item.get("Schedule_Due_Date")),
+                            item.get("schedule_payment_due_date") or item.get("Schedule_Payment_Due_Date"),
                             item.get("billing_cycle", item.get("Billing_Cycle")), is_read,
                             str(item.get("reading_status") or "pending"),
                             str(item.get("reading_sync_status") or "pending"),
@@ -1206,12 +1233,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                hc.amount_due, hc.previous_balance, hc.due_date, hc.penalty, hc.previous_penalty,
                hc.total_after_due_date, hc.bill_status, hc.late_fee,
                hc.penalty_rate, hc.setting_id, hc.billing_reference, hc.billing_policy_source,
+               hc.billing_policy_payment_due_date,
                hc.water_meter_fee, hc.connection_fee, hc.membership_fee, hc.previous_reading,
                ha.schedule_id, ha.assignment_order, ha.reading_route_id,
-               ha.schedule_date, ha.schedule_due_date, ha.billing_cycle,
+               ha.schedule_date, ha.schedule_due_date,
+               COALESCE(ha.schedule_payment_due_date, rs.payment_due_date) AS schedule_payment_due_date,
+               ha.billing_cycle,
                ha.is_read, ha.reading_status, ha.reading_sync_status
         FROM handheld_consumers_cache hc
         LEFT JOIN handheld_assignments_cache ha ON ha.consumer_id = hc.id
+        LEFT JOIN reading_schedule rs ON rs.schedule_id = ha.schedule_id
         """
         params: tuple = ()
         if zone_name:
@@ -1885,6 +1916,8 @@ class HandheldSyncDataAccess:
                 snapshot["late_fee"] = policy["late_fee"]
             if policy.get("source") not in (None, ""):
                 snapshot["billing_policy_source"] = policy["source"]
+            if "payment_due_date" in policy:
+                snapshot["billing_policy_payment_due_date"] = policy["payment_due_date"]
             if bill.get("status") not in (None, ""):
                 snapshot["bill_status"] = bill["status"]
             self.local.cache_consumers([snapshot])

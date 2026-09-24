@@ -14,6 +14,7 @@ class ReceiptCoverageTests(unittest.TestCase):
             "id": 42, "classification_id": 1, "classification_name": "Residential",
             "minimum_cubic": 10, "minimum_rate": 100, "excess_rate_per_cubic": 15,
             "due_days": 15, "previous_reading": 5,
+            "schedule_payment_due_date": "2026-10-12",
             "latest_reading_date": "2026-08-20",
             "date_covered_from": "2026-08-27", "date_covered_to": "2026-08-27",
         }
@@ -143,6 +144,8 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")
         self.assertIn("Reading Date: " + job["reading_date"], job["receipt_text"])
         self.assertIn("Schedule End Date: 2026-09-01", job["receipt_text"])
+        self.assertIn("Officer Payment Date: 2026-10-12 (unissued)", job["receipt_text"])
+        self.assertNotEqual(job["schedule_due_date"], job["schedule_payment_due_date"])
         self.assertNotIn("Due Date", job["receipt_text"])
         # Saving updates the consumer's latest date; the queue must keep the
         # previous date captured when this receipt was prepared.

@@ -373,7 +373,9 @@ Rectangle {
                         spacing: 4
 
                         Text {
-                            text: "Bill Payment Due Date"
+                            text: bridgeObj && bridgeObj.dueDateIsConfirmed
+                                  ? "Bill Payment Due Date"
+                                  : "Officer Payment Date (unissued bill)"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -402,7 +404,9 @@ Rectangle {
                         }
 
                         Text {
-                            text: "The main system sets the payment due date after the reading is synced."
+                            text: bridgeObj && bridgeObj.dueDateIsConfirmed
+                                  ? "Confirmed by the main system for this issued bill."
+                                  : "Set in the main system's reading schedule. The issued bill's due date is confirmed after sync."
                             font.pixelSize: TouchMetrics.helperText
                             font.family: "Montserrat"
                             color: "#64748B"
