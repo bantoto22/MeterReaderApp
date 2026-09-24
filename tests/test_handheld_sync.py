@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 from src.handheld_sync import (
     BackendApiClient,
@@ -79,11 +80,20 @@ class FakeLocalStore:
     def list_pending(self, target=None):
         return [q for q in self.queue if q["backend_status"] in ("pending", "failed")]
 
-    def mark_target_synced(self, queue_id, target):
+    def mark_target_synced(self, queue_id, target, server_payload=None):
         for q in self.queue:
             if q["id"] == queue_id:
                 q[f"{target}_status"] = "synced"
+                q["server_payload"] = server_payload
                 self._refresh_status(q)
+
+    def get_latest_confirmed_bill(self, consumer_id):
+        for row in reversed(self.queue):
+            if row["consumer_id"] == consumer_id and row["backend_status"] == "synced":
+                response = row.get("server_payload") or {}
+                if isinstance(response.get("bill"), dict):
+                    return response["bill"]
+        return {}
 
     def mark_target_failed(self, queue_id, target, reason):
         for q in self.queue:
@@ -221,7 +231,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(context["water_charge"], 500)
 
     def test_sqlite_writers_are_serialized_for_the_full_transaction(self):
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         first = connect_sqlite(db_path)
@@ -482,7 +492,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertFalse(any(call[1].endswith("/context") for call in client.calls))
 
     def test_local_bill_reservation_reuses_ids_until_backend_marks_it_used(self):
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         try:
@@ -499,6 +509,15 @@ class HandheldSyncTests(unittest.TestCase):
             reserved = store.get_or_create_bill_reservation(8, "2026-09-06")
             self.assertEqual(reserved["billing_reference"], "SLR2026000125")
             self.assertEqual(reserved["status"], "Reserved")
+
+            later_reading = store.get_or_create_bill_reservation(
+                8, "2026-09-23", schedule_id=401,
+            )
+            next_date = store.get_or_create_bill_reservation(
+                8, "2026-09-24", schedule_id=401,
+            )
+            self.assertNotEqual(next_date["bill_sync_id"], later_reading["bill_sync_id"])
+            self.assertEqual(next_date["bill_date"], "2026-09-24")
 
             store.mark_bill_reservation_used(first["bill_sync_id"], 456)
             next_bill = store.get_or_create_bill_reservation(8, "2026-09-06")
@@ -530,7 +549,7 @@ class HandheldSyncTests(unittest.TestCase):
                     },
                 }
 
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         try:
@@ -545,14 +564,16 @@ class HandheldSyncTests(unittest.TestCase):
                 "schedule_date": "2026-09-06",
                 "schedule_due_date": "2026-09-22",
                 "billing_cycle": "September 2026",
+                "due_days": 15,
                 "late_fee": 10,
             }]
 
             remote.assigned_consumers = scheduled
-            downloaded = dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
-            first = dict(dal.last_pre_reservation_result)
-            dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
-            repeated = dict(dal.last_pre_reservation_result)
+            with patch("src.handheld_sync._manila_current_date", return_value=date(2026, 9, 23)):
+                downloaded = dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
+                first = dict(dal.last_pre_reservation_result)
+                dal.loadAssignedConsumers(12, None, "2026-09-01", "2026-09-30")
+                repeated = dict(dal.last_pre_reservation_result)
             self.assertEqual(downloaded, scheduled)
             self.assertEqual(first["reserved"], 1)
             self.assertEqual(first["ready"], 1)
@@ -562,17 +583,17 @@ class HandheldSyncTests(unittest.TestCase):
             remote.online = False
             offline = dal.prepareBillingReference(
                 8,
-                "2026-09-06",
+                "2026-09-23",
                 schedule_id=401,
                 billing_cycle="September 2026",
-                due_date="2026-09-22",
+                due_date="2026-10-08",
                 late_fee=10,
             )
             self.assertEqual(offline["billing_reference"], "SLR2026000125")
             self.assertEqual(offline["schedule_id"], 401)
             self.assertEqual(offline["billing_cycle"], "September 2026")
-            self.assertEqual(offline["bill_date"], "2026-09-06")
-            self.assertEqual(offline["due_date"], "2026-09-22")
+            self.assertEqual(offline["bill_date"], "2026-09-23")
+            self.assertEqual(offline["due_date"], "2026-10-08")
             self.assertEqual(offline["late_fee"], 10)
         finally:
             gc.collect()
@@ -615,7 +636,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertNotIn("https://device.example.test/api/api/login", client.urls)
 
     def test_queue_schema_migrates_legacy_pending_status_to_backend(self):
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         legacy_status = "supa" + "base_status"
@@ -667,7 +688,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_cached_meter_reader_credentials_support_hashed_offline_login(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -706,7 +727,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_replace_consumers_from_sync_marks_pulled_backend_reading_as_read(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -741,7 +762,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_replace_consumers_from_sync_persists_address_and_billing_period(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -793,7 +814,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_local_schedule_filter_limits_zones_and_read_status_by_selected_month(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -875,7 +896,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_multi_day_routes_are_reader_scoped_and_offline_ready_only_after_verification(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -1026,7 +1047,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_assignment_deadline_and_completion_are_scoped_to_schedule(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -1110,7 +1131,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_receipt_history_persists_all_records_and_filters_by_reading_month(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -1158,7 +1179,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_local_schedule_queries_do_not_expose_cached_routes_without_assignment(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -1212,7 +1233,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_replace_consumers_from_sync_skips_consumers_without_meter_numbers(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -1901,10 +1922,10 @@ class HandheldSyncTests(unittest.TestCase):
             as_of_date=date(2026, 9, 7),
         )
 
-        self.assertIn("Due Pen(10%)   : PHP    50.00", text)
+        self.assertIn("Due Pen(10%)   : PHP     0.00", text)
         self.assertIn("Prev Pen(10%)  : PHP    20.00", text)
         self.assertIn("TOTAL DUE      : PHP   720.00", text)
-        self.assertIn("AFTER DUE      : PHP   770.00", text)
+        self.assertIn("AFTER DUE      : PHP   720.00", text)
         self.assertIn("Due Date       : 2026-09-01", text)
 
     def test_reprint_recalculates_stored_zero_penalty_after_due_date(self):
@@ -1939,7 +1960,7 @@ class HandheldSyncTests(unittest.TestCase):
 
     def test_assignment_account_numbers_order_search_and_reading_metadata(self):
         original_db_path = database._db_path
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         database._db_path = lambda: db_path
@@ -2021,7 +2042,7 @@ class HandheldSyncTests(unittest.TestCase):
                 pass
 
     def test_assignment_cache_survives_restart_with_exact_account_and_order(self):
-        handle = tempfile.NamedTemporaryFile(dir=os.getcwd(), suffix=".db", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         db_path = handle.name
         handle.close()
         try:

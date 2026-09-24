@@ -25,6 +25,7 @@ class NewScheduleStatusTests(unittest.TestCase):
         self._add_schedule(101, self.old_start, self.old_due)
         self._add_consumer(1, 101, True)
         self._add_consumer(2, 101, False)
+        self._add_consumer(3, 101, False)
 
     def _add_schedule(self, schedule_id, start, due):
         database.replace_reading_schedules_from_sync([{
@@ -47,6 +48,7 @@ class NewScheduleStatusTests(unittest.TestCase):
             _meter_reader_account_id="12", selectedBillingDate=self.new_start,
             _route_schedules=lambda: group["viewSchedules"],
         )
+        view._selected_route_consumer_rows = lambda: AppBridge._selected_route_consumer_rows(view)
         return view
 
     def test_new_route_shows_new_unread_and_only_unread_carry_over(self):
@@ -58,14 +60,16 @@ class NewScheduleStatusTests(unittest.TestCase):
         current_rows = AppBridge._selected_route_consumer_rows(self._view(current))
         self.assertEqual(
             {(row["schedule_id"], row["id"], row["is_read"]) for row in current_rows},
-            {(101, 2, 0), (202, 1, 0), (202, 2, 0)},
+            {(101, 3, 0), (202, 1, 0), (202, 2, 0)},
         )
         search_rows = AppBridge._search_selected_route(self._view(current), "Consumer 1", 10, False)
         self.assertEqual([(row["schedule_id"], row["id"]) for row in search_rows], [(202, 1)])
 
         past = next(group for group in grouped if group["startDate"] == self.old_start)
         past_rows = AppBridge._selected_route_consumer_rows(self._view(past))
-        self.assertEqual({(row["id"], row["is_read"]) for row in past_rows}, {(1, 1), (2, 0)})
+        self.assertEqual({(row["id"], row["is_read"]) for row in past_rows}, {(1, 1), (2, 0), (3, 0)})
+        reassigned = AppBridge._search_selected_route(self._view(current), "Consumer 2", 10, False)
+        self.assertEqual([(row["schedule_id"], row["id"]) for row in reassigned], [(202, 2)])
 
     def test_refresh_selects_new_route_unless_reader_chose_a_past_route(self):
         def signal():

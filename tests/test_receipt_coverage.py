@@ -1,7 +1,8 @@
 import unittest
 import threading
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.handheld_sync import _build_bill_payload
 from src.receipt import apply_authoritative_bill, build_receipt_text, build_reprint_receipt_text
@@ -51,6 +52,50 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual(bill["date_covered_from"], "2026-08-20 00:00:00")
         self.assertEqual(bill["date_covered_to"], "2026-09-17 00:00:00")
 
+    def test_new_bill_does_not_reuse_july_schedule_or_prior_bill_due_date(self):
+        reading = dict(
+            self.reading, reading_date="2026-09-23", bill_date="2026-09-23",
+            schedule_date="2026-07-15", schedule_due_date="2026-07-14",
+            due_date="2026-07-14",
+        )
+        bill = _build_bill_payload(reading, dict(self.consumer, due_date="2026-07-14"), 99)
+        self.assertEqual(bill["bill_date"], "2026-09-23 00:00:00")
+        self.assertEqual(bill["due_date"], "2026-10-08 00:00:00")
+        self.assertEqual(bill["date_covered_to"], "2026-09-23 00:00:00")
+
+    def test_context_refresh_preserves_the_selected_assignment(self):
+        from src.qt_hybrid_app import AppBridge
+
+        selected = {
+            "id": 8, "schedule_id": 549, "schedule_date": "2026-09-23",
+            "schedule_due_date": "2026-09-30", "billing_cycle": "2026-09",
+            "reading_route_id": 88, "assignment_order": 3, "zone_name": "Zone 1",
+            "due_days": 9, "late_fee": 6,
+        }
+        refreshed = {
+            "id": 8, "schedule_id": None, "schedule_date": None,
+            "schedule_due_date": None, "billing_cycle": None,
+            "reading_route_id": None, "assignment_order": None,
+            "due_date": "2026-07-14", "latest_reading_date": "2026-09-23",
+            "due_days": None, "late_fee": None,
+        }
+        bridge = SimpleNamespace(
+            _consumer=dict(selected),
+            _sync_dal=SimpleNamespace(getConsumerContext=lambda _id: refreshed),
+            _reload_current_consumer_from_db=lambda: None,
+        )
+        with patch("src.qt_hybrid_app.replace_consumers_from_sync"):
+            AppBridge._ensure_current_consumer_receipt_context(bridge, force_refresh=True)
+        for key in ("schedule_id", "schedule_date", "schedule_due_date", "billing_cycle", "reading_route_id"):
+            self.assertEqual(bridge._consumer[key], selected[key])
+        self.assertEqual(bridge._consumer["due_date"], "2026-07-14")
+        self.assertEqual((bridge._consumer["due_days"], bridge._consumer["late_fee"]), (9, 6))
+
+        bridge._sync_dal.getConsumerContext = lambda _id: {**refreshed, "due_days": 20, "late_fee": 4}
+        with patch("src.qt_hybrid_app.replace_consumers_from_sync"):
+            AppBridge._ensure_current_consumer_receipt_context(bridge, force_refresh=True)
+        self.assertEqual((bridge._consumer["due_days"], bridge._consumer["late_fee"]), (20, 4))
+
     def test_missing_previous_date_does_not_invent_a_schedule_or_month_start(self):
         consumer = dict(self.consumer, previous_reading_date=None)
         bill = _build_bill_payload(dict(self.reading, previous_reading_date=None), consumer, 99)
@@ -82,17 +127,23 @@ class ReceiptCoverageTests(unittest.TestCase):
             },
             _sync_dal=SimpleNamespace(prepareBillingReference=reserve),
         )
+        bridge._default_due_date_for_consumer = lambda consumer, reading_date: (
+            date.fromisoformat(reading_date) + timedelta(days=int(consumer["due_days"]))
+        ).isoformat()
         job = AppBridge._build_pending_receipt_job(bridge)
         self.assertEqual(job["schedule_id"], 538)
         self.assertEqual(job["schedule_date"], "2026-08-27")
         self.assertEqual(job["schedule_due_date"], "2026-09-01")
-        self.assertEqual(reservations[0][1], "2026-08-27")
+        self.assertEqual(reservations[0][1], job["reading_date"])
+        self.assertEqual(job["bill_date"], job["reading_date"])
+        self.assertIsNone(job["due_date"])
+        self.assertNotIn("due_date", reservations[0][2])
+        self.assertIn("Pending server calculation", job["receipt_text"])
         self.assertEqual(job["previous_reading_date"], "2026-08-20")
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")
-        self.assertIn(
-            "Coverage       : 2026-08-20 to\n                  " + job["reading_date"],
-            job["receipt_text"],
-        )
+        self.assertIn("Reading Date: " + job["reading_date"], job["receipt_text"])
+        self.assertIn("Schedule End Date: 2026-09-01", job["receipt_text"])
+        self.assertNotIn("Due Date", job["receipt_text"])
         # Saving updates the consumer's latest date; the queue must keep the
         # previous date captured when this receipt was prepared.
         bridge._consumer = dict(self.consumer, latest_reading_date=job["reading_date"])

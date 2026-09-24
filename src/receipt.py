@@ -12,9 +12,11 @@ import tkinter as tk
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
+    from .billing_policy import due_days as policy_due_days, payment_due_date
     from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
 except ImportError:
+    from billing_policy import due_days as policy_due_days, payment_due_date
     from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
 
@@ -392,14 +394,20 @@ def build_receipt_text(
     as_of_date: datetime.date | None = None,
 ) -> str:
     reader_name = reader_display_name({"full_name": reader_name})
-    _require_billing_profile(consumer)
     consumption = present - previous
-    calculated_current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
+    authoritative = bool(consumer.get("_authoritative_bill"))
+    if authoritative:
+        minimum_cubic = int(_optional_money(consumer, "minimum_cubic"))
+        minimum_rate = _optional_money(consumer, "minimum_rate")
+        excess_rate = _optional_money(consumer, "excess_rate_per_cubic")
+        calculated_current_bill = 0.0
+    else:
+        _require_billing_profile(consumer)
+        calculated_current_bill, minimum_cubic, minimum_rate, excess_rate = _compute_bill(consumption, consumer)
     water_meter_fee = _consumer_fee(consumer, "water_meter_fee")
     connection_fee = _consumer_fee(consumer, "connection_fee")
     membership_fee = _consumer_fee(consumer, "membership_fee")
     concessionaire_fees = round(water_meter_fee + connection_fee + membership_fee, 2)
-    authoritative = bool(consumer.get("_authoritative_bill"))
     current_bill = calculated_current_bill
     if authoritative:
         for field_name in ("water_charge", "class_cost"):
@@ -418,28 +426,37 @@ def build_receipt_text(
     penalty_date = as_of_date or manila_current_date()
     date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
-    due_days = _require_int(consumer, "due_days")
-    carried_previous_bill, previous_penalty, previous_bill_status = _carried_previous_bill(consumer)
+    due_days = policy_due_days(consumer.get("due_days"))
+    if authoritative:
+        carried_previous_bill = _optional_money(consumer, "previous_balance")
+        previous_penalty = _optional_money(consumer, "previous_penalty")
+        previous_bill_status = str(consumer.get("bill_status") or "Unpaid")
+    else:
+        carried_previous_bill, previous_penalty, previous_bill_status = _carried_previous_bill(consumer)
     calculated_amount_due = round(
         current_bill + concessionaire_fees + carried_previous_bill + previous_penalty,
         2,
     )
-    amount_due = (
-        _optional_money(consumer, "amount_due")
-        if authoritative and consumer.get("amount_due") not in (None, "")
-        else calculated_amount_due
-    )
+    amount_due = _optional_money(consumer, "amount_due") if authoritative else calculated_amount_due
     due_date_value = consumer.get("due_date")
-    due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (reference_date + datetime.timedelta(days=due_days))
-    due_date = due_date_obj.isoformat()
+    due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (
+        None if authoritative else payment_due_date(reference_date, due_days)
+    )
+    due_date = due_date_obj.isoformat() if due_date_obj else "Pending server calculation"
     # Recompute every time the receipt is built. Stored zero values become stale
     # when a bill crosses its due date while the handheld is offline.
-    penalty, after_due, penalty_source, bill_status = _calculate_penalty(
-        consumer, current_bill, amount_due, due_date_obj, penalty_date
-    )
+    if authoritative:
+        penalty = _optional_money(consumer, "penalty")
+        after_due = _optional_money(consumer, "total_after_due_date")
+    else:
+        penalty, after_due, _, _ = _calculate_penalty(
+            consumer, current_bill, amount_due, due_date_obj, penalty_date
+        )
     bill_status = previous_bill_status
-    late_fee = consumer.get("late_fee")
-    late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
+    late_fee = consumer.get("penalty_rate") if authoritative else consumer.get("late_fee")
+    if late_fee in (None, ""):
+        late_fee = consumer.get("late_fee")
+    late_fee_percent = 10.0 if late_fee in (None, "") else float(late_fee)
     billing_month = _billing_month_text(consumer, reference_date)
     billing_period = _billing_period_text(consumer, reference_date)
     previous_bill = _previous_bill_text(previous, carried_previous_bill)

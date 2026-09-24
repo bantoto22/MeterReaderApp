@@ -373,7 +373,7 @@ Rectangle {
                         spacing: 4
 
                         Text {
-                            text: "Due Date"
+                            text: "Bill Payment Due Date"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -384,9 +384,9 @@ Rectangle {
                             id: txtDueDate
                             property string keyboardMode: "numeric"
                             Layout.fillWidth: true
-                            placeholderText: "YYYY-MM-DD"
+                            placeholderText: "Pending server calculation"
                             text: bridgeObj ? bridgeObj.dueDate : ""
-                            inputMethodHints: Qt.ImhDate | Qt.ImhNoPredictiveText
+                            readOnly: true
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             color: "#0F172A"
@@ -399,11 +399,10 @@ Rectangle {
                                 color: "#F8FAFC"
                                 Behavior on border.color { ColorAnimation { duration: 150 } }
                             }
-                            onTextChanged: { if (bridgeObj) bridgeObj.dueDate = text }
                         }
 
                         Text {
-                            text: "Edit when a zone needs more than one day to finish."
+                            text: "The main system sets the payment due date after the reading is synced."
                             font.pixelSize: TouchMetrics.helperText
                             font.family: "Montserrat"
                             color: "#64748B"

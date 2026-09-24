@@ -168,6 +168,20 @@ backend must persist `schedule_id` on the meter reading, accept a valid late
 reading, and clear reader/biller exceptions only after that reading is committed.
 Rejected or deleted readings must leave the assignment pending.
 
+The authenticated API supplies billing-policy values for display and diagnostics.
+The Node backend owns payment due dates, penalty rates, previous penalties,
+current penalties, bill totals, status, and setting IDs. The device sends reading
+and base charge data to `/api/handheld/reading-bundles` without those final
+fields. `schedule_due_date` is only the reading assignment's End Date.
+
+An offline reading is queued in SQLite as `Pending server calculation`, with no
+bill payment due date or penalty. On successful sync, the returned `response.bill`
+is saved unchanged in the sync record and its values are mirrored into the local
+consumer cache for offline viewing. The returned `billing_policy` is retained for
+diagnostics; its values never recalculate a saved bill. When online, the device
+refreshes `/api/handheld/consumers/:id/context` before displaying a saved receipt
+so overdue penalties and the bill's original `penalty_rate` come from the server.
+
 The assigned-consumer/context response and the authoritative `response.bill` must
 also expose the concessionaire's `connection_fee_components` records. The device
 maps component code `MTR` to **Water Meter Fee**, `CONN` to **Connection Fee**, and

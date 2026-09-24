@@ -44,11 +44,11 @@ try:
         seed_default_users,
     )
     from .receipt import (
+        apply_authoritative_bill,
         build_receipt_text,
         can_use_system_printer,
-        recalculate_receipt_penalty_text,
+        preview_receipt,
         send_to_system_printer,
-        show_receipt,
     )
     from .handheld_sync import HandheldSyncDataAccess, SyncConfig
 except Exception:
@@ -68,11 +68,11 @@ except Exception:
         seed_default_users,
     )
     from receipt import (
+        apply_authoritative_bill,
         build_receipt_text,
         can_use_system_printer,
-        recalculate_receipt_penalty_text,
+        preview_receipt,
         send_to_system_printer,
-        show_receipt,
     )
     try:
         from handheld_sync import HandheldSyncDataAccess, SyncConfig
@@ -3515,6 +3515,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         if not self._sync_dal:
             return
         consumer = self._current_consumer or {}
+        reading_date = datetime.now().date().isoformat()
         payload = {
             "consumer_id": consumer_id,
             "acct_no": consumer.get("acct_no"),
@@ -3525,25 +3526,17 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             "minimum_cubic": consumer.get("minimum_cubic"),
             "minimum_rate": consumer.get("minimum_rate"),
             "excess_rate_per_cubic": consumer.get("excess_rate_per_cubic"),
-            "due_days": consumer.get("due_days"),
-            "late_fee": consumer.get("late_fee"),
             "water_meter_fee": consumer.get("water_meter_fee"),
             "meter_maintenance_fee": consumer.get("water_meter_fee", consumer.get("meter_maintenance_fee")),
             "connection_fee": consumer.get("connection_fee"),
             "membership_fee": consumer.get("membership_fee"),
-            "amount_due": consumer.get("amount_due"),
-            "previous_balance": consumer.get("previous_balance"),
-            "due_date": consumer.get("due_date"),
-            "penalty": consumer.get("penalty"),
-            "previous_penalty": consumer.get("previous_penalty"),
-            "total_after_due_date": consumer.get("total_after_due_date"),
-            "bill_status": consumer.get("bill_status"),
+            "billing_calculation_status": "Pending server calculation",
             "previous_reading": consumer.get("previous_reading"),
             "present_reading": present,
             "consumption": consumption,
             "exception": exception,
             "is_flagged": bool(is_flagged),
-            "reading_date": datetime.now().date().isoformat(),
+            "reading_date": reading_date,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -3630,14 +3623,20 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         return saved_id
 
     def _deliver_receipt(self, consumer, previous, present, exception, reader_name, reading_id=None, print_action="print", receipt_text=None):
-        if receipt_text:
-            receipt_text = recalculate_receipt_penalty_text(
-                receipt_text,
-                bill_status=str(consumer.get("bill_status") or "Unpaid"),
-                late_fee=consumer.get("late_fee"),
+        if not receipt_text:
+            try:
+                context = self._sync_dal.getConsumerContext(int(consumer["id"])) if self._sync_dal else {}
+            except Exception:
+                context = {}
+            bill = context.get("bill") if isinstance(context.get("bill"), dict) else context
+            bill_date = str(bill.get("bill_date") or "").split("T", 1)[0].split(" ", 1)[0]
+            if not bill.get("billing_reference") or bill_date != datetime.now().date().isoformat():
+                messagebox.showinfo("Pending server calculation", "Sync this reading before printing its bill.")
+                return False
+            receipt_text = build_receipt_text(
+                apply_authoritative_bill({**consumer, **context}, bill),
+                previous, present, exception, reader_name,
             )
-        else:
-            receipt_text = build_receipt_text(consumer, previous, present, exception, reader_name)
         self._persist_receipt_print(consumer, previous, present, exception, reader_name, receipt_text, print_action, reading_id)
         if can_use_system_printer():
             try:
@@ -3648,7 +3647,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
                     "Printer Error",
                     f"Unable to print to the GP58 over USB.\n\n{exc}\n\nShowing receipt preview instead.",
                 )
-        show_receipt(self, consumer, previous, present, exception, reader_name)
+        preview_receipt(self, receipt_text)
         return False
 
     def _simulate_printing(self):

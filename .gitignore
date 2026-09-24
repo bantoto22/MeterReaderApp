@@ -7,6 +7,7 @@ __pycache__/
 # Local runtime database and generated data
 data/*.db
 data/*.db-*
+/tmp*.db
 
 # Local virtual environments
 .venv/
