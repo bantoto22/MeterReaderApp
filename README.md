@@ -115,6 +115,13 @@ The device uses the same public HTTPS Funnel as the web app:
 Device -> https://aspire.tail3de291.ts.net/api -> Node backend:3001 -> PostgreSQL:5432
 ```
 
+The app checks `https://aspire.tail3de291.ts.net/health` before uploading queued
+readings. If the Pi reports the backend offline, run
+`curl -fsS --max-time 10 https://aspire.tail3de291.ts.net/health` on the Pi and
+inspect Sync Logs for the HTTP or network error. A failed health check does not
+remove queued readings or cached consumer records. The app does not report an
+upload failure when there are no queued readings.
+
 ### Device provisioning and heartbeat
 
 Provision each Raspberry Pi with its own permanent `HANDHELD_DEVICE_ID` in `.env`

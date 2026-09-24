@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.handheld_sync import (
     BackendApiClient,
@@ -181,6 +181,33 @@ class HandheldSyncTests(unittest.TestCase):
         result = self.dal.saveMeterReading({"consumer_id": 1, "present_reading": 100, "reading_date": "2026-05-08"})
         self.assertEqual(result["status"], "queued")
         self.assertEqual(len(self.local.list_pending()), 1)
+
+    def test_empty_upload_queue_does_not_claim_backend_is_unreachable(self):
+        with patch.object(self.remote, "is_online", side_effect=AssertionError("unneeded probe")):
+            result = self.dal.syncPendingReadings()
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["errors"], [])
+        self.assertFalse(self.local.audit)
+
+    def test_offline_upload_reports_health_detail_and_keeps_queue(self):
+        self.dal.saveMeterReading({"consumer_id": 1, "present_reading": 100,
+                                   "reading_date": "2026-09-25"})
+        self.remote.last_health_error = (
+            "Connection error at https://device.example.test/health: DNS lookup failed"
+        )
+        result = self.dal.syncPendingReadings()
+        self.assertEqual(result["status"], "offline")
+        self.assertIn("DNS lookup failed", result["errors"][0])
+        self.assertIn("cannot be reached from this device", result["errors"][0])
+        self.assertEqual(len(self.local.list_pending()), 1)
+        self.assertEqual(self.local.audit[-1]["status"], "pending")
+
+    def test_login_uses_login_route_without_health_preflight(self):
+        remote = Mock()
+        remote.authenticate_meter_reader.return_value = {"id": 12}
+        self.dal.remote = remote
+        self.assertEqual(self.dal.authenticateMeterReader("reader", "secret"), {"id": 12})
+        remote.is_online.assert_not_called()
 
     def test_sync_error_explains_database_lock(self):
         diagnostic = format_sync_error("Updating the device cache", sqlite3.OperationalError("database is locked"))
@@ -641,6 +668,20 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("https://device.example.test/api/handheld/consumers", client.urls)
         self.assertIn("https://device.example.test/health", client.urls)
         self.assertNotIn("https://device.example.test/api/api/login", client.urls)
+
+    def test_health_probe_retains_reason_without_bearer_token(self):
+        client = BackendApiClient(SyncConfig(backend_api_base_url="https://device.example.test/api"))
+        client.set_authenticated_session("private-session-token", 12)
+        with patch.object(client, "_req", return_value=(0, {
+            "error": "connection refused: private-session-token",
+        })):
+            self.assertFalse(client.is_online())
+        self.assertIn("https://device.example.test/health", client.last_health_error)
+        self.assertIn("connection refused", client.last_health_error)
+        self.assertNotIn("private-session-token", client.last_health_error)
+        with patch.object(client, "_req", return_value=(200, {"status": "ok"})):
+            self.assertTrue(client.is_online())
+        self.assertEqual(client.last_health_error, "")
 
     def test_queue_schema_migrates_legacy_pending_status_to_backend(self):
         handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1293,7 +1334,7 @@ class HandheldSyncTests(unittest.TestCase):
 
         self.assertEqual(payload["amount_due"], 100.0)
         self.assertEqual(payload["penalty"], 0.0)
-        self.assertEqual(payload["total_after_due_date"], 100.0)
+        self.assertEqual(payload["total_after_due_date"], 110.0)
 
     def test_bill_payload_generates_non_null_due_date_when_source_is_null(self):
         payload = _build_bill_payload(
@@ -1361,7 +1402,49 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["previous_balance"], 42.0)
         self.assertEqual(payload["previous_penalty"], 4.2)
         self.assertEqual(payload["penalty"], 0.0)
-        self.assertEqual(payload["total_after_due_date"], 86.2)
+        self.assertEqual(payload["total_after_due_date"], 90.2)
+
+    def test_after_due_projects_new_penalty_without_penalizing_previous_amounts(self):
+        reading = {
+            "reading_id": "new-reading-with-previous-bill",
+            "consumer_id": 42,
+            "previous_reading": 0,
+            "present_reading": 1,
+            "consumption": 1,
+            "reading_date": "2026-09-25",
+            "schedule_payment_due_date": "2026-10-12",
+        }
+        context = {
+            "minimum_cubic": 0,
+            "minimum_rate": 0,
+            "excess_rate_per_cubic": 40,
+            "late_fee": 10,
+            "unpaid_bills": [{
+                "sync_id": "old-bill",
+                "original_amount": 40,
+                "water_charge": 40,
+                "penalty_rate": 10,
+                "due_date": "2026-08-01",
+                "status": "Unpaid",
+            }],
+        }
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 9, 25))
+
+        self.assertEqual(bill["water_charge"], 40)
+        self.assertEqual(bill["previous_balance"], 40)
+        self.assertEqual(bill["previous_penalty"], 4)
+        self.assertEqual(bill["penalty"], 0)
+        self.assertEqual(bill["amount_due"], 84)
+        self.assertEqual(bill["total_after_due_date"], 88)
+
+        receipt = build_receipt_text(
+            apply_authoritative_bill(context, bill), 0, 1, "None",
+            reading_date=reading["reading_date"],
+        )
+        self.assertIn("Previous       : PHP    40.00", receipt)
+        self.assertIn("Prev Pen(10%)  : PHP     4.00", receipt)
+        self.assertIn("TOTAL DUE      : PHP    84.00", receipt)
+        self.assertIn("AFTER DUE      : PHP    88.00", receipt)
 
     def test_bill_payload_applies_penalty_only_to_overdue_current_principal(self):
         payload = _build_bill_payload(
@@ -1642,7 +1725,7 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    10.00", text)
-        self.assertIn("Prev Bill      : PHP 0.00", text)
+        self.assertIn("Prev Bill      : None", text)
         self.assertIn("Bill Month     : July 2026", text)
         self.assertIn("Coverage       : N/A to", text)
         self.assertIn("TOTAL DUE      : PHP    10.00", text)
@@ -1717,7 +1800,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Prev Pen(10%)  : PHP     5.00", text)
         self.assertIn("Prev Bill      : PHP 50.00", text)
         self.assertIn("TOTAL DUE      : PHP    65.00", text)
-        self.assertIn("AFTER DUE      : PHP    65.00", text)
+        self.assertIn("AFTER DUE      : PHP    66.00", text)
 
     def test_receipt_does_not_treat_rolled_amount_due_as_monthly_principal(self):
         text = build_receipt_text(
@@ -1751,7 +1834,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Previous       : PHP     0.00", text)
         self.assertIn("Prev Pen(10%)  : PHP     0.00", text)
         self.assertIn("TOTAL DUE      : PHP    10.00", text)
-        self.assertIn("AFTER DUE      : PHP    10.00", text)
+        self.assertIn("AFTER DUE      : PHP    11.00", text)
 
     def test_receipt_applies_previous_penalty_separately_from_current_due_penalty(self):
         text = build_receipt_text(
@@ -1827,7 +1910,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("Previous       : PHP   132.00", text)
         self.assertIn("Prev Pen(10%)  : PHP    13.20", text)
         self.assertIn("TOTAL DUE      : PHP   175.20", text)
-        self.assertIn("AFTER DUE      : PHP   175.20", text)
+        self.assertIn("AFTER DUE      : PHP   178.20", text)
 
     def test_receipt_does_not_apply_current_penalty_before_due_date(self):
         text = build_receipt_text(
@@ -1853,7 +1936,8 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Due Pen(10%)   : PHP     0.00", text)
-        self.assertIn("AFTER DUE      : PHP   100.00", text)
+        self.assertIn("TOTAL DUE      : PHP   100.00", text)
+        self.assertIn("AFTER DUE      : PHP   110.00", text)
 
     def test_receipt_uses_authoritative_backend_bill_totals(self):
         consumer = apply_authoritative_bill(

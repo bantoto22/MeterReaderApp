@@ -114,6 +114,66 @@ class ServerOwnedBillingTests(unittest.TestCase):
         self.assertEqual(bill["amount_due"], 255)
         self.assertEqual(bill["due_date"], "2026-11-04 00:00:00")
 
+    def test_cached_previous_balance_survives_zero_assignment_totals(self):
+        from src.handheld_sync import _build_bill_payload
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = os.path.join(folder, "previous-bill.db")
+            store.ensure_schema()
+            assignment = {
+                "id": 8, "meter_no": "09-23-2233", "name": "Test",
+                "zone_name": "Zone 1", "minimum_cubic": 10,
+                "minimum_rate": 100, "excess_rate_per_cubic": 15,
+                "amount_due": 0, "previous_balance": 0,
+                "previous_penalty": 0, "bill_status": "Unpaid",
+            }
+            store.cache_consumers([assignment])
+            store.cache_consumer_context(8, {
+                "amount_due": 0, "previous_balance": 145,
+                "previous_penalty": 10, "bill_status": "Unpaid",
+            })
+            store.cache_consumers([assignment])
+            dal = HandheldSyncDataAccess(store, None)
+            context = dal.getCachedConsumerContext(8)
+            self.assertEqual(context["previous_balance"], 145)
+            self.assertEqual(context["previous_penalty"], 10)
+            reading = {
+                "consumer_id": 8, "previous_reading": 5,
+                "present_reading": 7, "consumption": 2,
+                "reading_date": "2026-09-25",
+                "schedule_payment_due_date": "2026-10-12",
+            }
+            bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 9, 25))
+            self.assertEqual(bill["previous_balance"], 145)
+            self.assertEqual(bill["previous_penalty"], 10)
+            self.assertEqual(bill["amount_due"], 255)
+            store.cache_consumer_context(8, {"bill_status": "Paid"})
+            paid = _build_bill_payload(
+                reading, dal.getCachedConsumerContext(8), 0,
+                as_of_date=date(2026, 9, 25),
+            )
+            self.assertEqual(paid["previous_balance"], 0)
+            self.assertEqual(paid["amount_due"], 100)
+            del dal, store
+            gc.collect()
+
+    def test_previous_bill_label_uses_balance_even_with_zero_previous_meter_reading(self):
+        receipt = build_receipt_text(
+            apply_authoritative_bill({
+                "minimum_cubic": 10, "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+            }, {
+                "water_charge": 100, "previous_balance": 145,
+                "previous_penalty": 10, "amount_due": 255,
+                "total_after_due_date": 255, "penalty": 0,
+                "due_date": "2026-10-12", "status": "Unpaid",
+            }),
+            0, 2, "None", reading_date="2026-09-25",
+        )
+        self.assertIn("Prev Bill      : PHP 145.00", receipt)
+        self.assertIn("Previous       : PHP   145.00", receipt)
+
     def test_reconnect_refreshes_assignments_without_pending_uploads(self):
         view = SimpleNamespace(
             _wifi_status="Status: Offline", _wifi_status_color="gray",

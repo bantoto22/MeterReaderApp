@@ -74,7 +74,7 @@ class ReceiptCoverageTests(unittest.TestCase):
         bill = _build_bill_payload(reading, self.consumer, 0, as_of_date=date(2026, 9, 17))
         self.assertEqual(bill["due_date"], "2026-10-12 00:00:00")
         self.assertEqual(bill["amount_due"], 100)
-        self.assertEqual(bill["total_after_due_date"], 100)
+        self.assertEqual(bill["total_after_due_date"], 110)
 
     def test_reading_dates_override_schedule_and_backend_bill_dates(self):
         snapshot = dict(self.consumer, schedule_date="2026-08-27", schedule_due_date="2026-09-01")
@@ -181,7 +181,7 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertIsNone(job["due_date"])
         self.assertNotIn("due_date", reservations[0][2])
         self.assertIn("TOTAL DUE      : PHP   150.00", job["receipt_text"])
-        self.assertIn("AFTER DUE      : PHP   150.00", job["receipt_text"])
+        self.assertIn("AFTER DUE      : PHP   160.00", job["receipt_text"])
         self.assertIn("Previous       : PHP    50.00", job["receipt_text"])
         self.assertEqual(job["previous_reading_date"], "2026-08-20")
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")

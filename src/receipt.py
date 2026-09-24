@@ -170,10 +170,10 @@ def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
 
 
 def _previous_bill_text(previous: float, carried_previous_bill: float | None) -> str:
-    if previous <= 0:
-        return "None"
     if carried_previous_bill is None:
         return "Pending server calculation"
+    if carried_previous_bill <= 0:
+        return "None"
     return f"PHP {carried_previous_bill:.2f}"
 
 
@@ -187,10 +187,12 @@ def _calculate_penalty(
     late_fee = consumer.get("late_fee")
     late_fee_percent = 10.0 if late_fee in (None, "") else _require_float(consumer, "late_fee")
     bill_status = str(consumer.get("bill_status") or "Unpaid").strip()
-    is_overdue = reference_date > due_date and bill_status.lower() != "paid"
-    applied_penalty = round(current_bill * (late_fee_percent / 100.0), 2) if is_overdue else 0.0
+    is_unpaid = bill_status.lower() != "paid"
+    is_overdue = reference_date > due_date and is_unpaid
+    projected_penalty = round(current_bill * (late_fee_percent / 100.0), 2) if is_unpaid else 0.0
+    applied_penalty = projected_penalty if is_overdue else 0.0
     penalty_source = "current bill penalty" if is_overdue else "not yet due"
-    total_after_due_date = round(total_amount + applied_penalty, 2)
+    total_after_due_date = round(total_amount + projected_penalty, 2)
     return applied_penalty, total_after_due_date, penalty_source, bill_status
 
 
@@ -246,8 +248,12 @@ def recalculate_receipt_penalty_text(
 
     today = as_of_date or manila_current_date()
     overdue = str(bill_status or "Unpaid").strip().lower() != "paid" and today > due_date
-    current_penalty = round(water_charge * effective_late_fee / 100.0, 2) if overdue else 0.0
-    total_after_due = round(amount_due + current_penalty, 2)
+    projected_penalty = (
+        round(water_charge * effective_late_fee / 100.0, 2)
+        if str(bill_status or "Unpaid").strip().lower() != "paid" else 0.0
+    )
+    current_penalty = projected_penalty if overdue else 0.0
+    total_after_due = round(amount_due + projected_penalty, 2)
     refreshed: list[str] = []
     for line in lines:
         stripped = line.strip()

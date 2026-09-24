@@ -48,6 +48,12 @@ CONTEXT_PRIVATE_KEYS = frozenset({
     "token", "session_token", "access_token", "refresh_token",
     "authorization", "password", "secret",
 })
+CONTEXT_BILL_FIELDS = frozenset({
+    "amount_due", "previous_balance", "previous_penalty", "penalty",
+    "total_after_due_date", "bill_status", "due_date", "penalty_rate",
+    "setting_id", "billing_reference", "billing_policy_source",
+    "billing_policy_payment_due_date",
+})
 
 
 def _record_identity(value) -> str:
@@ -171,9 +177,15 @@ def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> s
     elif "timed out" in lowered or "timeout" in lowered:
         problem = "The Backend API request timed out"
         action = "Check internet/Tailscale Funnel connectivity, then retry. The reading remains queued."
-    elif any(token in lowered for token in ("urlopen error", "connection refused", "name or service", "unreachable")):
-        problem = "The Backend API is unreachable"
-        action = "Check device internet, Tailscale Funnel, and that the backend is running on port 3001."
+    elif any(token in lowered for token in (
+        "urlopen error", "connection refused", "name or service", "unreachable",
+        "connection error at", "dns lookup failed", "name resolution", "getaddrinfo failed",
+    )):
+        problem = "The Backend API cannot be reached from this device"
+        action = "Check Raspberry Pi Wi-Fi, DNS, Tailscale Funnel, and the backend. Queued readings remain in SQLite."
+    elif "http 5" in lowered and "/health" in lowered:
+        problem = "The Backend API health check failed"
+        action = "Check the Node backend and its database; queued readings remain in SQLite."
     elif "401" in lowered or "403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
         problem = "The backend rejected device authentication"
         action = "Log in online again and verify that the meter-reader account is active."
@@ -548,7 +560,11 @@ def _build_bill_payload(
         if prior_status != "paid" and prior_context.get("amount_due") not in (None, ""):
             rolled_amount_due = max(0.0, _safe_float(prior_context.get("amount_due")))
             embedded_previous_penalty = max(0.0, _safe_float(prior_context.get("previous_penalty")))
-            carried_balance = max(0.0, round(rolled_amount_due - embedded_previous_penalty, 2))
+            carried_balance = (
+                max(0.0, _safe_float(prior_context.get("previous_balance")))
+                if rolled_amount_due == 0 else
+                max(0.0, round(rolled_amount_due - embedded_previous_penalty, 2))
+            )
             prior_due_date = _parse_date(prior_context.get("prior_bill_due_date") or prior_context.get("due_date"))
             total_after_due = max(0.0, _safe_float(prior_context.get("total_after_due_date")))
             stored_current_penalty = max(
@@ -584,13 +600,12 @@ def _build_bill_payload(
     due_date_obj = _parse_date(reading.get("schedule_payment_due_date")) or payment_due_date(coverage_end, due_days)
     due_date = datetime.combine(due_date_obj, datetime.min.time())
     amount_due = round(current_charge + concessionaire_fees + carried_balance + carried_penalty, 2)
-    current_penalty = (
-        round(current_charge * (current_late_fee_percent / 100.0), 2)
-        if penalty_date > due_date_obj
-        else 0.0
-    )
+    # The penalty is accrued only when overdue, but AFTER DUE is the amount
+    # payable if this new bill is not settled by its payment due date.
+    projected_penalty = round(current_charge * (current_late_fee_percent / 100.0), 2)
+    current_penalty = projected_penalty if penalty_date > due_date_obj else 0.0
     total_amount = amount_due
-    total_after_due_date = round(amount_due + current_penalty, 2)
+    total_after_due_date = round(amount_due + projected_penalty, 2)
     reading_sync_id = str(reading.get("reading_id") or uuid.uuid4())
 
     existing_setting_id = context.get("setting_id")
@@ -1678,6 +1693,7 @@ class BackendApiClient:
         self._session_token = ""
         self._device_id = str(cfg.device_id or "").strip()
         self._device_label = str(cfg.device_label or cfg.device_id or "").strip()
+        self.last_health_error = ""
 
     def _req(
         self,
@@ -1735,8 +1751,16 @@ class BackendApiClient:
         return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
 
     def is_online(self) -> bool:
-        status, _ = self._req("GET", "/health", api_route=False)
-        return 200 <= status < 300
+        status, response = self._req("GET", "/health", api_route=False)
+        if 200 <= status < 300:
+            self.last_health_error = ""
+            return True
+        detail = self._message(response, "No response from the health endpoint.")
+        if self._session_token:
+            detail = detail.replace(self._session_token, "[redacted]")
+        status_text = f"HTTP {status}" if status else "Connection error"
+        self.last_health_error = f"{status_text} at {self._root_url}/health: {detail[:240]}"
+        return False
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
         status, data = self._req("POST", "/api/login", payload={"username": username, "password": password})
@@ -2043,7 +2067,11 @@ class HandheldSyncDataAccess:
             try:
                 if int(row.get("id")) == int(consumer_id):
                     context = self.local.load_cached_consumer_context(int(consumer_id))
-                    return {**context, **{key: value for key, value in row.items() if value is not None}}
+                    merged = {**context, **{key: value for key, value in row.items() if value is not None}}
+                    for key in CONTEXT_BILL_FIELDS:
+                        if context.get(key) is not None:
+                            merged[key] = context[key]
+                    return merged
             except (TypeError, ValueError):
                 continue
         return {}
@@ -2250,8 +2278,8 @@ class HandheldSyncDataAccess:
         return cached
 
     def authenticateMeterReader(self, username: str, password: str) -> dict:
-        if not self.remote or not self.remote.is_online():
-            raise RuntimeError("Backend API is unavailable for meter reader login.")
+        if not self.remote:
+            raise RuntimeError("Backend API is not configured for meter reader login.")
         return self.remote.authenticate_meter_reader(username, password)
 
     def setAuthenticatedSession(self, token: str | None, meter_reader_id: int | str | None = None) -> None:
@@ -2474,16 +2502,18 @@ class HandheldSyncDataAccess:
             return self._sync_pending_readings()
 
     def _sync_pending_readings(self) -> dict:
+        pending = self.listPendingSyncReadings()
+        if not pending:
+            return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": []}
         if not self.is_online():
+            health_error = str(getattr(self.remote, "last_health_error", "") or "").strip()
             diagnostic = format_sync_error(
                 "Checking Backend API connectivity",
-                "Backend API is unreachable or returned an unsuccessful health response.",
+                health_error or "Backend health check did not succeed; the network may be offline.",
                 self._endpoint(),
             )
-            self._audit(None, "failed", diagnostic)
+            self._audit(None, "pending", diagnostic)
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic]}
-
-        pending = self.listPendingSyncReadings()
         self._audit(
             None,
             "pending",
