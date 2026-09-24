@@ -122,6 +122,15 @@ inspect Sync Logs for the HTTP or network error. A failed health check does not
 remove queued readings or cached consumer records. The app does not report an
 upload failure when there are no queued readings.
 
+If the Pi reaches the hostname but reports `SSL: UNEXPECTED_EOF_WHILE_READING`,
+check the Funnel's public HTTPS path. On the backend host, confirm that
+`tailscale funnel status` still shows `/ proxy http://127.0.0.1:3001`. If the
+local backend health check succeeds but the public Funnel TLS handshake fails,
+cycle only that Funnel route with `tailscale funnel --https=443 off` followed by
+`tailscale funnel --bg 3001`, then repeat the Pi's `curl` check. This briefly
+interrupts public access. An IPv6 `Network is unreachable` message is not the
+cause when curl subsequently tries IPv4; check the final IPv4/TLS result.
+
 ### Device provisioning and heartbeat
 
 Provision each Raspberry Pi with its own permanent `HANDHELD_DEVICE_ID` in `.env`

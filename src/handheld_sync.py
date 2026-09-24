@@ -178,6 +178,16 @@ def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> s
         problem = "The Backend API request timed out"
         action = "Check internet/Tailscale Funnel connectivity, then retry. The reading remains queued."
     elif any(token in lowered for token in (
+        "unexpected_eof_while_reading", "eof occurred in violation of protocol",
+        "eof occured in violation of protocol", "ssl/tls connection failed",
+    )):
+        problem = "The HTTPS connection closed before the Backend API responded"
+        action = (
+            "Run curl -v --max-time 10 on this /health URL from the Raspberry Pi; "
+            "check the public Tailscale Funnel TLS path if it also fails. "
+            "Queued readings remain in SQLite."
+        )
+    elif any(token in lowered for token in (
         "urlopen error", "connection refused", "name or service", "unreachable",
         "connection error at", "dns lookup failed", "name resolution", "getaddrinfo failed",
     )):

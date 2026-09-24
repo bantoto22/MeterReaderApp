@@ -215,6 +215,17 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertIn("local SQLite database is busy", diagnostic)
         self.assertIn("Recommended action:", diagnostic)
 
+    def test_sync_error_identifies_tls_eof_before_generic_network_error(self):
+        detail = (
+            "Connection error at https://device.example.test/health: "
+            "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+            "EOF occurred in violation of protocol (_ssl.c:1029)>"
+        )
+        diagnostic = format_sync_error("Checking Backend API connectivity", detail)
+        self.assertIn("HTTPS connection closed before the Backend API responded", diagnostic)
+        self.assertIn("public Tailscale Funnel TLS path", diagnostic)
+        self.assertIn("Queued readings remain in SQLite", diagnostic)
+
     def test_nested_backend_bill_values_override_context_estimates(self):
         context = _flatten_backend_bill_context({
             "consumer_id": 100,
