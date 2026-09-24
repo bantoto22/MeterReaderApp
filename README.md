@@ -171,6 +171,10 @@ Rejected or deleted readings must leave the assignment pending.
 The Billing Officer sets `reading_schedule.payment_due_date` when saving an
 assignment. The device caches it as `schedule_payment_due_date` and may show it
 for an unissued reading. `schedule_due_date` is only the assignment End Date.
+The form and unissued preview look up the payment date by the selected
+`schedule_id` in the refreshed local schedule cache, so a newer schedule date
+replaces an older date copied into a consumer assignment. An issued bill keeps
+the due date returned by the backend.
 For older assignments without a payment date, the Node backend uses
 `admin_settings.due_date_days`. The device does not calculate the fallback.
 
@@ -188,6 +192,15 @@ payment date, fallback days, and late fee are retained for diagnostics; they
 never recalculate a saved bill. When online, the device
 refreshes `/api/handheld/consumers/:id/context` before displaying a saved receipt
 so overdue penalties and the bill's original `penalty_rate` come from the server.
+
+During each assigned-consumer pull, a bounded background refresh requests that
+same authenticated context endpoint for each assigned consumer before the app
+reports the pull complete. SQLite keeps the
+bill and any `unpaid_bills`, `payments`, `payment_history`, `readings`, or
+`reading_history` records returned by the API, plus the latest reading dates.
+The newest API response replaces the records it provides; offline lookups use
+the last successful response. The device cannot fetch payment or reading history that
+the backend does not expose through this endpoint.
 
 The assigned-consumer/context response and the authoritative `response.bill` must
 also expose the concessionaire's `connection_fee_components` records. The device

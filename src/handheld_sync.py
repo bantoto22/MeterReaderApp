@@ -12,6 +12,7 @@ Offline:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -41,6 +42,11 @@ except ImportError:
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
+CONTEXT_RECORD_KEYS = (
+    "bill", "unpaid_bills", "payments", "payment_history", "readings",
+    "reading_history", "latest_reading", "latest_reading_date",
+    "previous_reading_date", "billing_policy",
+)
 # Bump this with each device-app release; it is sent in the heartbeat user_agent.
 APP_VERSION = "1.0.0"
 
@@ -236,10 +242,11 @@ def _flatten_backend_bill_context(payload: dict) -> dict:
         context["schedule_payment_due_date"] = context["Schedule_Payment_Due_Date"]
 
     aliases = {
-        "amount_due": ("Amount_Due",),
+        "amount_due": ("Amount_Due", "total_amount", "bill_amount"),
+        "previous_balance": ("Previous_Balance",),
         "penalty": ("Penalty", "Penalties"),
         "previous_penalty": ("Previous_Penalty",),
-        "total_after_due_date": ("Total_After_Due_Date",),
+        "total_after_due_date": ("Total_After_Due_Date", "amount_after_due_date", "pay_through"),
         "overdue_penalty": ("Overdue_Penalty",),
         "late_fee": ("Late_Fee_Percentage", "Late_Fee"),
         "is_overdue": ("Is_Overdue",),
@@ -251,6 +258,11 @@ def _flatten_backend_bill_context(payload: dict) -> dict:
         "sync_id": ("Sync_ID",),
     }
     for canonical, source_names in aliases.items():
+        if isinstance(bill, dict):
+            for source_name in source_names:
+                if bill.get(source_name) not in (None, "") and bill.get(canonical) in (None, ""):
+                    context[canonical] = bill[source_name]
+                    break
         if context.get(canonical) not in (None, ""):
             continue
         for source_name in source_names:
@@ -654,6 +666,12 @@ class LocalSyncStore:
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         raise NotImplementedError
 
+    def cache_consumer_context(self, consumer_id: int, context: dict) -> None:
+        raise NotImplementedError
+
+    def load_cached_consumer_context(self, consumer_id: int) -> dict:
+        raise NotImplementedError
+
     def enqueue_operation(
         self,
         operation: str,
@@ -891,6 +909,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             membership_fee REAL NOT NULL DEFAULT 0,
             previous_reading INTEGER,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS handheld_consumer_context_cache (
+            consumer_id INTEGER PRIMARY KEY,
+            context_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS local_billing_reference_reservations (
@@ -1153,13 +1177,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             billing_month = COALESCE(NULLIF(TRIM(excluded.billing_month), ''), handheld_consumers_cache.billing_month),
             date_covered_from = COALESCE(NULLIF(TRIM(excluded.date_covered_from), ''), handheld_consumers_cache.date_covered_from),
             date_covered_to = COALESCE(NULLIF(TRIM(excluded.date_covered_to), ''), handheld_consumers_cache.date_covered_to),
-            amount_due = excluded.amount_due,
-            previous_balance = excluded.previous_balance,
+            amount_due = COALESCE(excluded.amount_due, handheld_consumers_cache.amount_due),
+            previous_balance = COALESCE(excluded.previous_balance, handheld_consumers_cache.previous_balance),
             due_date = COALESCE(NULLIF(TRIM(excluded.due_date), ''), handheld_consumers_cache.due_date),
-            penalty = excluded.penalty,
-            previous_penalty = excluded.previous_penalty,
-            total_after_due_date = excluded.total_after_due_date,
-            bill_status = excluded.bill_status,
+            penalty = COALESCE(excluded.penalty, handheld_consumers_cache.penalty),
+            previous_penalty = COALESCE(excluded.previous_penalty, handheld_consumers_cache.previous_penalty),
+            total_after_due_date = COALESCE(excluded.total_after_due_date, handheld_consumers_cache.total_after_due_date),
+            bill_status = COALESCE(excluded.bill_status, handheld_consumers_cache.bill_status),
             late_fee = COALESCE(excluded.late_fee, handheld_consumers_cache.late_fee),
             penalty_rate = COALESCE(excluded.penalty_rate, handheld_consumers_cache.penalty_rate),
             setting_id = COALESCE(excluded.setting_id, handheld_consumers_cache.setting_id),
@@ -1237,7 +1261,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                hc.water_meter_fee, hc.connection_fee, hc.membership_fee, hc.previous_reading,
                ha.schedule_id, ha.assignment_order, ha.reading_route_id,
                ha.schedule_date, ha.schedule_due_date,
-               COALESCE(ha.schedule_payment_due_date, rs.payment_due_date) AS schedule_payment_due_date,
+               COALESCE(NULLIF(rs.payment_due_date, ''), ha.schedule_payment_due_date) AS schedule_payment_due_date,
                ha.billing_cycle,
                ha.is_read, ha.reading_status, ha.reading_sync_status
         FROM handheld_consumers_cache hc
@@ -1252,6 +1276,46 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         with self._connect() as conn:
             rows = conn.execute(base, params).fetchall()
         return sorted((dict(row) for row in rows), key=_cached_assignment_sort_key)
+
+    def cache_consumer_context(self, consumer_id: int, context: dict) -> None:
+        """Keep API-provided bill, payment and reading records for offline use."""
+        incoming = {key: context[key] for key in CONTEXT_RECORD_KEYS if key in context}
+        if not incoming:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT context_json FROM handheld_consumer_context_cache WHERE consumer_id=?",
+                (int(consumer_id),),
+            ).fetchone()
+            try:
+                existing = json.loads(row["context_json"]) if row else {}
+            except (TypeError, ValueError):
+                existing = {}
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(incoming)
+            conn.execute(
+                """INSERT INTO handheld_consumer_context_cache (consumer_id, context_json)
+                   VALUES (?, ?)
+                   ON CONFLICT(consumer_id) DO UPDATE SET
+                     context_json=excluded.context_json, fetched_at=CURRENT_TIMESTAMP""",
+                (int(consumer_id), json.dumps(existing, default=str)),
+            )
+            conn.commit()
+
+    def load_cached_consumer_context(self, consumer_id: int) -> dict:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT context_json FROM handheld_consumer_context_cache WHERE consumer_id=?",
+                (int(consumer_id),),
+            ).fetchone()
+        if not row:
+            return {}
+        try:
+            value = json.loads(row["context_json"])
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def get_or_create_bill_reservation(
         self,
@@ -1835,6 +1899,7 @@ class HandheldSyncDataAccess:
         self.remote = remote_store
         self.operation_lock = threading.RLock()
         self._worker_lock = threading.Lock()
+        self._context_prefetch_lock = threading.Lock()
         self._runtime_audit: list[dict] = []
         self.last_pre_reservation_result = {
             "ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": [],
@@ -1868,34 +1933,75 @@ class HandheldSyncDataAccess:
     def is_online(self) -> bool:
         return bool(self.remote and self.remote.is_online())
 
+    def _cache_remote_consumer_context(self, consumer_id: int, context: dict) -> dict:
+        context = _flatten_backend_bill_context(context)
+        cached = next(
+            (row for row in self.local.load_cached_consumers(None)
+             if _safe_int(row.get("id"), None) == int(consumer_id)),
+            {},
+        )
+        refreshed = {**cached, **context, "id": int(consumer_id)}
+        self.local.cache_consumers([refreshed])
+        self.local.cache_consumer_context(int(consumer_id), context)
+        return refreshed
+
     def getConsumerContext(self, consumer_id: int) -> dict:
         if self.is_online():
             try:
                 context = self.remote.get_consumer_context(int(consumer_id))
                 if context:
-                    context = _flatten_backend_bill_context(context)
-                    cached = next(
-                        (row for row in self.local.load_cached_consumers(None)
-                         if _safe_int(row.get("id"), None) == int(consumer_id)),
-                        {},
-                    )
-                    refreshed = {**cached, **context, "id": int(consumer_id)}
-                    self.local.cache_consumers([refreshed])
-                    return refreshed
+                    return self._cache_remote_consumer_context(int(consumer_id), context)
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"Backend API context lookup failed: {exc}")
         for row in self.local.load_cached_consumers(None):
             try:
                 if int(row.get("id")) == int(consumer_id):
-                    return row
+                    return {**row, **self.local.load_cached_consumer_context(int(consumer_id))}
             except (TypeError, ValueError):
                 continue
         return {}
 
+    def prefetchAssignedConsumerContexts(self, consumers: list[dict]) -> dict:
+        """Cache detailed API records before an assignment is marked offline-ready."""
+        result = {"requested": 0, "refreshed": 0, "failed": 0, "skipped": False}
+        if not self.is_online():
+            result["skipped"] = True
+            return result
+        self._context_prefetch_lock.acquire()
+        try:
+            ids = sorted({
+                int(value) for item in consumers if isinstance(item, dict)
+                for value in (item.get("id") or item.get("consumer_id"),)
+                if value not in (None, "") and str(value).isdigit()
+            })
+            if not ids:
+                return result
+            result["requested"] = len(ids)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(self.remote.get_consumer_context, consumer_id): consumer_id for consumer_id in ids}
+                for future in as_completed(futures):
+                    try:
+                        context = future.result()
+                        if context:
+                            self._cache_remote_consumer_context(futures[future], context)
+                            result["refreshed"] += 1
+                        else:
+                            result["failed"] += 1
+                    except Exception as exc:
+                        result["failed"] += 1
+                        self.local.log_audit(None, "failed", f"Consumer context refresh failed: {exc}")
+        finally:
+            self._context_prefetch_lock.release()
+        self.local.log_audit(
+            None, "success" if not result["failed"] else "failed",
+            "Refreshed assigned consumer records", result,
+        )
+        return result
+
     def _cache_confirmed_bill(self, reading: dict, response: dict) -> None:
         """Mirror the backend's confirmed calculation without affecting sync success."""
         bill = response.get("bill") if isinstance(response, dict) else None
-        if not isinstance(bill, dict) or bill.get("amount_due") in (None, ""):
+        if not isinstance(bill, dict) or not bill:
             return
         try:
             consumer_id = int(reading["consumer_id"])
@@ -1904,7 +2010,7 @@ class HandheldSyncDataAccess:
                  if _safe_int(row.get("id"), None) == consumer_id),
                 {},
             )
-            snapshot = {**cached, **reading, **bill, "id": consumer_id}
+            snapshot = {**cached, **reading, **_flatten_backend_bill_context({"bill": bill}), "id": consumer_id}
             # A bill-cache update must not rewrite assignment completion state.
             snapshot.pop("schedule_id", None)
             snapshot.pop("Schedule_ID", None)
@@ -1921,6 +2027,10 @@ class HandheldSyncDataAccess:
             if bill.get("status") not in (None, ""):
                 snapshot["bill_status"] = bill["status"]
             self.local.cache_consumers([snapshot])
+            context_update = {"bill": bill}
+            if policy:
+                context_update["billing_policy"] = policy
+            self.local.cache_consumer_context(consumer_id, context_update)
         except Exception as exc:
             self.local.log_audit(None, "failed", f"Could not cache confirmed backend bill: {exc}")
 

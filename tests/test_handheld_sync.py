@@ -32,6 +32,7 @@ class FakeLocalStore:
         self.queue = []
         self.audit = []
         self.cached = []
+        self.contexts = {}
         self.cached_schedules = []
         self.cached_schedule_reader_id = None
         self.cached_schedule_range = (None, None)
@@ -52,6 +53,12 @@ class FakeLocalStore:
         if not zone_name:
             return list(self.cached)
         return [c for c in self.cached if c.get("zone_name") == zone_name]
+
+    def cache_consumer_context(self, consumer_id, context):
+        self.contexts[int(consumer_id)] = {**self.contexts.get(int(consumer_id), {}), **context}
+
+    def load_cached_consumer_context(self, consumer_id):
+        return dict(self.contexts.get(int(consumer_id), {}))
 
     @staticmethod
     def _combined_status(backend_status):

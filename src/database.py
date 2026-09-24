@@ -849,6 +849,28 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_schedule_payment_due_date(schedule_id: int | str | None) -> str | None:
+    """Return the latest cached date for this exact schedule, or None if absent."""
+    try:
+        linked_id = int(schedule_id)
+    except (TypeError, ValueError):
+        return None
+    conn = get_connection()
+    try:
+        try:
+            row = conn.execute(
+                "SELECT payment_due_date FROM reading_schedule WHERE schedule_id=?",
+                (linked_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower() and "no such table" not in str(exc).lower():
+                raise
+            return None
+        return str(row["payment_due_date"] or "") if row else None
+    finally:
+        conn.close()
+
+
 def mark_route_cache_verified(
     schedule_id: int | str,
     meter_reader_id: int | str,
@@ -886,12 +908,14 @@ def _attach_assignment_context(conn: sqlite3.Connection, item: dict, schedule_id
         return item
     assignment = conn.execute(
         """
-        SELECT schedule_id, consumer_id, schedule_date, schedule_due_date,
-               schedule_payment_due_date, billing_cycle,
-               zone_name, acct_no, assignment_order, reading_route_id,
-               is_read, reading_status, reading_sync_status
-        FROM reading_assignment
-        WHERE schedule_id = ? AND consumer_id = ?
+        SELECT ra.schedule_id, ra.consumer_id, ra.schedule_date, ra.schedule_due_date,
+               COALESCE(NULLIF(rs.payment_due_date, ''), ra.schedule_payment_due_date) AS schedule_payment_due_date,
+               ra.billing_cycle,
+               ra.zone_name, ra.acct_no, ra.assignment_order, ra.reading_route_id,
+               ra.is_read, ra.reading_status, ra.reading_sync_status
+        FROM reading_assignment ra
+        LEFT JOIN reading_schedule rs ON rs.schedule_id = ra.schedule_id
+        WHERE ra.schedule_id = ? AND ra.consumer_id = ?
         LIMIT 1
         """,
         (schedule_id, int(item.get("id") or item.get("consumer_id"))),
@@ -1657,13 +1681,15 @@ def get_zone_consumers_with_status(
             c.total_after_due_date, c.bill_status, c.late_fee,
             c.water_meter_fee, c.connection_fee, c.membership_fee,
             ra.schedule_id, ra.schedule_date, ra.schedule_due_date,
-            ra.schedule_payment_due_date, ra.billing_cycle,
+            COALESCE(NULLIF(rs.payment_due_date, ''), ra.schedule_payment_due_date) AS schedule_payment_due_date,
+            ra.billing_cycle,
             ra.assignment_order, ra.reading_route_id,
             ra.zone_name, ra.is_read, ra.reading_status, ra.reading_sync_status,
             r.present_reading AS reading_value, r.consumption, r.reading_date,
             r.exception, r.is_flagged, r.captured_at
         FROM reading_assignment ra
         JOIN consumers c ON c.id = ra.consumer_id
+        LEFT JOIN reading_schedule rs ON rs.schedule_id = ra.schedule_id
         LEFT JOIN readings r ON r.id = (
             SELECT MAX(r2.id) FROM readings r2
             WHERE r2.consumer_id = ra.consumer_id AND r2.schedule_id = ra.schedule_id
@@ -2025,13 +2051,13 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     billing_month = COALESCE(NULLIF(TRIM(excluded.billing_month), ''), consumers.billing_month),
                     date_covered_from = COALESCE(NULLIF(TRIM(excluded.date_covered_from), ''), consumers.date_covered_from),
                     date_covered_to = COALESCE(NULLIF(TRIM(excluded.date_covered_to), ''), consumers.date_covered_to),
-                    amount_due = excluded.amount_due,
-                    previous_balance = excluded.previous_balance,
+                    amount_due = COALESCE(excluded.amount_due, consumers.amount_due),
+                    previous_balance = COALESCE(excluded.previous_balance, consumers.previous_balance),
                     due_date = COALESCE(NULLIF(TRIM(excluded.due_date), ''), consumers.due_date),
-                    penalty = excluded.penalty,
-                    previous_penalty = excluded.previous_penalty,
-                    total_after_due_date = excluded.total_after_due_date,
-                    bill_status = excluded.bill_status,
+                    penalty = COALESCE(excluded.penalty, consumers.penalty),
+                    previous_penalty = COALESCE(excluded.previous_penalty, consumers.previous_penalty),
+                    total_after_due_date = COALESCE(excluded.total_after_due_date, consumers.total_after_due_date),
+                    bill_status = COALESCE(excluded.bill_status, consumers.bill_status),
                     late_fee = COALESCE(excluded.late_fee, consumers.late_fee),
                     water_meter_fee = excluded.water_meter_fee,
                     connection_fee = excluded.connection_fee,
@@ -2218,8 +2244,8 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     (
                         schedule_row["schedule_id"], local_consumer_id, schedule_row["schedule_date"],
                         schedule_row["schedule_due_date"],
-                        _normalize_schedule_date(c.get("schedule_payment_due_date") or c.get("Schedule_Payment_Due_Date"))
-                        or schedule_row["schedule_payment_due_date"],
+                        schedule_row["schedule_payment_due_date"]
+                        or _normalize_schedule_date(c.get("schedule_payment_due_date") or c.get("Schedule_Payment_Due_Date")),
                         c.get("billing_cycle") or schedule_row["billing_month"], schedule_row["zone_name"],
                         acct_no, assignment_order, reading_route_id,
                         1 if remote_is_read else 0, assignment_status, remote_sync,

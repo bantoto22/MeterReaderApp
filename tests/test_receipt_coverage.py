@@ -25,6 +25,36 @@ class ReceiptCoverageTests(unittest.TestCase):
             "schedule_date": "2026-08-27", "schedule_due_date": "2026-09-01",
         }
 
+    def test_unissued_preview_uses_receipt_layout_without_old_bill_totals(self):
+        old_bill_context = dict(
+            self.consumer, amount_due=500, total_after_due_date=550,
+            previous_balance=300, penalty=50, due_date="2026-09-01",
+            water_charge=250, billing_reference="SLR2026000125",
+        )
+        preview = build_receipt_text(
+            old_bill_context, 5, 7, "None", "Juan Dela Cruz",
+            reading_date="2026-09-17", pending_server_calculation=True,
+            proposed_due_date="2026-10-12",
+        )
+        issued = build_receipt_text(
+            apply_authoritative_bill(old_bill_context, {
+                "amount_due": 145, "total_after_due_date": 155,
+                "previous_balance": 20, "previous_penalty": 5,
+                "penalty": 10, "water_charge": 120,
+                "due_date": "2026-10-12",
+            }), 5, 7, "None", "Juan Dela Cruz", reading_date="2026-09-17",
+        )
+        for label in ("Coverage", "Current Bill", "Previous", "TOTAL DUE", "AFTER DUE", "Due Date", "Reading Date"):
+            self.assertIn(label, preview)
+            self.assertIn(label, issued)
+        self.assertIn("Current Bill   : PHP   100.00", preview)
+        self.assertIn("Due Date       : 2026-10-12", preview)
+        self.assertIn("(pending", preview)
+        self.assertNotIn("Schedule End Date", preview)
+        self.assertNotIn("PHP   500.00", preview)
+        self.assertNotIn("PHP   550.00", preview)
+        self.assertNotIn("PHP   300.00", preview)
+
     def test_late_reading_uses_meter_reading_dates_in_bill_receipt_and_reprint(self):
         bill = _build_bill_payload(self.reading, self.consumer, 99, as_of_date=date(2026, 9, 17))
         self.assertEqual(bill["date_covered_from"], "2026-08-20 00:00:00")
@@ -35,7 +65,7 @@ class ReceiptCoverageTests(unittest.TestCase):
         )
         expected = "Coverage       : 2026-08-20 to\n                  2026-09-17"
         self.assertIn(expected, receipt)
-        self.assertIn("Date           : 2026-09-17", receipt)
+        self.assertIn("Reading Date   : 2026-09-17", receipt)
         self.assertIn(expected, build_reprint_receipt_text(receipt))
 
     def test_reading_dates_override_schedule_and_backend_bill_dates(self):
@@ -129,8 +159,8 @@ class ReceiptCoverageTests(unittest.TestCase):
             _sync_dal=SimpleNamespace(prepareBillingReference=reserve),
         )
         bridge._default_due_date_for_consumer = lambda consumer, reading_date: (
-            date.fromisoformat(reading_date) + timedelta(days=int(consumer["due_days"]))
-        ).isoformat()
+            AppBridge._default_due_date_for_consumer(bridge, consumer, reading_date)
+        )
         job = AppBridge._build_pending_receipt_job(bridge)
         self.assertEqual(job["schedule_id"], 538)
         self.assertEqual(job["schedule_date"], "2026-08-27")
@@ -139,14 +169,15 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual(job["bill_date"], job["reading_date"])
         self.assertIsNone(job["due_date"])
         self.assertNotIn("due_date", reservations[0][2])
-        self.assertIn("Pending server calculation", job["receipt_text"])
+        self.assertIn("Pending server\n                  calculation", job["receipt_text"])
         self.assertEqual(job["previous_reading_date"], "2026-08-20")
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")
-        self.assertIn("Reading Date: " + job["reading_date"], job["receipt_text"])
-        self.assertIn("Schedule End Date: 2026-09-01", job["receipt_text"])
-        self.assertIn("Officer Payment Date: 2026-10-12 (unissued)", job["receipt_text"])
+        self.assertIn("Reading Date   : " + job["reading_date"], job["receipt_text"])
+        self.assertIn("Coverage       : 2026-08-20 to", job["receipt_text"])
+        self.assertNotIn("Schedule End Date", job["receipt_text"])
+        self.assertIn("Due Date       : 2026-10-12", job["receipt_text"])
+        self.assertIn("(pending", job["receipt_text"])
         self.assertNotEqual(job["schedule_due_date"], job["schedule_payment_due_date"])
-        self.assertNotIn("Due Date", job["receipt_text"])
         # Saving updates the consumer's latest date; the queue must keep the
         # previous date captured when this receipt was prepared.
         bridge._consumer = dict(self.consumer, latest_reading_date=job["reading_date"])

@@ -66,6 +66,10 @@ def _money_line(label: str, value: float) -> str:
     return _field_line(label, f"PHP {value:>8.2f}")
 
 
+def _server_money_line(label: str, value: float | None) -> str:
+    return _money_line(label, value) if value is not None else _field_line(label, "Pending server calculation")
+
+
 def _percent_line(label: str, value: float) -> str:
     return _field_line(label, f"{value:>8.2f}%")
 
@@ -165,9 +169,11 @@ def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
     return f"{start_value} to {reference_date.isoformat()}"
 
 
-def _previous_bill_text(previous: float, carried_previous_bill: float) -> str:
+def _previous_bill_text(previous: float, carried_previous_bill: float | None) -> str:
     if previous <= 0:
         return "None"
+    if carried_previous_bill is None:
+        return "Pending server calculation"
     return f"PHP {carried_previous_bill:.2f}"
 
 
@@ -264,6 +270,16 @@ def _optional_money(consumer: dict, field_name: str) -> float:
         return 0.0
 
 
+def _known_money(consumer: dict, field_name: str) -> float | None:
+    value = consumer.get(field_name)
+    if value in (None, ""):
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 _FEE_ALIASES = {
     "water_meter_fee": ("water_meter_fee", "meter_maintenance_fee", "meter_fee"),
     "connection_fee": ("connection_fee",),
@@ -331,10 +347,11 @@ def apply_authoritative_bill(consumer: dict, bill: dict) -> dict:
     """Overlay a backend-calculated bill onto consumer display metadata."""
     normalized_bill = dict(bill)
     aliases = {
-        "amount_due": ("Amount_Due",),
+        "amount_due": ("Amount_Due", "total_amount", "bill_amount"),
+        "previous_balance": ("Previous_Balance",),
         "penalty": ("Penalty", "Penalties"),
         "previous_penalty": ("Previous_Penalty",),
-        "total_after_due_date": ("Total_After_Due_Date",),
+        "total_after_due_date": ("Total_After_Due_Date", "amount_after_due_date", "pay_through"),
         "overdue_penalty": ("Overdue_Penalty",),
         "late_fee": ("Late_Fee_Percentage", "Late_Fee"),
         "is_overdue": ("Is_Overdue",),
@@ -353,6 +370,11 @@ def apply_authoritative_bill(consumer: dict, bill: dict) -> dict:
                 break
     snapshot = dict(consumer)
     snapshot.update(normalized_bill)
+    # An older consumer snapshot may describe a different bill. Missing totals
+    # on this response must never make that earlier bill look like this one.
+    for field_name in ("amount_due", "penalty", "total_after_due_date"):
+        if normalized_bill.get(field_name) in (None, ""):
+            snapshot[field_name] = None
     if normalized_bill.get("status") not in (None, ""):
         snapshot["bill_status"] = normalized_bill["status"]
     snapshot["_authoritative_bill"] = True
@@ -392,10 +414,12 @@ def build_receipt_text(
     reader_name: str = "",
     reading_date: str | datetime.date | None = None,
     as_of_date: datetime.date | None = None,
+    pending_server_calculation: bool = False,
+    proposed_due_date: str | None = None,
 ) -> str:
     reader_name = reader_display_name({"full_name": reader_name})
     consumption = present - previous
-    authoritative = bool(consumer.get("_authoritative_bill"))
+    authoritative = bool(consumer.get("_authoritative_bill")) or pending_server_calculation
     if authoritative:
         minimum_cubic = int(_optional_money(consumer, "minimum_cubic"))
         minimum_rate = _optional_money(consumer, "minimum_rate")
@@ -409,7 +433,14 @@ def build_receipt_text(
     membership_fee = _consumer_fee(consumer, "membership_fee")
     concessionaire_fees = round(water_meter_fee + connection_fee + membership_fee, 2)
     current_bill = calculated_current_bill
-    if authoritative:
+    if pending_server_calculation:
+        # The base charge can be previewed from synced tariff data. A prior
+        # issued bill's charge must not be reused for this reading.
+        try:
+            current_bill = _compute_bill(consumption, consumer)[0]
+        except (TypeError, ValueError):
+            current_bill = None
+    elif authoritative:
         for field_name in ("water_charge", "class_cost"):
             if consumer.get(field_name) not in (None, ""):
                 current_bill = _optional_money(consumer, field_name)
@@ -427,27 +458,39 @@ def build_receipt_text(
     date_str = reference_date.isoformat()
     time_str = now.strftime("%I:%M %p")
     due_days = policy_due_days(consumer.get("due_days"))
-    if authoritative:
-        carried_previous_bill = _optional_money(consumer, "previous_balance")
-        previous_penalty = _optional_money(consumer, "previous_penalty")
+    if pending_server_calculation:
+        carried_previous_bill = None
+        previous_penalty = None
+        previous_bill_status = "Pending server calculation"
+    elif authoritative:
+        carried_previous_bill = _known_money(consumer, "previous_balance")
+        previous_penalty = _known_money(consumer, "previous_penalty")
         previous_bill_status = str(consumer.get("bill_status") or "Unpaid")
     else:
         carried_previous_bill, previous_penalty, previous_bill_status = _carried_previous_bill(consumer)
-    calculated_amount_due = round(
-        current_bill + concessionaire_fees + carried_previous_bill + previous_penalty,
-        2,
+    calculated_amount_due = (
+        None if authoritative else round(
+            current_bill + concessionaire_fees + carried_previous_bill + previous_penalty, 2
+        )
     )
-    amount_due = _optional_money(consumer, "amount_due") if authoritative else calculated_amount_due
-    due_date_value = consumer.get("due_date")
+    amount_due = None if pending_server_calculation else (
+        _known_money(consumer, "amount_due") if authoritative else calculated_amount_due
+    )
+    due_date_value = None if pending_server_calculation else consumer.get("due_date")
     due_date_obj = _parse_date(due_date_value) if due_date_value not in (None, "") else (
         None if authoritative else payment_due_date(reference_date, due_days)
     )
     due_date = due_date_obj.isoformat() if due_date_obj else "Pending server calculation"
-    # Recompute every time the receipt is built. Stored zero values become stale
-    # when a bill crosses its due date while the handheld is offline.
-    if authoritative:
-        penalty = _optional_money(consumer, "penalty")
-        after_due = _optional_money(consumer, "total_after_due_date")
+    if pending_server_calculation and proposed_due_date:
+        due_date = f"{proposed_due_date} (pending server)"
+    # Issued bill penalties and totals come from the server snapshot. The
+    # legacy local calculation remains only for non-authoritative previews.
+    if pending_server_calculation:
+        penalty = None
+        after_due = None
+    elif authoritative:
+        penalty = _known_money(consumer, "penalty")
+        after_due = _known_money(consumer, "total_after_due_date")
     else:
         penalty, after_due, _, _ = _calculate_penalty(
             consumer, current_bill, amount_due, due_date_obj, penalty_date
@@ -498,19 +541,19 @@ def build_receipt_text(
         _field_line("Min Cubic", minimum_cubic),
         _money_line("Min Rate", minimum_rate),
         _money_line("Excess Rate", excess_rate),
-        _money_line("Current Bill", current_bill),
+        _server_money_line("Current Bill", current_bill),
         _money_line("Water Meter Fee", water_meter_fee),
         _money_line("Connection Fee", connection_fee),
         _money_line("Membership Fee", membership_fee),
-        _money_line(f"Due Pen({late_fee_percent:g}%)", penalty),
-        _money_line("Previous", carried_previous_bill),
-        _money_line(f"Prev Pen({late_fee_percent:g}%)", previous_penalty),
+        _server_money_line(f"Due Pen({late_fee_percent:g}%)", penalty),
+        _server_money_line("Previous", carried_previous_bill),
+        _server_money_line(f"Prev Pen({late_fee_percent:g}%)", previous_penalty),
         border,
-        _money_line("TOTAL DUE", amount_due),
-        _money_line("AFTER DUE", after_due),
+        _server_money_line("TOTAL DUE", amount_due),
+        _server_money_line("AFTER DUE", after_due),
         _field_line("Due Date", due_date),
         border,
-        _field_line("Date", date_str),
+        _field_line("Reading Date", date_str),
         _field_line("Time", time_str),
         _field_line("Reader", reader_name) if reader_name else f" {'Reader':<{LABEL_WIDTH}}:",
         divider,

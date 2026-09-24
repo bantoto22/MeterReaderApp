@@ -73,6 +73,7 @@ try:
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_assigned_routes,
+        get_schedule_payment_due_date,
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
@@ -102,6 +103,7 @@ except ImportError:
         clear_current_meter_reader,
         get_receipt_print_by_id,
         get_assigned_routes,
+        get_schedule_payment_due_date,
         get_all_zone_names,
         get_app_setting,
         get_current_meter_reader,
@@ -1100,9 +1102,11 @@ class AppBridge(QObject):
                     str(item.get("zone_name") or "").strip()
                     for item in consumers if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
                 })
+                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers)
                 self.assignedDatasetFinished.emit({
                     "success": True, "pulled": len(consumers), "mirrored": mirrored,
                     "zone": zone_name, "pulled_zones": pulled_zones,
+                    "context_pull": context_pull,
                 })
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
@@ -1699,6 +1703,13 @@ class AppBridge(QObject):
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
         self.update_stats()
+        consumer = getattr(self, "_consumer", None)
+        if consumer and not getattr(self, "_due_date_confirmed", False):
+            latest_payment_date = AppBridge._default_due_date_for_consumer(self, consumer)
+            if latest_payment_date != getattr(self, "_due_date", ""):
+                consumer["schedule_payment_due_date"] = latest_payment_date or None
+                self._due_date = latest_payment_date
+                self.dueDateChanged.emit()
 
     def _mirror_assigned_schedules(self, date_from: str, date_to: str) -> int:
         if not self._sync_dal or not self._meter_reader_account_id:
@@ -1752,6 +1763,7 @@ class AppBridge(QObject):
                         if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
                     }
                 )
+                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers)
                 self.assignedDatasetFinished.emit(
                     {
                         "success": True,
@@ -1759,6 +1771,7 @@ class AppBridge(QObject):
                         "mirrored": mirrored,
                         "schedules": schedule_count,
                         "pulled_zones": pulled_zones,
+                        "context_pull": context_pull,
                     }
                 )
             except Exception as exc:
@@ -1806,11 +1819,19 @@ class AppBridge(QObject):
                 pulled_zones = [zone_name]
             self._verify_cached_routes(pulled_zones)
             if pulled_zones:
+                context_pull = result.get("context_pull") or {}
+                context_status = (
+                    "Offline cache used" if context_pull.get("skipped") else
+                    f"Consumer records cached: {context_pull.get('refreshed', 0)}/{context_pull.get('requested', 0)}"
+                )
+                if context_pull.get("failed"):
+                    context_status += "\nSome records are missing. Reconnect and sync again before offline work."
                 self._sync_logs = (
                     f"Assigned consumers refreshed.\n"
                     f"Pulled: {self._last_pull_count}\n"
                     f"Mirrored: {self._last_pull_mirror}\n"
-                    f"Zones: {', '.join(str(zone) for zone in pulled_zones)}"
+                    f"Zones: {', '.join(str(zone) for zone in pulled_zones)}\n"
+                    f"{context_status}"
                 )
                 self.syncLogsChanged.emit()
             self.lastPullCountChanged.emit()
@@ -1862,7 +1883,7 @@ class AppBridge(QObject):
         selected_assignment = {
             key: self._consumer.get(key)
             for key in (
-                "schedule_id", "schedule_date", "schedule_due_date", "schedule_payment_due_date", "billing_cycle",
+                "schedule_id", "schedule_date", "schedule_due_date", "billing_cycle",
                 "reading_route_id", "assignment_order", "zone_name",
             )
             if self._consumer.get(key) not in (None, "")
@@ -1879,10 +1900,15 @@ class AppBridge(QObject):
         current = dict(self._consumer or {})
         current.update(refreshed)
         current.update(selected_assignment)
+        current["schedule_payment_due_date"] = AppBridge._default_due_date_for_consumer(self, current) or None
         for key, value in selected_policy.items():
             if refreshed.get(key) in (None, ""):
                 current[key] = value
         self._consumer = current
+        if not getattr(self, "_due_date_confirmed", False):
+            self._due_date = current.get("schedule_payment_due_date") or ""
+            if hasattr(self, "dueDateChanged"):
+                self.dueDateChanged.emit()
 
     @Slot(bool)
     def setAutoSyncEnabled(self, enabled: bool) -> None:
@@ -1937,7 +1963,16 @@ class AppBridge(QObject):
         # This form creates a new bill. A previous bill's due date cannot be
         # presented as the payment deadline for the new reading.
         source = consumer or self._consumer or {}
-        return _normalize_iso_date(source.get("schedule_payment_due_date")) or ""
+        linked_date = get_schedule_payment_due_date(source.get("schedule_id"))
+        if linked_date is not None:
+            return _normalize_iso_date(linked_date) or ""
+        schedule_for_consumer = getattr(self, "_schedule_for_consumer", None)
+        schedule = schedule_for_consumer(source) if schedule_for_consumer else {}
+        return (
+            _normalize_iso_date(source.get("schedule_payment_due_date"))
+            or _normalize_iso_date(schedule.get("paymentDueDate"))
+            or ""
+        )
 
     def _load_consumer_for_new_bill(self, consumer: dict) -> None:
         self._consumer = consumer
@@ -2043,10 +2078,7 @@ class AppBridge(QObject):
             or _normalize_iso_date(route.get("dueDate"))
             or effective_schedule_date
         )
-        schedule_payment_due_date = (
-            _normalize_iso_date(consumer.get("schedule_payment_due_date"))
-            or _normalize_iso_date(schedule.get("paymentDueDate"))
-        )
+        schedule_payment_due_date = self._default_due_date_for_consumer(consumer, effective_reading_date)
         payload = {
             "reading_id": sync_reading_id or str(uuid.uuid4()),
             "consumer_id": consumer_id,
@@ -2607,10 +2639,7 @@ class AppBridge(QObject):
             raise RuntimeError("This consumer's assigned schedule is unavailable. Sync assignments before billing.")
         schedule_date = str(schedule.get("startDate") or route.get("startDate") or self.selectedBillingDate)
         schedule_due_date = str(schedule.get("dueDate") or route.get("dueDate") or schedule_date)
-        schedule_payment_due_date = (
-            _normalize_iso_date(self._consumer.get("schedule_payment_due_date"))
-            or _normalize_iso_date(schedule.get("paymentDueDate"))
-        )
+        schedule_payment_due_date = self._default_due_date_for_consumer(self._consumer, reading_date)
         billing_cycle = str(schedule.get("billingMonth") or route.get("billingMonth") or self._consumer.get("billing_month") or "")
         if not self._sync_dal:
             raise RuntimeError("The local billing-reference store is unavailable.")
@@ -2636,14 +2665,10 @@ class AppBridge(QObject):
         consumer_snapshot["schedule_due_date"] = schedule_due_date
         consumer_snapshot["schedule_payment_due_date"] = schedule_payment_due_date
         flagged = consumption > 500 or exception != "None"
-        receipt = (
-            f"Reading Preview\nAccount: {consumer_snapshot.get('acct_no') or self._consumer['id']}\n"
-            f"Consumer: {consumer_snapshot.get('name') or ''}\n"
-            f"Reading Date: {reading_date}\nPrevious: {_format_reading(previous)}\n"
-            f"Present: {_format_reading(present)}\nConsumption: {_format_reading(consumption)} m3\n"
-            f"Schedule End Date: {schedule_due_date}\n"
-            + (f"Officer Payment Date: {schedule_payment_due_date} (unissued)\n" if schedule_payment_due_date else "")
-            + "\nPending server calculation"
+        receipt = build_receipt_text(
+            consumer_snapshot, previous, present, exception, self._reader_name,
+            reading_date=reading_date, pending_server_calculation=True,
+            proposed_due_date=schedule_payment_due_date,
         )
         return {
             "job_type": "original",
@@ -2718,7 +2743,7 @@ class AppBridge(QObject):
         if not isinstance(job, dict):
             self.alertRequested.emit("Save Failed", "The prepared bill response was invalid.")
             return
-        self._open_print_preview("Reading Preview", job["receipt_text"], "Save Reading", job)
+        self._open_print_preview("Receipt Preview", job["receipt_text"], "Save Reading", job)
         self.update_stats()
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -2743,7 +2768,7 @@ class AppBridge(QObject):
         snapshot = apply_authoritative_bill({**context, **entry}, bill)
         reading_date = next(
             (line.split(":", 1)[1].strip() for line in original.splitlines()
-             if line.strip().startswith("Date") and ":" in line),
+             if line.strip().startswith(("Reading Date", "Date")) and ":" in line),
             None,
         )
         try:
@@ -2946,7 +2971,13 @@ class AppBridge(QObject):
                                 "consumption": consumption, "exception": exception,
                             })
                             return
-                        consumer = apply_authoritative_bill(consumer, authoritative_bill)
+                        try:
+                            fresh_context = self._sync_dal.getConsumerContext(int(job["consumer_id"]))
+                        except Exception:
+                            fresh_context = {}
+                        consumer = apply_authoritative_bill(
+                            {**consumer, **fresh_context}, authoritative_bill
+                        )
                         due_date = _normalize_iso_date(consumer.get("due_date"))
                         receipt_text = build_receipt_text(
                             consumer, previous, present, exception,
