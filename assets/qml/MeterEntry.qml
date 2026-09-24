@@ -375,7 +375,7 @@ Rectangle {
                         Text {
                             text: bridgeObj && bridgeObj.dueDateIsConfirmed
                                   ? "Bill Payment Due Date"
-                                  : "Officer Payment Date (unissued bill)"
+                                  : "Payment Due Date (device preview)"
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -386,7 +386,7 @@ Rectangle {
                             id: txtDueDate
                             property string keyboardMode: "numeric"
                             Layout.fillWidth: true
-                            placeholderText: "Pending server calculation"
+                            placeholderText: "Select a consumer to see the payment date"
                             text: bridgeObj ? bridgeObj.dueDate : ""
                             readOnly: true
                             font.pixelSize: TouchMetrics.bodyText
@@ -406,7 +406,7 @@ Rectangle {
                         Text {
                             text: bridgeObj && bridgeObj.dueDateIsConfirmed
                                   ? "Confirmed by the main system for this issued bill."
-                                  : "Set in the main system's reading schedule. The issued bill's due date is confirmed after sync."
+                                  : "Uses the linked schedule's payment date, or cached billing days when the schedule has none."
                             font.pixelSize: TouchMetrics.helperText
                             font.family: "Montserrat"
                             color: "#64748B"

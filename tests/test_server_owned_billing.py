@@ -2,6 +2,7 @@ import gc
 import os
 import tempfile
 import unittest
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,7 +11,10 @@ from src.handheld_sync import (
     BackendApiClient, HandheldSyncDataAccess, SQLiteLocalSyncStore, SyncConfig,
     _flatten_backend_bill_context,
 )
-from src.qt_hybrid_app import AppBridge
+from src.qt_hybrid_app import (
+    AppBridge, _cached_bill_for_reading, _display_consumer_context,
+    _use_local_bill_for_display,
+)
 from src.receipt import apply_authoritative_bill, build_receipt_text
 
 
@@ -50,6 +54,192 @@ class _Remote:
 
 
 class ServerOwnedBillingTests(unittest.TestCase):
+    def test_local_bill_from_device_survives_restart_and_fills_incomplete_server_bill(self):
+        local_bill = {
+            "sync_id": "bill-8", "consumer_id": 8, "schedule_id": 549,
+            "bill_date": "2026-09-25 00:00:00", "due_date": "2026-10-12 00:00:00",
+            "billing_reference": "SLR2026000125", "water_charge": 100,
+            "amount_due": 150, "total_after_due_date": 165,
+            "previous_balance": 50, "previous_penalty": 0,
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "local-bills.db")
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = path
+            store.ensure_schema()
+            dal = HandheldSyncDataAccess(store, None)
+            dal.cacheLocalBill(8, local_bill)
+            reopened = SQLiteLocalSyncStore(SyncConfig())
+            reopened._db_path = path
+            reopened.ensure_schema()
+            reopened.cache_consumer_context(8, {"bill": {
+                "sync_id": "bill-8", "bill_date": "2026-09-25",
+                "billing_reference": "SLR2026000125", "due_date": "2026-10-12",
+                "amount_due": 0, "total_after_due_date": 0, "status": "Unpaid",
+            }})
+            saved = reopened.load_cached_consumer_context(8)
+            reading = {"reading_date": "2026-09-25", "schedule_id": 549}
+            self.assertEqual(_cached_bill_for_reading(saved, reading), local_bill)
+            self.assertEqual(saved["local_bills"], [local_bill])
+            reopened.cache_consumer_context(8, {"bill": {
+                **saved["bill"], "amount_due": 148,
+                "total_after_due_date": 163, "water_charge": 98,
+            }})
+            self.assertEqual(_cached_bill_for_reading(
+                reopened.load_cached_consumer_context(8), reading,
+            )["amount_due"], 148)
+            del dal, store, reopened
+            gc.collect()
+
+    def test_next_offline_bill_carries_saved_local_bill_when_server_total_is_zero(self):
+        from src.handheld_sync import _build_bill_payload
+
+        bill = _build_bill_payload(
+            {"reading_id": "reading-new", "bill_sync_id": "bill-new",
+             "consumer_id": 8, "previous_reading": 5, "present_reading": 7,
+             "consumption": 2, "reading_date": "2026-10-20",
+             "schedule_payment_due_date": "2026-11-04"},
+            {"minimum_cubic": 10, "minimum_rate": 100,
+             "excess_rate_per_cubic": 15, "late_fee": 10,
+             "amount_due": 0, "bill_status": "Unpaid",
+             "local_bill": {"sync_id": "bill-old", "bill_date": "2026-09-25",
+                            "due_date": "2026-10-12", "water_charge": 100,
+                            "amount_due": 150, "previous_penalty": 0,
+                            "penalty_rate": 5, "status": "Unpaid"},
+             "bill": {"sync_id": "bill-old", "amount_due": 0, "status": "Unpaid"}},
+            0, as_of_date=date(2026, 10, 20),
+        )
+        self.assertEqual(bill["previous_balance"], 150)
+        self.assertEqual(bill["previous_penalty"], 5)
+        self.assertEqual(bill["amount_due"], 255)
+        self.assertEqual(bill["due_date"], "2026-11-04 00:00:00")
+
+    def test_reconnect_refreshes_assignments_without_pending_uploads(self):
+        view = SimpleNamespace(
+            _wifi_status="Status: Offline", _wifi_status_color="gray",
+            _auto_sync_enabled=True,
+            wifiStatusChanged=SimpleNamespace(emit=Mock()),
+            wifiStatusColorChanged=SimpleNamespace(emit=Mock()),
+            _start_heartbeat=Mock(), _start_reconnect_sync=Mock(),
+            _start_assigned_consumer_dataset_refresh=Mock(),
+        )
+        AppBridge._set_wifi_status(view, "Status: Connected to Wi-Fi", "green")
+        view._start_assigned_consumer_dataset_refresh.assert_called_once_with()
+
+    def test_local_receipt_fills_missing_or_zero_unpaid_server_totals(self):
+        local = {"amount_due": 150, "total_after_due_date": 165}
+        self.assertTrue(_use_local_bill_for_display(None, local))
+        self.assertTrue(_use_local_bill_for_display(
+            {"amount_due": 0, "total_after_due_date": 0, "status": "Unpaid"}, local,
+        ))
+        self.assertFalse(_use_local_bill_for_display(
+            {"amount_due": 150, "total_after_due_date": 165, "status": "Unpaid"}, local,
+        ))
+        self.assertFalse(_use_local_bill_for_display(
+            {"amount_due": 0, "total_after_due_date": 0, "status": "Paid"}, local,
+        ))
+
+    def test_display_uses_cached_context_without_network(self):
+        dal = SimpleNamespace(
+            getCachedConsumerContext=Mock(return_value={"amount_due": 120}),
+            getConsumerContext=Mock(side_effect=AssertionError("network request")),
+        )
+        self.assertEqual(_display_consumer_context(dal, 8)["amount_due"], 120)
+        dal.getCachedConsumerContext.assert_called_once_with(8)
+        dal.getConsumerContext.assert_not_called()
+
+    def test_reprint_keeps_local_amount_when_unpaid_server_bill_is_zero(self):
+        entry = {
+            "consumer_id": 8,
+            "receipt_text": "Billing Ref    : SLR2026000125\nTOTAL DUE      : PHP   150.00",
+        }
+        bridge = SimpleNamespace(
+            _sync_dal=SimpleNamespace(getCachedConsumerContext=lambda _id: {
+                "billing_reference": "SLR2026000125",
+                "bill": {"billing_reference": "SLR2026000125", "amount_due": 0,
+                         "total_after_due_date": 0, "status": "Unpaid"},
+            }),
+            _reader_name="Juan Dela Cruz",
+        )
+        self.assertEqual(AppBridge._refresh_saved_receipt_penalty(bridge, entry), entry["receipt_text"])
+
+    def test_context_history_keeps_newest_fifteen_across_restarts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "history.db")
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = path
+            store.ensure_schema()
+            store.cache_consumer_context(8, {"payments": [
+                {"id": number, "payment_date": f"2026-09-{number:02d}", "amount": number}
+                for number in range(1, 17)
+            ], "unpaid_bills": [{"id": 1}],
+                "account_records": {"adjustments": [{"id": 7, "amount": 3,
+                                                      "access_token": "private"}]},
+                "session_token": "must-not-be-cached"})
+            reopened = SQLiteLocalSyncStore(SyncConfig())
+            reopened._db_path = path
+            reopened.ensure_schema()
+            saved = reopened.load_cached_consumer_context(8)
+            self.assertEqual([row["id"] for row in saved["payments"]], list(range(2, 17)))
+            self.assertEqual(saved["account_records"]["adjustments"][0]["amount"], 3)
+            self.assertNotIn("access_token", saved["account_records"]["adjustments"][0])
+            self.assertNotIn("session_token", saved)
+            reopened.cache_consumer_context(8, {
+                "payments": [{"id": 17, "payment_date": "2026-09-17", "amount": 17}],
+                "unpaid_bills": [],
+            })
+            saved = reopened.load_cached_consumer_context(8)
+            self.assertEqual([row["id"] for row in saved["payments"]], list(range(3, 18)))
+            self.assertEqual(saved["unpaid_bills"], [])
+            del store, reopened
+            gc.collect()
+
+    def test_assignment_refresh_keeps_cached_rates_across_restarts(self):
+        base = {"id": 8, "meter_no": "09-23-2233", "name": "Test", "zone_name": "Zone 1"}
+        rates = {"previous_reading": 42, "minimum_cubic": 10, "minimum_rate": 100,
+                 "excess_rate_per_cubic": 12, "water_meter_fee": 5,
+                 "connection_fee": 3, "membership_fee": 2}
+        with tempfile.TemporaryDirectory() as folder:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = os.path.join(folder, "sync.db")
+            store.ensure_schema()
+            store.cache_consumers([{**base, **rates}])
+            reopened = SQLiteLocalSyncStore(SyncConfig())
+            reopened._db_path = store._db_path
+            reopened.ensure_schema()
+            reopened.cache_consumers([base])
+            cached = reopened.load_cached_consumers()[0]
+            self.assertTrue(all(cached[field] == value for field, value in rates.items()))
+            reopened.cache_consumers([{**base, "minimum_rate": 120, "water_meter_fee": 0}])
+            cached = reopened.load_cached_consumers()[0]
+            self.assertEqual((cached["minimum_rate"], cached["water_meter_fee"]), (120, 0))
+            with patch.object(database, "_db_path", return_value=os.path.join(folder, "ui.db")):
+                database.init_db()
+                database.replace_consumers_from_sync([{**base, **rates}])
+                database.replace_consumers_from_sync([base])
+                conn = database.get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT previous_reading, minimum_cubic, minimum_rate, excess_rate_per_cubic, "
+                        "water_meter_fee, connection_fee, membership_fee "
+                        "FROM consumers WHERE id=8"
+                    ).fetchone()
+                    self.assertEqual(tuple(row), tuple(rates.values()))
+                finally:
+                    conn.close()
+                database.replace_consumers_from_sync([{**base, "minimum_rate": 120,
+                                                       "water_meter_fee": 0}])
+                conn = database.get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT minimum_rate, water_meter_fee FROM consumers WHERE id=8"
+                    ).fetchone()
+                    self.assertEqual(tuple(row), (120, 0))
+                finally:
+                    conn.close()
+            del store, reopened
+            gc.collect()
+
     def test_assigned_consumer_records_are_refreshed_and_available_offline(self):
         with tempfile.TemporaryDirectory() as folder:
             store = SQLiteLocalSyncStore(SyncConfig())
@@ -82,14 +272,14 @@ class ServerOwnedBillingTests(unittest.TestCase):
             self.assertEqual(dal.prefetchAssignedConsumerContexts([assigned])["refreshed"], 1)
             remote.online = False
             refreshed = dal.getConsumerContext(8)
-            self.assertEqual(refreshed["payments"][0]["amount"], 120)
+            self.assertEqual([row["amount"] for row in refreshed["payments"]], [50, 120])
             self.assertEqual(refreshed["unpaid_bills"], [])
             remote.online = True
             remote.get_consumer_context = Mock(side_effect=OSError("network unavailable"))
             pull = dal.prefetchAssignedConsumerContexts([assigned])
             self.assertEqual((pull["requested"], pull["refreshed"], pull["failed"]), (1, 0, 1))
             remote.online = False
-            self.assertEqual(dal.getConsumerContext(8)["payments"][0]["amount"], 120)
+            self.assertEqual(dal.getConsumerContext(8)["payments"][-1]["amount"], 120)
             del dal, store
             gc.collect()
 
@@ -369,11 +559,11 @@ class ServerOwnedBillingTests(unittest.TestCase):
                 ), "2026-10-20")
             gc.collect()
 
-    def test_unissued_form_does_not_calculate_fallback_date(self):
+    def test_unissued_form_calculates_fallback_payment_date(self):
         bridge = SimpleNamespace(_consumer={})
         self.assertEqual(AppBridge._default_due_date_for_consumer(
             bridge, {"due_days": 15, "schedule_due_date": "2026-09-30"}, "2026-09-25",
-        ), "")
+        ), "2026-10-09")
         self.assertEqual(AppBridge._default_due_date_for_consumer(
             bridge, {"schedule_payment_due_date": "2026-10-12"}, "2026-09-25",
         ), "2026-10-12")
@@ -410,7 +600,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
         self.assertIn("Previous       : PHP   120.00", receipt)
         self.assertIn("2026-10-12", receipt)
 
-    def test_pending_reading_cannot_print_a_previous_bill(self):
+    def test_reading_cannot_print_a_previous_bill(self):
         alerts = Mock()
         bridge = SimpleNamespace(
             _selected_route_consumer_rows=lambda: [{
@@ -427,7 +617,39 @@ class ServerOwnedBillingTests(unittest.TestCase):
         ) as render:
             AppBridge.reprintZoneConsumer(bridge, 8)
         render.assert_not_called()
-        self.assertEqual(alerts.call_args.args[0], "Pending server calculation")
+        self.assertEqual(alerts.call_args.args[0], "Bill Unavailable")
+
+    def test_saved_local_bill_can_be_reprinted_without_server_or_print_history(self):
+        alerts = Mock()
+        preview = Mock()
+        bridge = SimpleNamespace(
+            _selected_route_consumer_rows=lambda: [{
+                "id": 8, "is_read": True, "reading_value": 5,
+                "consumption": 3, "reading_date": "2026-09-25", "schedule_id": 549,
+            }],
+            _sync_dal=SimpleNamespace(getCachedConsumerContext=lambda _id: {
+                "local_bill": {
+                    "sync_id": "bill-8", "schedule_id": 549,
+                    "billing_reference": "SLR2026000125",
+                    "bill_date": "2026-09-25", "due_date": "2026-10-12",
+                    "water_charge": 100, "amount_due": 150,
+                    "total_after_due_date": 165,
+                },
+                "minimum_cubic": 10, "minimum_rate": 100,
+                "excess_rate_per_cubic": 15,
+            }),
+            _reader_name="Juan Dela Cruz", _selected_zone="Zone 1",
+            alertRequested=SimpleNamespace(emit=alerts),
+            canReprintChanged=SimpleNamespace(emit=Mock()),
+            receiptPreviewRequested=SimpleNamespace(emit=preview),
+        )
+        with patch("src.qt_hybrid_app.get_latest_receipt_print", return_value=None), patch(
+            "src.qt_hybrid_app.can_use_system_printer", return_value=False,
+        ), patch("src.qt_hybrid_app.save_receipt_print", return_value=1):
+            AppBridge.reprintZoneConsumer(bridge, 8)
+        alerts.assert_not_called()
+        self.assertIn("TOTAL DUE      : PHP   150.00", preview.call_args.args[1])
+        self.assertIn("Due Date       : 2026-10-12", preview.call_args.args[1])
 
 
 if __name__ == "__main__":

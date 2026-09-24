@@ -184,23 +184,38 @@ reading and base charge data to `/api/handheld/reading-bundles` without those
 final fields. An issued bill keeps its saved due date and penalty rate even if
 the assignment or Admin Settings change later.
 
-An offline reading is queued in SQLite as `Pending server calculation`, with no
-bill payment due date or penalty. On successful sync, the returned `response.bill`
-is saved unchanged in the sync record and its values are mirrored into the local
-consumer cache for offline viewing. The returned `billing_policy` source,
+An offline reading is queued in SQLite for later API sync. The device immediately
+shows a local receipt estimate from its cached tariff, unpaid-bill records, and
+the linked schedule's Payment Due Date (or cached `due_days` fallback). It saves
+that receipt for offline reprint across restarts. On successful sync, the returned
+`response.bill` is saved unchanged in the sync record and its values are mirrored
+into the local consumer cache. If an unpaid backend bill unexpectedly returns
+zero totals, the device keeps its nonzero local receipt and flags the mismatch;
+the backend bill still needs investigation. The returned `billing_policy` source,
 payment date, fallback days, and late fee are retained for diagnostics; they
-never recalculate a saved bill. When online, the device
-refreshes `/api/handheld/consumers/:id/context` before displaying a saved receipt
-so overdue penalties and the bill's original `penalty_rate` come from the server.
+never recalculate a saved backend bill. Automatic sync and reconnection refresh
+`/api/handheld/consumers/:id/context`; opening a consumer or receipt reads the
+SQLite snapshot without a separate network request.
+
+The locally calculated bill is also kept in SQLite under its reserved bill sync
+ID, separate from the backend bill. It can be used for offline reprints and as
+the prior balance of a later offline reading when the last backend total is
+missing or zero. A complete backend bill takes precedence when it arrives.
 
 During each assigned-consumer pull, a bounded background refresh requests that
 same authenticated context endpoint for each assigned consumer before the app
 reports the pull complete. SQLite keeps the
 bill and any `unpaid_bills`, `payments`, `payment_history`, `readings`, or
 `reading_history` records returned by the API, plus the latest reading dates.
-The newest API response replaces the records it provides; offline lookups use
-the last successful response. The device cannot fetch payment or reading history that
+The newest API response replaces current bill and unpaid-bill snapshots. Payment
+and reading history is merged by record ID and retains the newest 15 records of
+each type, removing the oldest one as each new record exceeds that limit.
+Offline lookups use the last successful response. The device cannot fetch payment or reading history that
 the backend does not expose through this endpoint.
+Assignment refreshes also preserve the last cached meter reading, tariff, and
+fees when an API response omits those fields, so reopening the app offline does
+not reset them. Explicit replacement values, including zero fees, still update
+the cache.
 
 The assigned-consumer/context response and the authoritative `response.bill` must
 also expose the concessionaire's `connection_fee_components` records. The device

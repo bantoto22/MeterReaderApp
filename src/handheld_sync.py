@@ -42,11 +42,63 @@ except ImportError:
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
-CONTEXT_RECORD_KEYS = (
-    "bill", "unpaid_bills", "payments", "payment_history", "readings",
-    "reading_history", "latest_reading", "latest_reading_date",
-    "previous_reading_date", "billing_policy",
-)
+CONTEXT_HISTORY_KEYS = ("payments", "payment_history", "readings", "reading_history", "local_bills")
+CONTEXT_HISTORY_LIMIT = 15
+CONTEXT_PRIVATE_KEYS = frozenset({
+    "token", "session_token", "access_token", "refresh_token",
+    "authorization", "password", "secret",
+})
+
+
+def _record_identity(value) -> str:
+    if isinstance(value, dict):
+        for key in ("id", "payment_id", "reading_id", "bill_id", "sync_id"):
+            if value.get(key) not in (None, ""):
+                return f"{key}:{value[key]}"
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _record_date(value) -> str:
+    if isinstance(value, dict):
+        for key in ("paid_at", "payment_date", "reading_date", "created_at", "updated_at", "date"):
+            if value.get(key) not in (None, ""):
+                return str(value[key])
+    return ""
+
+
+def _retain_recent_records(existing, incoming) -> list:
+    """Merge immutable history and remove only oldest entries above the cap."""
+    ordered: dict[str, object] = {}
+    for record in (*existing, *incoming):
+        identity = _record_identity(record)
+        ordered.pop(identity, None)
+        ordered[identity] = record
+    records = list(ordered.values())
+    if records and all(_record_date(record) for record in records):
+        records.sort(key=_record_date)
+    while len(records) > CONTEXT_HISTORY_LIMIT:
+        records.pop(0)
+    return records
+
+
+def _merge_context_snapshot(existing, incoming, key: str = ""):
+    if isinstance(incoming, dict):
+        merged = (
+            {name: value for name, value in existing.items()
+             if str(name).lower() not in CONTEXT_PRIVATE_KEYS}
+            if isinstance(existing, dict) and key not in {"bill", "billing_policy", "local_bill"} else {}
+        )
+        for name, value in incoming.items():
+            if str(name).lower() in CONTEXT_PRIVATE_KEYS:
+                continue
+            merged[name] = _merge_context_snapshot(merged.get(name), value, str(name))
+        return merged
+    if isinstance(incoming, list) and key in CONTEXT_HISTORY_KEYS:
+        records = _retain_recent_records(existing if isinstance(existing, list) else [], incoming)
+        return [_merge_context_snapshot(None, record) for record in records]
+    if isinstance(incoming, list):
+        return [_merge_context_snapshot(None, record) for record in incoming]
+    return incoming
 # Bump this with each device-app release; it is sent in the heartbeat user_agent.
 APP_VERSION = "1.0.0"
 
@@ -465,7 +517,7 @@ def _build_bill_payload(
                     ),
                     max(0.0, original_amount - prior_fees),
                 )
-                bill_late_fee = _first_money(unpaid_bill, ("late_fee", "late_fee_percent", "penalty_percent"))
+                bill_late_fee = _first_money(unpaid_bill, ("penalty_rate", "late_fee", "late_fee_percent", "penalty_percent"))
                 effective_late_fee = current_late_fee_percent if bill_late_fee is None else bill_late_fee
                 if penalty_base > 0:
                     own_penalty = round(penalty_base * (effective_late_fee / 100.0), 2)
@@ -480,25 +532,42 @@ def _build_bill_payload(
         # Carry that aggregate exactly once: amount_due already contains all
         # earlier principal and penalties, while the latest bill's own penalty
         # is the difference to total_after_due_date (or the stored penalty).
-        prior_status = str(context.get("bill_status") or context.get("status") or "Unpaid").strip().lower()
-        if prior_status != "paid" and context.get("amount_due") not in (None, ""):
-            rolled_amount_due = max(0.0, _safe_float(context.get("amount_due")))
-            embedded_previous_penalty = max(0.0, _safe_float(context.get("previous_penalty")))
+        prior_context = context
+        local_previous = context.get("local_bill")
+        server_bill = context.get("bill") if isinstance(context.get("bill"), dict) else {}
+        if (isinstance(local_previous, dict)
+                and str(local_previous.get("sync_id") or "") != str(reading.get("bill_sync_id") or "")
+                and (_parse_date(local_previous.get("bill_date")) or reference_date) < reference_date
+                and _safe_float(context.get("amount_due")) <= 0
+                and _safe_float(local_previous.get("amount_due")) > 0
+                and str(server_bill.get("status") or context.get("bill_status") or "").lower() != "paid"
+                and (not server_bill.get("sync_id")
+                     or server_bill.get("sync_id") == local_previous.get("sync_id"))):
+            prior_context = {**context, **local_previous}
+        prior_status = str(prior_context.get("bill_status") or prior_context.get("status") or "Unpaid").strip().lower()
+        if prior_status != "paid" and prior_context.get("amount_due") not in (None, ""):
+            rolled_amount_due = max(0.0, _safe_float(prior_context.get("amount_due")))
+            embedded_previous_penalty = max(0.0, _safe_float(prior_context.get("previous_penalty")))
             carried_balance = max(0.0, round(rolled_amount_due - embedded_previous_penalty, 2))
-            prior_due_date = _parse_date(context.get("prior_bill_due_date") or context.get("due_date"))
-            total_after_due = max(0.0, _safe_float(context.get("total_after_due_date")))
+            prior_due_date = _parse_date(prior_context.get("prior_bill_due_date") or prior_context.get("due_date"))
+            total_after_due = max(0.0, _safe_float(prior_context.get("total_after_due_date")))
             stored_current_penalty = max(
                 max(0.0, round(total_after_due - rolled_amount_due, 2)),
-                max(0.0, _safe_float(context.get("current_penalty"))),
-                max(0.0, _safe_float(context.get("penalty"))),
+                max(0.0, _safe_float(prior_context.get("current_penalty"))),
+                max(0.0, _safe_float(prior_context.get("penalty"))),
             )
             current_penalty = stored_current_penalty
             carried_penalty = round(embedded_previous_penalty + current_penalty, 2)
             if prior_due_date is not None:
-                penalty_base = _first_money(context, ("water_charge", "class_cost"))
+                penalty_base = _first_money(prior_context, ("water_charge", "class_cost"))
                 if penalty_date > prior_due_date and penalty_base is not None:
+                    original_rate = prior_context.get("penalty_rate")
+                    effective_rate = (
+                        current_late_fee_percent if original_rate in (None, "")
+                        else late_fee_percent(original_rate)
+                    )
                     carried_penalty = round(
-                        embedded_previous_penalty + (penalty_base * (current_late_fee_percent / 100.0)),
+                        embedded_previous_penalty + (penalty_base * (effective_rate / 100.0)),
                         2,
                     )
                 elif penalty_date <= prior_due_date:
@@ -512,7 +581,7 @@ def _build_bill_payload(
     coverage_start = previous_reading_date(reading if "previous_reading_date" in reading else context)
     coverage_end = _reading_date(reading.get("reading_date"))
     # Schedule deadlines belong to route assignments; they are not payment due dates.
-    due_date_obj = payment_due_date(coverage_end, due_days)
+    due_date_obj = _parse_date(reading.get("schedule_payment_due_date")) or payment_due_date(coverage_end, due_days)
     due_date = datetime.combine(due_date_obj, datetime.min.time())
     amount_due = round(current_charge + concessionaire_fees + carried_balance + carried_penalty, 2)
     current_penalty = (
@@ -549,6 +618,7 @@ def _build_bill_payload(
         "previous_balance": round(carried_balance, 2),
         "previous_penalty": round(carried_penalty, 2),
         "penalty": current_penalty,
+        "penalty_rate": current_late_fee_percent,
         "total_amount": total_amount,
         "total_after_due_date": total_after_due_date,
         "status": "Unpaid",
@@ -1198,6 +1268,19 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         """
         with self._connect() as conn:
             for item in consumers:
+                consumer_id = item.get("id") or item.get("consumer_id")
+                previous = conn.execute(
+                    """SELECT previous_reading, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                              water_meter_fee, connection_fee, membership_fee
+                       FROM handheld_consumers_cache WHERE id = ?""",
+                    (consumer_id,),
+                ).fetchone() if consumer_id not in (None, "") else None
+                if previous:
+                    item = dict(item)
+                    for field in ("previous_reading", "minimum_cubic", "minimum_rate", "excess_rate_per_cubic",
+                                  "water_meter_fee", "connection_fee", "membership_fee"):
+                        if item.get(field) in (None, ""):
+                            item[field] = previous[field]
                 params = self._normalize_cached_consumer(item)
                 if not params:
                     continue
@@ -1279,8 +1362,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
     def cache_consumer_context(self, consumer_id: int, context: dict) -> None:
         """Keep API-provided bill, payment and reading records for offline use."""
-        incoming = {key: context[key] for key in CONTEXT_RECORD_KEYS if key in context}
-        if not incoming:
+        if not isinstance(context, dict) or not context:
             return
         with self._connect() as conn:
             row = conn.execute(
@@ -1293,13 +1375,13 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 existing = {}
             if not isinstance(existing, dict):
                 existing = {}
-            existing.update(incoming)
+            merged = _merge_context_snapshot(existing, context)
             conn.execute(
                 """INSERT INTO handheld_consumer_context_cache (consumer_id, context_json)
                    VALUES (?, ?)
                    ON CONFLICT(consumer_id) DO UPDATE SET
                      context_json=excluded.context_json, fetched_at=CURRENT_TIMESTAMP""",
-                (int(consumer_id), json.dumps(existing, default=str)),
+                (int(consumer_id), json.dumps(merged, default=str)),
             )
             conn.commit()
 
@@ -1953,13 +2035,27 @@ class HandheldSyncDataAccess:
                     return self._cache_remote_consumer_context(int(consumer_id), context)
             except Exception as exc:
                 self.local.log_audit(None, "failed", f"Backend API context lookup failed: {exc}")
+        return self.getCachedConsumerContext(consumer_id)
+
+    def getCachedConsumerContext(self, consumer_id: int) -> dict:
+        """Read the synchronized snapshot without making a network request."""
         for row in self.local.load_cached_consumers(None):
             try:
                 if int(row.get("id")) == int(consumer_id):
-                    return {**row, **self.local.load_cached_consumer_context(int(consumer_id))}
+                    context = self.local.load_cached_consumer_context(int(consumer_id))
+                    return {**context, **{key: value for key, value in row.items() if value is not None}}
             except (TypeError, ValueError):
                 continue
         return {}
+
+    def cacheLocalBill(self, consumer_id: int, bill: dict) -> None:
+        """Save the device calculation separately from the backend bill."""
+        if not isinstance(bill, dict) or not bill.get("sync_id"):
+            raise ValueError("A local bill must have its reserved sync ID.")
+        self.local.cache_consumer_context(int(consumer_id), {
+            "local_bill": bill,
+            "local_bills": [bill],
+        })
 
     def prefetchAssignedConsumerContexts(self, consumers: list[dict]) -> dict:
         """Cache detailed API records before an assignment is marked offline-ready."""

@@ -15,9 +15,11 @@ from pathlib import Path
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
 try:
+    from .billing_policy import payment_due_date
     from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
 except ImportError:
+    from billing_policy import payment_due_date
     from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
 
@@ -128,10 +130,10 @@ except ImportError:
     )
 
 try:
-    from .handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
+    from .handheld_sync import HandheldSyncDataAccess, SyncConfig, _build_bill_payload, format_sync_error
 except ImportError:
     try:
-        from handheld_sync import HandheldSyncDataAccess, SyncConfig, format_sync_error
+        from handheld_sync import HandheldSyncDataAccess, SyncConfig, _build_bill_payload, format_sync_error
     except ImportError:
         HandheldSyncDataAccess = None
         SyncConfig = None
@@ -187,6 +189,51 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _display_consumer_context(sync_dal, consumer_id: int) -> dict:
+    """Display the synchronized SQLite snapshot without a per-screen fetch."""
+    getter = getattr(sync_dal, "getCachedConsumerContext", None)
+    if getter is None:
+        getter = sync_dal.getConsumerContext
+    return getter(int(consumer_id))
+
+
+def _use_local_bill_for_display(server_bill: dict | None, local_bill: dict) -> bool:
+    if not server_bill:
+        return True
+    if str(server_bill.get("status") or "").strip().lower() == "paid":
+        return False
+    server_due = _to_float(server_bill.get("amount_due", server_bill.get("total_amount")))
+    server_after = _to_float(
+        server_bill.get("total_after_due_date", server_bill.get("amount_after_due_date"))
+    )
+    return (
+        server_due <= 0 < _to_float(local_bill.get("amount_due"))
+        or server_after <= 0 < _to_float(local_bill.get("total_after_due_date"))
+        or (not server_bill.get("due_date") and bool(local_bill.get("due_date")))
+        or (_to_float(server_bill.get("water_charge", server_bill.get("class_cost"))) <= 0
+            < _to_float(local_bill.get("water_charge")))
+    )
+
+
+def _cached_bill_for_reading(context: dict, reading: dict) -> dict | None:
+    """Use the server bill when complete, otherwise the matching local calculation."""
+    reading_day = _normalize_iso_date(reading.get("reading_date"))
+    local = context.get("local_bill") if isinstance(context.get("local_bill"), dict) else {}
+    server = context.get("bill") if isinstance(context.get("bill"), dict) else context
+
+    def matches(bill: dict) -> bool:
+        return bool(
+            bill.get("billing_reference") and bill.get("due_date")
+            and _normalize_iso_date(bill.get("bill_date")) == reading_day
+            and (not bill.get("schedule_id") or not reading.get("schedule_id")
+                 or str(bill["schedule_id"]) == str(reading["schedule_id"]))
+        )
+
+    if matches(local) and (not matches(server) or _use_local_bill_for_display(server, local)):
+        return local
+    return server if matches(server) else None
 
 
 def _format_reading(value) -> str:
@@ -1875,7 +1922,7 @@ class AppBridge(QObject):
         except (TypeError, ValueError):
             return
         try:
-            refreshed = self._sync_dal.getConsumerContext(consumer_id_int)
+            refreshed = _display_consumer_context(self._sync_dal, consumer_id_int)
         except Exception:
             return
         if not refreshed:
@@ -1971,7 +2018,10 @@ class AppBridge(QObject):
         return (
             _normalize_iso_date(source.get("schedule_payment_due_date"))
             or _normalize_iso_date(schedule.get("paymentDueDate"))
-            or ""
+            or payment_due_date(
+                _normalize_iso_date(reading_date) or datetime.now().date().isoformat(),
+                source.get("due_days"),
+            ).isoformat()
         )
 
     def _load_consumer_for_new_bill(self, consumer: dict) -> None:
@@ -2164,6 +2214,8 @@ class AppBridge(QObject):
         if is_connected and not was_connected:
             self._start_heartbeat()
             self._start_reconnect_sync()
+            if getattr(self, "_auto_sync_enabled", False):
+                self._start_assigned_consumer_dataset_refresh()
 
     def _start_reconnect_sync(self) -> None:
         if not self._auto_sync_enabled or not self._sync_dal:
@@ -2482,16 +2534,13 @@ class AppBridge(QObject):
             latest_entry = {**latest_entry, "receipt_text": receipt}
         else:
             try:
-                context = self._sync_dal.getConsumerContext(int(consumer_id)) if self._sync_dal else {}
+                context = _display_consumer_context(self._sync_dal, int(consumer_id)) if self._sync_dal else {}
             except Exception:
                 context = {}
-            bill = context.get("bill") if isinstance(context.get("bill"), dict) else context
-            bill_day = _normalize_iso_date(bill.get("bill_date")) if isinstance(bill, dict) else None
+            bill = _cached_bill_for_reading(context, row)
             reading_day = _normalize_iso_date(row.get("reading_date"))
-            if not bill or not bill.get("billing_reference") or not bill.get("due_date") or (
-                not bill_day or not reading_day or bill_day != reading_day
-            ):
-                self.alertRequested.emit("Pending server calculation", "This reading has no confirmed bill yet. Sync it before printing.")
+            if not bill:
+                self.alertRequested.emit("Bill Unavailable", "No saved bill calculation is available for this reading.")
                 return
             receipt = build_receipt_text(
                 apply_authoritative_bill({**row, **context}, bill),
@@ -2665,10 +2714,34 @@ class AppBridge(QObject):
         consumer_snapshot["schedule_due_date"] = schedule_due_date
         consumer_snapshot["schedule_payment_due_date"] = schedule_payment_due_date
         flagged = consumption > 500 or exception != "None"
+        required_tariff = ("minimum_cubic", "minimum_rate", "excess_rate_per_cubic")
+        missing_tariff = [key for key in required_tariff if consumer_snapshot.get(key) in (None, "")]
+        if missing_tariff:
+            raise RuntimeError(
+                "This consumer's billing rates are not cached. Sync while online before reading offline: "
+                + ", ".join(missing_tariff)
+            )
+        local_bill = _build_bill_payload(
+            {
+                "consumer_id": self._consumer["id"], "reading_id": sync_reading_id,
+                "bill_sync_id": bill_sync_id, "bill_date": bill_date,
+                "reading_date": reading_date,
+                "previous_reading_date": consumer_snapshot["previous_reading_date"],
+                "previous_reading": previous, "present_reading": present,
+                "consumption": consumption,
+                "schedule_payment_due_date": schedule_payment_due_date,
+            },
+            consumer_snapshot, 0,
+        )
+        local_bill.update({
+            "sync_id": bill_sync_id or sync_reading_id,
+            "billing_reference": billing_reference,
+            "schedule_id": schedule_id,
+        })
         receipt = build_receipt_text(
-            consumer_snapshot, previous, present, exception, self._reader_name,
-            reading_date=reading_date, pending_server_calculation=True,
-            proposed_due_date=schedule_payment_due_date,
+            apply_authoritative_bill(consumer_snapshot, local_bill),
+            previous, present, exception, self._reader_name,
+            reading_date=reading_date,
         )
         return {
             "job_type": "original",
@@ -2696,6 +2769,7 @@ class AppBridge(QObject):
             "billing_reference": billing_reference,
             "captured_at": captured_at,
             "authoritative_bill": None,
+            "local_bill": local_bill,
             "receipt_text": receipt,
             "reader_name": self._reader_name,
         }
@@ -2759,12 +2833,20 @@ class AppBridge(QObject):
             "",
         )
         try:
-            context = self._sync_dal.getConsumerContext(int(entry["consumer_id"]))
+            context = _display_consumer_context(self._sync_dal, int(entry["consumer_id"]))
         except Exception:
             return original
         if not context or str(context.get("billing_reference") or "").strip() != reference:
             return original
         bill = context.get("bill") if isinstance(context.get("bill"), dict) else context
+        original_total = next(
+            (_to_float(line.rsplit("PHP", 1)[-1].strip()) for line in original.splitlines()
+             if line.strip().startswith("TOTAL DUE") and "PHP" in line),
+            0.0,
+        )
+        if (original_total > 0 and _to_float(bill.get("amount_due")) <= 0
+                and str(bill.get("status") or bill.get("bill_status") or "").lower() != "paid"):
+            return original
         snapshot = apply_authoritative_bill({**context, **entry}, bill)
         reading_date = next(
             (line.split(":", 1)[1].strip() for line in original.splitlines()
@@ -2860,7 +2942,11 @@ class AppBridge(QObject):
                             **result,
                             "pull_error": format_sync_error(stage, pull_exc, self._backend_endpoint),
                         }
-                self.syncTaskFinished.emit({"kind": "sync", "result": result, "pulled": pulled, "mirrored": mirrored})
+                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers) if pulled else {}
+                self.syncTaskFinished.emit({
+                    "kind": "sync", "result": result, "pulled": pulled,
+                    "mirrored": mirrored, "context_pull": context_pull,
+                })
             except Exception as exc:
                 self.syncTaskFinished.emit(
                     {"kind": "error", "error": format_sync_error(stage, exc, self._backend_endpoint)}
@@ -2933,6 +3019,9 @@ class AppBridge(QObject):
                     exception = str(job["exception"])
                     reading_date = str(job.get("reading_date") or datetime.now().date().isoformat())
                     due_date = None
+                    locally_calculated = False
+                    local_bill = dict(job.get("local_bill") or {})
+                    local_bill_cache_error = None
                     reading_id = int(job.get("reading_id") or 0)
                     if not reading_id:
                         flagged = consumption > 500 or exception != "None"
@@ -2944,6 +3033,12 @@ class AppBridge(QObject):
                             reading_status="valid", reading_sync_status="pending",
                             sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
                         )
+                        cache_local_bill = getattr(self._sync_dal, "cacheLocalBill", None)
+                        if cache_local_bill and local_bill.get("sync_id"):
+                            try:
+                                cache_local_bill(int(job["consumer_id"]), local_bill)
+                            except Exception as exc:
+                                local_bill_cache_error = str(exc)
                         sync_result = self._save_to_sync_layer(
                             job["consumer_id"], present, consumption, exception, flagged, reading_date, due_date,
                             sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
@@ -2962,21 +3057,14 @@ class AppBridge(QObject):
                             detail = str(errors[0]) if errors else "The reserved reference conflicts with the bill."
                             raise RuntimeError(f"The backend rejected the bill. {detail}")
                         authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
-                        if not authoritative_bill:
-                            self.printExecutionFinished.emit({
-                                "success": True, "job_type": "original", "pending_calculation": True,
-                                "reading_id": reading_id, "consumer_snapshot": consumer,
-                                "schedule_payment_due_date": job.get("schedule_payment_due_date"),
-                                "previous": previous, "present": present,
-                                "consumption": consumption, "exception": exception,
-                            })
-                            return
+                        locally_calculated = _use_local_bill_for_display(authoritative_bill, local_bill)
                         try:
-                            fresh_context = self._sync_dal.getConsumerContext(int(job["consumer_id"]))
+                            fresh_context = _display_consumer_context(self._sync_dal, int(job["consumer_id"]))
                         except Exception:
                             fresh_context = {}
                         consumer = apply_authoritative_bill(
-                            {**consumer, **fresh_context}, authoritative_bill
+                            {**consumer, **fresh_context},
+                            local_bill if locally_calculated else authoritative_bill,
                         )
                         due_date = _normalize_iso_date(consumer.get("due_date"))
                         receipt_text = build_receipt_text(
@@ -3028,6 +3116,9 @@ class AppBridge(QObject):
                             "exception": exception,
                             "due_date": due_date,
                             "receipt_text": receipt_text,
+                            "locally_calculated": locally_calculated,
+                            "local_bill_cache_error": local_bill_cache_error,
+                            "synced": sync_result.get("status") == "synced",
                         }
                     )
                     return
@@ -3135,13 +3226,16 @@ class AppBridge(QObject):
             if result.get("due_date"):
                 self._consumer["due_date"] = result["due_date"]
                 self._due_date = result["due_date"]
-                self._due_date_confirmed = True
+                self._due_date_confirmed = not result.get("locally_calculated")
                 self.dueDateChanged.emit()
             self._previous_reading = _format_reading(present)
             self._present_reading = ""
             self._consumption = "-"
             self._validation_color = "#10B981"
-            self._validation_message = "Saved successfully!"
+            self._validation_message = (
+                "Saved with local bill amounts; sync will reconcile"
+                if result.get("locally_calculated") else "Saved successfully!"
+            )
             self.previousReadingChanged.emit()
             self.presentReadingChanged.emit()
             self.consumptionChanged.emit()
@@ -3153,8 +3247,17 @@ class AppBridge(QObject):
             self.refreshPrintHistory()
             if result.get("printed", True):
                 message = "Receipt printed successfully."
+                if result.get("locally_calculated"):
+                    message += (
+                        "\n\nThe main system returned zero or missing totals. This receipt uses "
+                        "device-cached amounts and needs reconciliation."
+                        if result.get("synced") else
+                        "\n\nAmounts came from the device cache and will be checked on sync."
+                    )
                 if result.get("history_error"):
                     message += "\n\nThe print-history record could not be saved and will not appear in History."
+                if result.get("local_bill_cache_error"):
+                    message += "\n\nThe local bill details could not be cached. The saved receipt is still available for reprint."
                 self.alertRequested.emit("Print Complete", message)
             else:
                 self.alertRequested.emit(

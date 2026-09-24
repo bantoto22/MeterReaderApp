@@ -1978,6 +1978,18 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         meter_no = _real_meter_no(c)
         if not meter_no:
             continue
+        consumer_id = c.get("id") or c.get("consumer_id")
+        previous = cur.execute(
+            """SELECT previous_reading, minimum_cubic, minimum_rate, excess_rate_per_cubic,
+                      water_meter_fee, connection_fee, membership_fee
+               FROM consumers WHERE id = ? OR meter_no = ? LIMIT 1""",
+            (consumer_id, meter_no),
+        ).fetchone()
+        if previous:
+            for field in ("previous_reading", "minimum_cubic", "minimum_rate", "excess_rate_per_cubic",
+                          "water_meter_fee", "connection_fee", "membership_fee"):
+                if c.get(field) in (None, ""):
+                    c[field] = previous[field]
         zone_name = (c.get("zone_name") or "Unassigned").strip()
         zone_id = zone_id_by_name.get(zone_name)
         if zone_id is None:
