@@ -182,6 +182,49 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "queued")
         self.assertEqual(len(self.local.list_pending()), 1)
 
+    def test_offline_monthly_bill_guard_survives_restart_and_allows_next_month(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "meter.db")
+            first_store = SQLiteLocalSyncStore(SyncConfig())
+            first_store._db_path = path
+            first = HandheldSyncDataAccess(first_store, FakeRemoteStore())
+            first.queueMeterReading({
+                "consumer_id": 8, "reading_date": "2026-09-05",
+                "bill_date": "2026-09-05", "bill_sync_id": "september-bill",
+            })
+
+            restarted_store = SQLiteLocalSyncStore(SyncConfig())
+            restarted_store._db_path = path
+            restarted = HandheldSyncDataAccess(restarted_store, FakeRemoteStore())
+            with self.assertRaisesRegex(ValueError, "already has a saved or pending bill for September 2026"):
+                restarted.prepareBillingReference(8, "2026-09-25", allow_unreserved_offline=True)
+            with self.assertRaisesRegex(ValueError, "already has a saved or pending bill for September 2026"):
+                restarted.queueMeterReading({
+                    "consumer_id": 8, "reading_date": "2026-09-25", "bill_sync_id": "another-bill",
+                })
+            self.assertEqual(len(restarted_store.list_pending()), 1)
+            self.assertEqual(
+                restarted.prepareBillingReference(8, "2026-10-01", allow_unreserved_offline=True)["bill_date"],
+                "2026-10-01",
+            )
+            gc.collect()
+
+    def test_cached_server_bill_blocks_second_monthly_bill_but_same_sync_id_is_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteLocalSyncStore(SyncConfig())
+            store._db_path = os.path.join(directory, "meter.db")
+            store.ensure_schema()
+            store.cache_consumer_context(8, {"bill": {
+                "sync_id": "confirmed-bill", "bill_date": "2026-09-05", "status": "Unpaid",
+                "billing_reference": "SLR2026000188",
+            }})
+            dal = HandheldSyncDataAccess(store, FakeRemoteStore())
+            with self.assertRaisesRegex(ValueError, "SLR2026000188"):
+                dal.prepareBillingReference(8, "2026-09-25", allow_unreserved_offline=True)
+            dal._reject_duplicate_monthly_bill(8, "2026-09-25", "confirmed-bill")
+            self.assertEqual(store.find_existing_monthly_bill(8, "2026-10-01"), {})
+            gc.collect()
+
     def test_empty_upload_queue_does_not_claim_backend_is_unreachable(self):
         with patch.object(self.remote, "is_online", side_effect=AssertionError("unneeded probe")):
             result = self.dal.syncPendingReadings()

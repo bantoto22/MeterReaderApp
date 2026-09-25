@@ -1424,6 +1424,50 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             return {}
         return value if isinstance(value, dict) else {}
 
+    def find_existing_monthly_bill(
+        self, consumer_id: int, bill_date: str, exclude_sync_id: str | None = None,
+    ) -> dict:
+        """Find a saved or queued bill in the reading month, even while offline."""
+        month = date.fromisoformat(str(bill_date)[:10]).isoformat()[:7]
+        excluded = str(exclude_sync_id or "")
+        with self._connect() as conn:
+            reservations = conn.execute(
+                """SELECT bill_sync_id, bill_date, billing_reference
+                   FROM local_billing_reference_reservations
+                   WHERE consumer_id = ? AND substr(bill_date, 1, 7) = ?
+                     AND status = 'Used'""",
+                (int(consumer_id), month),
+            ).fetchall()
+            queued = conn.execute(
+                """SELECT payload, reading_date, backend_status
+                   FROM sync_queue_meter_readings
+                   WHERE consumer_id = ? AND substr(reading_date, 1, 7) = ?
+                     AND backend_status != 'conflict'""",
+                (int(consumer_id), month),
+            ).fetchall()
+        for row in reservations:
+            if str(row["bill_sync_id"]) != excluded:
+                return dict(row)
+        for row in queued:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                payload = {}
+            sync_id = str(payload.get("bill_sync_id") or payload.get("reading_id") or "")
+            if sync_id != excluded:
+                return {"bill_sync_id": sync_id, "bill_date": row["reading_date"]}
+        context = self.load_cached_consumer_context(consumer_id)
+        bills = [context.get("bill"), context.get("local_bill"), *(context.get("local_bills") or [])]
+        for bill in bills:
+            if not isinstance(bill, dict) or bill.get("deleted_at"):
+                continue
+            if str(bill.get("status") or "").lower() in {"cancelled", "canceled"}:
+                continue
+            sync_id = str(bill.get("sync_id") or "")
+            if str(bill.get("bill_date") or "")[:7] == month and sync_id != excluded:
+                return bill
+        return {}
+
     def get_or_create_bill_reservation(
         self,
         consumer_id: int,
@@ -2330,8 +2374,10 @@ class HandheldSyncDataAccess:
         due_date: str | None = None,
         late_fee: float | int | str | None = None,
         allow_unreserved_offline: bool = False,
+        existing_bill_sync_id: str | None = None,
     ) -> dict:
         with self.operation_lock:
+            self._reject_duplicate_monthly_bill(consumer_id, bill_date, existing_bill_sync_id)
             draft = self.local.get_or_create_bill_reservation(
                 int(consumer_id),
                 bill_date,
@@ -2367,6 +2413,22 @@ class HandheldSyncDataAccess:
             )
             return prepared
 
+    def _reject_duplicate_monthly_bill(
+        self, consumer_id: int, bill_date: str, bill_sync_id: str | None = None,
+    ) -> None:
+        lookup = getattr(self.local, "find_existing_monthly_bill", None)
+        if not callable(lookup):
+            return
+        existing = lookup(int(consumer_id), bill_date, bill_sync_id)
+        if existing:
+            month = date.fromisoformat(str(bill_date)[:10]).strftime("%B %Y")
+            reference = str(existing.get("billing_reference") or "").strip()
+            detail = f" ({reference})" if reference else ""
+            raise ValueError(
+                f"This consumer already has a saved or pending bill for {month}{detail}. "
+                "Open the existing bill instead of recording another."
+            )
+
     @staticmethod
     def _normalize_reading(payload: dict) -> dict:
         reading = dict(payload)
@@ -2394,6 +2456,7 @@ class HandheldSyncDataAccess:
             str(reading.get("bill_date") or reading["reading_date"]),
             schedule_id=reading.get("schedule_id"),
             billing_cycle=reading.get("billing_cycle"),
+            existing_bill_sync_id=reading.get("bill_sync_id"),
         )
         return {**reading, "bill_sync_id": reserved["bill_sync_id"],
                 "billing_reference": reserved["billing_reference"]}
@@ -2401,6 +2464,10 @@ class HandheldSyncDataAccess:
     def queueMeterReading(self, payload: dict) -> dict:
         with self.operation_lock:
             reading = self._normalize_reading(payload)
+            self._reject_duplicate_monthly_bill(
+                reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
+                reading.get("bill_sync_id"),
+            )
             queued = self._queue_for_sync("create", reading)
             _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
             self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
@@ -2408,6 +2475,10 @@ class HandheldSyncDataAccess:
 
     def _save_or_queue(self, operation: str, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
+        self._reject_duplicate_monthly_bill(
+            reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
+            reading.get("bill_sync_id"),
+        )
         queued = self._queue_for_sync(operation, reading)
         _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
         if not self.is_online():
