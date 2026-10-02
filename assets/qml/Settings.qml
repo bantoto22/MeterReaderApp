@@ -15,6 +15,14 @@ Rectangle {
     readonly property int cardInset: compactScreen ? 32 : 48
     readonly property int cardSpacing: compactScreen ? 12 : 18
 
+    Connections {
+        target: bridgeObj
+        function onWifiConnectFinished(success, ssid, detail) {
+            if (success && detail !== "status-only")
+                txtWifiPassword.text = ""
+        }
+    }
+
     Dialog {
         id: powerDialog
         anchors.centerIn: parent
@@ -553,7 +561,6 @@ Rectangle {
                                 if (bridgeObj) {
                                     var ssid = cmbWifi.editText.length ? cmbWifi.editText : cmbWifi.currentText
                                     bridgeObj.connectWifiNetwork(ssid, txtWifiPassword.text)
-                                    txtWifiPassword.text = ""
                                 }
                             }
                         }

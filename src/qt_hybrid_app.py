@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+import tempfile
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -2340,6 +2341,29 @@ class AppBridge(QObject):
                     cmd.extend(["password", password])
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=35, check=False)
                 detail = (result.stderr or result.stdout or "Connection failed. Check the password.").strip()
+                # NetworkManager may reuse a saved profile whose PSK is missing.
+                # In that case, the password on "dev wifi connect" is not enough
+                # to satisfy the profile's secret request.
+                if result.returncode != 0 and password and (
+                    "secrets were required" in detail.lower() or "802-11-wireless-security.psk" in detail.lower()
+                ):
+                    secret_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as secret_file:
+                            secret_path = secret_file.name
+                            secret_file.write(f"802-11-wireless-security.psk:{password}\n")
+                        result = subprocess.run(
+                            ["nmcli", "connection", "up", "id", ssid, "passwd-file", secret_path],
+                            capture_output=True, text=True, timeout=35, check=False,
+                        )
+                        detail = (result.stderr or result.stdout or "Connection failed. Check the password.").strip()
+                    finally:
+                        if secret_path:
+                            os.unlink(secret_path)
+                if result.returncode != 0 and (
+                    "secrets were required" in detail.lower() or "802-11-wireless-security.psk" in detail.lower()
+                ):
+                    detail = "This network needs a Wi-Fi password. Check the Password field and try again."
                 self.wifiConnectFinished.emit(result.returncode == 0, ssid, detail)
             except FileNotFoundError:
                 self.wifiConnectFinished.emit(False, ssid, "NetworkManager utility 'nmcli' is not installed.")
