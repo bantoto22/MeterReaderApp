@@ -14,12 +14,28 @@ Rectangle {
     readonly property int cardPadding: compactScreen ? 16 : 24
     readonly property int cardInset: compactScreen ? 32 : 48
     readonly property int cardSpacing: compactScreen ? 12 : 18
+    property string selectedWifiSsid: ""
+    readonly property var selectedWifiNetwork: {
+        var ssid = cmbWifi.currentText
+        var networks = bridgeObj ? bridgeObj.wifiNetworkDetails : []
+        for (var i = 0; i < networks.length; i++) {
+            if (networks[i].ssid === ssid)
+                return networks[i]
+        }
+        return null
+    }
+    readonly property string wifiSecurityMode: ["auto", "wpa-psk", "sae", "open"][cmbWifiSecurity.currentIndex] || "auto"
+    readonly property bool wifiPasswordNeeded: wifiSecurityMode !== "open"
+        && !(wifiSecurityMode === "auto" && selectedWifiNetwork
+             && (selectedWifiNetwork.mode === "open" || selectedWifiNetwork.mode === "owe"))
 
     Connections {
         target: bridgeObj
         function onWifiConnectFinished(success, ssid, detail) {
-            if (success && detail !== "status-only")
+            if (success && detail !== "status-only") {
                 txtWifiPassword.text = ""
+                showWifiPassword.checked = false
+            }
         }
     }
 
@@ -450,9 +466,27 @@ Rectangle {
                         spacing: 16
                         ComboBox {
                             id: cmbWifi
+                            objectName: "wifiNetworkSelector"
                             Layout.fillWidth: true
                             editable: false
                             model: bridgeObj ? bridgeObj.wifiNetworks : []
+                            onModelChanged: {
+                                var savedIndex = model.indexOf(settingsRoot.selectedWifiSsid)
+                                currentIndex = savedIndex >= 0 ? savedIndex : (model.length ? 0 : -1)
+                                var nextSsid = currentIndex >= 0 ? model[currentIndex] : ""
+                                if (settingsRoot.selectedWifiSsid.length > 0 && settingsRoot.selectedWifiSsid !== nextSsid) {
+                                    if (txtWifiPassword) txtWifiPassword.text = ""
+                                    if (showWifiPassword) showWifiPassword.checked = false
+                                    if (cmbWifiSecurity) cmbWifiSecurity.currentIndex = 0
+                                }
+                                settingsRoot.selectedWifiSsid = nextSsid
+                            }
+                            onActivated: {
+                                settingsRoot.selectedWifiSsid = currentText
+                                txtWifiPassword.text = ""
+                                showWifiPassword.checked = false
+                                cmbWifiSecurity.currentIndex = 0
+                            }
                             font.family: "Montserrat"
                             font.pixelSize: TouchMetrics.bodyText
                             leftPadding: 14
@@ -467,7 +501,8 @@ Rectangle {
                                 selectedTextColor: "#111827"
                                 font: cmbWifi.font
                                 verticalAlignment: TextInput.AlignVCenter
-                                selectByMouse: true
+                                readOnly: !cmbWifi.editable
+                                selectByMouse: cmbWifi.editable
                                 clip: true
                             }
 
@@ -527,11 +562,54 @@ Rectangle {
 
                     Text {
                         Layout.fillWidth: true
-                        text: "Choose a network from the scan results, then enter its password below."
+                        text: "Choose a network, check its security, then enter its password. Leave Password blank to use a saved password."
                         color: "#526176"
                         font.family: "Montserrat"
                         font.pixelSize: TouchMetrics.bodyText
                         wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        text: "Security"
+                        color: "#111827"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        font.bold: true
+                    }
+
+                    ComboBox {
+                        id: cmbWifiSecurity
+                        objectName: "wifiSecuritySelector"
+                        Layout.fillWidth: true
+                        model: ["Automatic", "WPA/WPA2 Personal", "WPA3 Personal", "Open (no password)"]
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        enabled: bridgeObj ? !bridgeObj.wifiBusy : false
+                        background: Rectangle {
+                            implicitHeight: TouchMetrics.inputHeight
+                            radius: 7
+                            color: "#F8FAFD"
+                            border.color: cmbWifiSecurity.activeFocus ? "#60A5FA" : "#C9D5E3"
+                        }
+                    }
+
+                    Text {
+                        objectName: "wifiDetectedSecurity"
+                        Layout.fillWidth: true
+                        text: "Detected security: " + (settingsRoot.selectedWifiNetwork
+                            ? settingsRoot.selectedWifiNetwork.security : "Scan to detect")
+                        color: "#526176"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        text: "Password"
+                        color: "#111827"
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
+                        font.bold: true
                     }
 
                     RowLayout {
@@ -539,10 +617,12 @@ Rectangle {
                         spacing: 16
                         TextField {
                             id: txtWifiPassword
+                            objectName: "wifiPasswordField"
                             property string keyboardMode: "password"
                             Layout.fillWidth: true
-                            placeholderText: "Password"
-                            echoMode: TextInput.Password
+                            placeholderText: settingsRoot.wifiPasswordNeeded ? "Wi-Fi password" : "No password required"
+                            enabled: settingsRoot.wifiPasswordNeeded && bridgeObj && !bridgeObj.wifiBusy
+                            echoMode: showWifiPassword.checked ? TextInput.Normal : TextInput.Password
                             inputMethodHints: Qt.ImhHiddenText | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
                             color: "#111827"
                             font.family: "Montserrat"
@@ -552,6 +632,7 @@ Rectangle {
                         }
                         ActionButton {
                             id: btnConnect
+                            objectName: "wifiConnectButton"
                             text: bridgeObj && bridgeObj.wifiBusy ? "Working..." : "Connect"
                             buttonColor: "#10B981"
                             hoverColor: "#059669"
@@ -560,10 +641,19 @@ Rectangle {
                             onClicked: {
                                 if (bridgeObj) {
                                     var ssid = cmbWifi.editText.length ? cmbWifi.editText : cmbWifi.currentText
-                                    bridgeObj.connectWifiNetwork(ssid, txtWifiPassword.text)
+                                    bridgeObj.connectWifiNetwork(ssid, settingsRoot.wifiPasswordNeeded ? txtWifiPassword.text : "",
+                                                                 settingsRoot.wifiSecurityMode)
                                 }
                             }
                         }
+                    }
+
+                    CheckBox {
+                        id: showWifiPassword
+                        text: "Show password"
+                        enabled: settingsRoot.wifiPasswordNeeded && bridgeObj && !bridgeObj.wifiBusy
+                        font.family: "Montserrat"
+                        font.pixelSize: TouchMetrics.bodyText
                     }
                 }
             }

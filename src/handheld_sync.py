@@ -2574,6 +2574,7 @@ class HandheldSyncDataAccess:
             "backup_state": "PostgreSQL managed by Backend API",
             "last_sync_time": last_sync,
             "backend_online": online,
+            "backend_health_error": "" if online else str(getattr(self.remote, "last_health_error", "") or ""),
             "backend_pending_count": len(pending),
             "backend_last_sync_time": last_sync,
         }

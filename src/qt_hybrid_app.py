@@ -7,7 +7,6 @@ import os
 import re
 import subprocess
 import threading
-import tempfile
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -19,10 +18,12 @@ try:
     from .billing_policy import payment_due_date
     from .reading_dates import previous_reading_date
     from .reader_identity import reader_display_name
+    from .wifi import connected_wifi_ssid, connect_wifi_network, scan_wifi_networks, split_nmcli_fields
 except ImportError:
     from billing_policy import payment_due_date
     from reading_dates import previous_reading_date
     from reader_identity import reader_display_name
+    from wifi import connected_wifi_ssid, connect_wifi_network, scan_wifi_networks, split_nmcli_fields
 
 try:
     from .qt_compat import (
@@ -665,6 +666,7 @@ class AppBridge(QObject):
     wifiScanFinished = Signal(object, str)
     wifiConnectFinished = Signal(bool, str, str)
     wifiStatusResult = Signal(str, str)
+    backendProbeFinished = Signal(object)
     powerOffFailed = Signal(str)
     testPrintFinished = Signal(bool, str)
     printPreviewBusyChanged = Signal()
@@ -762,8 +764,10 @@ class AppBridge(QObject):
         self._wifi_status = "Status: Checking..."
         self._wifi_status_color = "#526176"
         self._wifi_networks = []
+        self._wifi_network_details = []
         self._wifi_busy = False
         self._wifi_scan_silent = False
+        self._backend_probe_in_flight = False
         self._test_print_busy = False
         self._print_preview_busy = False
         self._pending_print_job = None
@@ -791,6 +795,7 @@ class AppBridge(QObject):
         self.wifiScanFinished.connect(self._finish_wifi_scan)
         self.wifiConnectFinished.connect(self._finish_wifi_connect)
         self.wifiStatusResult.connect(self._set_wifi_status)
+        self.backendProbeFinished.connect(self._refresh_sync_snapshot)
         self.powerOffFailed.connect(self._finish_power_off_failure)
         self.testPrintFinished.connect(self._finish_test_print)
         self.printExecutionFinished.connect(self._finish_print_execution)
@@ -1515,6 +1520,10 @@ class AppBridge(QObject):
     def wifiNetworks(self) -> list:
         return self._wifi_networks
 
+    @Property(list, notify=wifiNetworksChanged)
+    def wifiNetworkDetails(self) -> list:
+        return self._wifi_network_details
+
     @Property(bool, notify=wifiBusyChanged)
     def wifiBusy(self) -> bool:
         return self._wifi_busy
@@ -1660,13 +1669,18 @@ class AppBridge(QObject):
             self.backendLogsChanged.emit()
             self._emit_sync_state()
 
-    def _refresh_sync_snapshot(self) -> None:
+    def _refresh_sync_snapshot(self, snapshot: dict | None = None) -> None:
+        if snapshot is not None:
+            self._backend_probe_in_flight = False
         if not self._sync_dal:
             self._emit_sync_state()
             return
         try:
             was_backend_online = self._backend_status == "Online"
-            snapshot = self._sync_dal.get_sync_snapshot()
+            if snapshot is None:
+                snapshot = self._sync_dal.get_sync_snapshot()
+            if snapshot.get("probe_error"):
+                raise RuntimeError(snapshot["probe_error"])
             self._sync_status = str(snapshot.get("status", "Offline"))
             self._sync_status_color = "#10B981" if self._sync_status == "Online" else "#526176"
             if snapshot.get("has_failed"):
@@ -1688,6 +1702,11 @@ class AppBridge(QObject):
                 f"Queued readings: {self._backend_pending_count}\n"
                 f"Automatic sync: {'Enabled' if self._auto_sync_enabled else 'Disabled'}"
             )
+            health_error = str(snapshot.get("backend_health_error") or "").strip()
+            if self._backend_status == "Offline" and health_error:
+                diagnostic_header += "\n\n" + format_sync_error(
+                    "Checking Backend API connectivity", health_error, self._backend_endpoint
+                )
             activity = "\n\n".join(
                 f"[{row.get('created_at', '')}] {str(row.get('status', '')).upper()}\n{row.get('message', '')}"
                 for row in entries
@@ -1716,6 +1735,20 @@ class AppBridge(QObject):
             self.syncLogsChanged.emit()
             self.backendLogsChanged.emit()
         self._emit_sync_state()
+
+    def _start_backend_probe(self) -> None:
+        if not self._sync_dal or self._backend_probe_in_flight:
+            return
+        self._backend_probe_in_flight = True
+
+        def _task() -> None:
+            try:
+                snapshot = self._sync_dal.get_sync_snapshot()
+            except Exception as exc:
+                snapshot = {"probe_error": str(exc)}
+            self.backendProbeFinished.emit(snapshot)
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def _reset_auto_pull_timer(self) -> None:
         if not hasattr(self, "_assignment_refresh_timer"):
@@ -2243,18 +2276,17 @@ class AppBridge(QObject):
         if self._wifi_busy:
             return
         self._wifi_scan_silent = silent
-        self._set_wifi_busy(True, "Status: Scanning...")
+        self._set_wifi_busy(True)
         if not silent:
             self._wifi_status_color = "#2563EB"
             self.wifiStatusColorChanged.emit()
 
         def _task() -> None:
             try:
-                command = (
-                    ["netsh", "wlan", "show", "networks", "mode=bssid"]
-                    if os.name == "nt"
-                    else ["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list"]
-                )
+                if os.name != "nt":
+                    self.wifiScanFinished.emit(scan_wifi_networks(rescan=not silent), "")
+                    return
+                command = ["netsh", "wlan", "show", "networks", "mode=bssid"]
                 result = subprocess.run(
                     command,
                     capture_output=True,
@@ -2267,15 +2299,13 @@ class AppBridge(QObject):
                     if os.name == "nt" and ("location permission" in detail.lower() or "requires elevation" in detail.lower()):
                         detail = "Windows requires Location services for Wi-Fi scanning. Enable Location in Privacy & security, then scan again."
                     raise RuntimeError(detail)
-                if os.name == "nt":
-                    networks = sorted({
-                        match.group(1).strip()
-                        for line in result.stdout.splitlines()
-                        if (match := re.match(r"^\s*SSID\s+\d+\s*:\s*(.+)$", line))
-                        and match.group(1).strip()
-                    })
-                else:
-                    networks = sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
+                names = sorted({
+                    match.group(1).strip()
+                    for line in result.stdout.splitlines()
+                    if (match := re.match(r"^\s*SSID\s+\d+\s*:\s*(.+)$", line))
+                    and match.group(1).strip()
+                })
+                networks = [{"ssid": name, "security": "Not detected", "mode": "unknown"} for name in names]
                 self.wifiScanFinished.emit(networks, "")
             except FileNotFoundError:
                 tool = "netsh" if os.name == "nt" else "nmcli"
@@ -2302,25 +2332,29 @@ class AppBridge(QObject):
         silent = self._wifi_scan_silent
         self._wifi_scan_silent = False
         if error:
-            self._wifi_networks = []
-            self.wifiNetworksChanged.emit()
             if not silent:
                 self._set_wifi_status(f"Status: Error - {error}", "#EF4444")
                 self.alertRequested.emit("Wi-Fi Scan Failed", error)
             return
-        self._wifi_networks = list(networks)
-        self.wifiNetworksChanged.emit()
+        names = [row["ssid"] for row in networks]
+        if self._wifi_networks != names or self._wifi_network_details != networks:
+            self._wifi_networks = names
+            self._wifi_network_details = list(networks)
+            self.wifiNetworksChanged.emit()
+        self.refreshWifiStatus()
         if silent:
             return
-        if networks:
+        if self._wifi_status.startswith("Status: Connected"):
+            return
+        if names:
             self._set_wifi_status(f"Status: Scan Complete ({len(networks)} found)", "#10B981")
         else:
             self._set_wifi_status("Status: No networks found", "#F59E0B")
 
     @Slot(str, str)
-    def connectWifiNetwork(self, ssid: str, password: str) -> None:
-        ssid = ssid.strip()
-        if not ssid:
+    @Slot(str, str, str)
+    def connectWifiNetwork(self, ssid: str, password: str, security: str = "auto") -> None:
+        if not ssid.strip():
             self.alertRequested.emit("Wi-Fi", "Enter or select a Wi-Fi network first.")
             return
         if os.name == "nt":
@@ -2333,48 +2367,20 @@ class AppBridge(QObject):
         self._set_wifi_busy(True, f"Status: Connecting to {ssid}...")
         self._wifi_status_color = "#2563EB"
         self.wifiStatusColorChanged.emit()
+        detected_mode = next((row["mode"] for row in self._wifi_network_details if row["ssid"] == ssid), "")
 
         def _task() -> None:
             try:
-                cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-                if password:
-                    cmd.extend(["password", password])
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=35, check=False)
-                detail = (result.stderr or result.stdout or "Connection failed. Check the password.").strip()
-                # NetworkManager may reuse a saved profile whose PSK is missing.
-                # In that case, the password on "dev wifi connect" is not enough
-                # to satisfy the profile's secret request.
-                if result.returncode != 0 and password and (
-                    "secrets were required" in detail.lower() or "802-11-wireless-security.psk" in detail.lower()
-                ):
-                    secret_path = None
-                    try:
-                        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as secret_file:
-                            secret_path = secret_file.name
-                            secret_file.write(f"802-11-wireless-security.psk:{password}\n")
-                        result = subprocess.run(
-                            ["nmcli", "connection", "up", "id", ssid, "passwd-file", secret_path],
-                            capture_output=True, text=True, timeout=35, check=False,
-                        )
-                        detail = (result.stderr or result.stdout or "Connection failed. Check the password.").strip()
-                    finally:
-                        if secret_path:
-                            os.unlink(secret_path)
-                if result.returncode != 0 and (
-                    "secrets were required" in detail.lower() or "802-11-wireless-security.psk" in detail.lower()
-                ):
-                    detail = "This network needs a Wi-Fi password. Check the Password field and try again."
-                self.wifiConnectFinished.emit(result.returncode == 0, ssid, detail)
-            except FileNotFoundError:
-                self.wifiConnectFinished.emit(False, ssid, "NetworkManager utility 'nmcli' is not installed.")
-            except subprocess.TimeoutExpired:
-                self.wifiConnectFinished.emit(False, ssid, "Connection attempt timed out. Please try again.")
+                connect_wifi_network(ssid, password, security, detected_mode=detected_mode)
+                self.wifiConnectFinished.emit(True, ssid, "")
             except Exception as exc:
                 self.wifiConnectFinished.emit(False, ssid, str(exc))
 
         threading.Thread(target=_task, daemon=True).start()
 
     def _finish_wifi_connect(self, success: bool, ssid: str, detail: str) -> None:
+        if success and (detail != "status-only" or self._wifi_status != f"Status: Connected to {ssid}"):
+            self._start_backend_probe()
         if detail == "status-only":
             self._set_wifi_status(f"Status: Connected to {ssid}", "#10B981")
             return
@@ -2422,17 +2428,19 @@ class AppBridge(QObject):
                     text=True,
                     timeout=5,
                     check=False,
+                    env={**os.environ, "LC_ALL": "C"},
                 )
                 if result.returncode != 0:
                     raise RuntimeError((result.stderr or result.stdout or "Unable to check Wi-Fi status").strip())
                 wifi_found = False
                 for line in result.stdout.splitlines():
-                    parts = line.split(":", 3)
+                    parts = split_nmcli_fields(line)
                     if len(parts) < 4 or parts[1].strip() != "wifi":
                         continue
                     wifi_found = True
                     if parts[2].strip() == "connected":
-                        self.wifiConnectFinished.emit(True, parts[3].strip(), "status-only")
+                        ssid = connected_wifi_ssid(parts[0], parts[3])
+                        self.wifiConnectFinished.emit(True, ssid, "status-only")
                         return
                 status = "Status: Disconnected" if wifi_found else "Status: Error - No Wi-Fi adapter detected"
                 color = "#526176" if wifi_found else "#F59E0B"

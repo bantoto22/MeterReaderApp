@@ -252,6 +252,15 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(self.dal.authenticateMeterReader("reader", "secret"), {"id": 12})
         remote.is_online.assert_not_called()
 
+    def test_snapshot_includes_health_error_without_requiring_queued_readings(self):
+        self.remote.last_health_error = "Connection error at https://device.example.test/health: DNS lookup failed"
+        snapshot = self.dal.get_sync_snapshot()
+        self.assertFalse(snapshot["backend_online"])
+        self.assertEqual(snapshot["pending_count"], 0)
+        self.assertIn("DNS lookup failed", snapshot["backend_health_error"])
+        self.remote.online = True
+        self.assertEqual(self.dal.get_sync_snapshot()["backend_health_error"], "")
+
     def test_sync_error_explains_database_lock(self):
         diagnostic = format_sync_error("Updating the device cache", sqlite3.OperationalError("database is locked"))
         self.assertIn("Stage: Updating the device cache", diagnostic)

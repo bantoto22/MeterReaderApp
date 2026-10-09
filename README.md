@@ -122,6 +122,10 @@ inspect Sync Logs for the HTTP or network error. A failed health check does not
 remove queued readings or cached consumer records. The app does not report an
 upload failure when there are no queued readings.
 
+Settings → Backend Logs also shows the current health-check failure when the
+upload queue is empty. The app rechecks the backend after a Wi-Fi connection,
+including when automatic sync is disabled.
+
 If the Pi reaches the hostname but reports `SSL: UNEXPECTED_EOF_WHILE_READING`,
 check the Funnel's public HTTPS path. On the backend host, confirm that
 `tailscale funnel status` still shows `/ proxy http://127.0.0.1:3001`. If the
@@ -130,6 +134,26 @@ cycle only that Funnel route with `tailscale funnel --https=443 off` followed by
 `tailscale funnel --bg 3001`, then repeat the Pi's `curl` check. This briefly
 interrupts public access. An IPv6 `Network is unreachable` message is not the
 cause when curl subsequently tries IPv4; check the final IPv4/TLS result.
+
+### Wi-Fi connections on the Raspberry Pi
+
+In Settings → Connectivity, scan and select a network. **Security** defaults to
+**Automatic** and the app displays the detected security type. WPA/WPA2 Personal,
+WPA3 Personal, and Open can also be selected explicitly. Enter the password for a
+new secured network; leave Password blank to reuse a saved password. Open
+networks do not require a password. WEP and enterprise networks require setup in
+Raspberry Pi network settings.
+
+The app matches saved profiles by their actual SSID and activates them by UUID,
+so a renamed profile still works. It sets the required security key management
+before connecting and supplies entered passwords through NetworkManager's
+private temporary password file. Other network profiles are retained. These
+commands follow the [NetworkManager nmcli reference](https://networkmanager.dev/docs/api/latest/nmcli.html).
+Background scans preserve the selected network and its security information.
+
+When updating the Pi, deploy the updated `src` and `assets/qml` directories
+together, including `src/wifi.py`, and restart the app. Keep the device's `.env`
+and `data` directory.
 
 ### Device provisioning and heartbeat
 
