@@ -1769,7 +1769,11 @@ class BackendApiClient:
             if clean_query:
                 url += "?" + parse.urlencode(clean_query)
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-SLR-Client": "handheld",
+        }
         if self._session_token:
             headers["Authorization"] = f"Bearer {self._session_token}"
         req = request.Request(
@@ -1817,6 +1821,7 @@ class BackendApiClient:
         return False
 
     def authenticate_meter_reader(self, username: str, password: str) -> dict:
+        self.set_authenticated_session(None)
         status, data = self._req("POST", "/api/login", payload={"username": username, "password": password})
         # Only explicit authentication rejections should block cached login.
         # Transport failures and unavailable endpoints must reach offline fallback.
@@ -1832,7 +1837,6 @@ class BackendApiClient:
         if int(user.get("role_id") or 0) != 3:
             raise PermissionError("This account is not an active Meter Reader.")
         account_id = user.get("id") or user.get("account_id")
-        self._meter_reader_id = int(account_id) if account_id not in (None, "") else None
         token_sources = (data, data.get("data") if isinstance(data.get("data"), dict) else {}, user)
         self._session_token = next(
             (
@@ -1846,6 +1850,12 @@ class BackendApiClient:
             ),
             "",
         )
+        if not self._session_token:
+            raise RuntimeError(
+                "Backend login did not return a device session token. "
+                "Update the backend to support handheld login, then sign in online again."
+            )
+        self._meter_reader_id = int(account_id) if account_id not in (None, "") else None
         return {
             "id": account_id,
             "account_id": account_id,

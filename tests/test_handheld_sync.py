@@ -714,6 +714,7 @@ class HandheldSyncTests(unittest.TestCase):
                 if path == "/api/login":
                     return 200, {
                         "success": True,
+                        "token": "meter-reader-token",
                         "user": {"id": 12, "username": "reader", "fullName": "Meter Reader", "role_id": 3},
                     }
                 if path == "/api/handheld/consumers":

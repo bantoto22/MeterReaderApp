@@ -956,7 +956,11 @@ class AppBridge(QObject):
         if status == 401:
             self._heartbeat_timer.stop()
             self._heartbeat_authenticated = False
-            self._heartbeat_dal._audit(None, "failed", "Device heartbeat: Meter Reader session expired.")
+            self._heartbeat_dal.setAuthenticatedSession(None, None)
+            self._heartbeat_dal._audit(
+                None, "failed",
+                "Device online session expired. Sign in online again to sync; local readings remain available.",
+            )
             self.sessionExpired.emit()
         elif status == 400:
             self._heartbeat_timer.stop()
@@ -3628,7 +3632,7 @@ class HybridMainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.login_page)
 
     def _on_session_expired(self) -> None:
-        self._on_logout_requested()
+        # Expiry stops authenticated online requests, not local field work.
         self.login_page.bridge.show_session_expired()
 
 def run_qt_hybrid() -> int:

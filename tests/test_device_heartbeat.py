@@ -203,6 +203,7 @@ class DeviceHeartbeatTests(unittest.TestCase):
         self.assertEqual(req.full_url, "https://example.test/api/handheld/device-heartbeat")
         self.assertEqual(req.get_header("Authorization"), "Bearer session-secret")
         self.assertEqual(req.get_header("Content-type"), "application/json")
+        self.assertEqual(req.get_header("X-slr-client"), "handheld")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 10)
         import json
         self.assertEqual(json.loads(req.data), {
@@ -291,6 +292,9 @@ class DeviceHeartbeatTests(unittest.TestCase):
                     if status == 401:
                         self.assertEqual(len(view.sessionExpired.calls), 1)
                         self.assertFalse(view._heartbeat_timer.active)
+                        self.assertEqual(dal.sessions[-1], (None, None))
+                        self.assertIn("local readings remain available", dal.audit[-1][1])
+                        self.assertEqual(dal.saveMeterReading({"reading_id": "offline-r1"})["status"], "queued")
                     elif status == 400:
                         self.assertTrue(view._heartbeat_config_invalid)
                         self.assertIn("bad [redacted]", dal.audit[-1][1])
@@ -299,7 +303,7 @@ class DeviceHeartbeatTests(unittest.TestCase):
                         self.assertIn("retry in 120s", dal.audit[-1][1])
                 self.assertNotIn("session-secret", str(dal.audit))
 
-    def test_expired_session_returns_to_existing_login_flow(self):
+    def test_expired_online_session_keeps_local_field_work_open(self):
         events = []
         window = SimpleNamespace(
             _on_logout_requested=lambda: events.append("logout"),
@@ -308,7 +312,7 @@ class DeviceHeartbeatTests(unittest.TestCase):
             )),
         )
         HybridMainWindow._on_session_expired(window)
-        self.assertEqual(events, ["logout", "login notice"])
+        self.assertEqual(events, ["login notice"])
 
     def test_backoff_blocks_reconnect_until_retry_window(self):
         view, dal = self._view()

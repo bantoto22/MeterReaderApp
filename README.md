@@ -69,6 +69,13 @@ The first login requires a reachable backend. After a successful online login,
 the same credentials work offline on that device. Connection failures use the
 cached account; an explicit rejection of credentials or account access does not.
 
+Device login sends `X-SLR-Client: handheld` with JSON credentials to `/api/login`.
+The backend must return a session `token` for an active Meter Reader; the app
+keeps it in memory and uses Bearer authentication for API calls and heartbeats.
+Browser cookies and CSRF tokens are not device session tokens. Deploy the
+matching backend login update, restart the backend, then update and restart the
+Pi app and sign in online. Keep the Pi's existing `.env` and `data` directory.
+
 ## Features
 
 - Zone-based meter reading
@@ -84,6 +91,11 @@ The handheld sync layer lives in `src/handheld_sync.py` and is designed for:
 - Offline mode: local SQLite cache + `sync_queue_meter_readings`.
 - PostgreSQL access: the Node backend is the only process that holds database credentials.
 - Reconnect: the backend API queue flushes with conflict detection and audit logs.
+
+The device normally works offline. After initial account and route provisioning,
+readers use cached data and save readings on the device. Online sessions serve
+data synchronization and presence reporting; their expiry does not close local
+field work or discard readings.
 
 ### Environment
 
@@ -101,9 +113,9 @@ The device does not store third-party cloud keys or PostgreSQL credentials.
 ### Offline Operation
 
 - Each meter reader must sign in online at least once so the device can cache a salted password hash and assigned route data.
-- While offline, the reader can sign in and browse cached schedules and consumers. A new bill cannot be previewed or
-  printed until the backend reserves its shared billing reference. Offline printing requires a future backend feature
-  that preallocates non-overlapping reference blocks to devices.
+- While offline, the reader can sign in, browse cached schedules and consumers, and record readings locally.
+  Scheduled bills can use billing references reserved during the previous route sync. A bill without a reserved
+  reference needs a brief sync to prepare that reference before it can be previewed or printed.
 - Offline readings remain in the local SQLite queue and upload automatically or through `Sync Now` when the backend API becomes reachable.
 - An invalid or inactive account response from the backend is never bypassed with stale cached credentials.
 
@@ -167,8 +179,9 @@ ID to another Pi. Keep the `.env` file across app updates. The ID accepts up to
 
 After an online Meter Reader login, the app sends an authenticated device
 heartbeat immediately and every 60 seconds, plus one when Wi-Fi reconnects.
-It stops on logout or shutdown. A 401 response returns the reader to login;
-other heartbeat failures are recorded in sync logs and never block readings.
+It stops on logout or shutdown. A 401 response clears the online session and
+pauses heartbeats while keeping local field work open. Online sign-in is required
+again before syncing; heartbeat failures never discard queued readings.
 The backend should show **Active** if a heartbeat arrived within the past
 three minutes, **Inactive** after three minutes, and **No registered device**
 before the first heartbeat. The device does not send a reader ID in the
