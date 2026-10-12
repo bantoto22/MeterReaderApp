@@ -816,6 +816,13 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
                (SELECT COUNT(*) FROM reading_assignment ra
                 WHERE ra.schedule_id = reading_schedule.schedule_id AND ra.is_read = 0) AS unread_count,
                CASE
+                   WHEN EXISTS (
+                       SELECT 1 FROM reading_assignment ra
+                       WHERE ra.schedule_id = reading_schedule.schedule_id
+                   ) AND NOT EXISTS (
+                       SELECT 1 FROM reading_assignment ra
+                       WHERE ra.schedule_id = reading_schedule.schedule_id AND ra.is_read = 0
+                   ) THEN 'Completed'
                    WHEN date(COALESCE(due_date, start_date, schedule_date)) < date('now') THEN 'Overdue'
                    WHEN lower(status) IN ('completed', 'cancelled') THEN status
                    ELSE status

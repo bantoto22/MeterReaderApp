@@ -67,7 +67,7 @@ Rectangle {
                         spacing: 6
 
                         Text {
-                            text: bridgeObj && bridgeObj.selectedRouteIsPast ? "OVERDUE FIELD ROUTE" : "Current / upcoming routes"
+                            text: bridgeObj && bridgeObj.selectedRouteStatus === "Completed" ? "COMPLETED FIELD ROUTE" : (bridgeObj && bridgeObj.selectedRouteIsPast ? "OVERDUE FIELD ROUTE" : "Current / upcoming routes")
                             font.pixelSize: TouchMetrics.bodyText
                             font.family: "Montserrat"
                             font.bold: true
@@ -150,7 +150,7 @@ Rectangle {
                             visible: bridgeObj && (bridgeObj.pastRoutes.length > 1 || (bridgeObj.pastRoutes.length === 1 && !bridgeObj.selectedRouteIsPast))
 
                             Text {
-                                text: bridgeObj && bridgeObj.pastRoutes.length > 1 ? "Past schedules" : "Missed schedule"
+                                text: bridgeObj && bridgeObj.pastRoutes.length > 1 ? "Past schedules" : "Past schedule"
                                 font.pixelSize: TouchMetrics.helperText
                                 font.family: "Montserrat"
                                 font.bold: true
@@ -169,7 +169,7 @@ Rectangle {
                                     var ids = bridgeObj.pastRoutes.map(function(route) { return route.scheduleId })
                                     return ids.indexOf(bridgeObj.selectedRouteId)
                                 }
-                                displayText: currentIndex >= 0 ? currentText : "Open a missed schedule..."
+                                displayText: currentIndex >= 0 ? currentText : "Open a past schedule..."
 
                                 background: Rectangle {
                                     implicitHeight: TouchMetrics.buttonHeight
@@ -210,7 +210,7 @@ Rectangle {
                                     border.width: 1
                                 }
                                 contentItem: Text {
-                                    text: bridgeObj && bridgeObj.pastRoutes.length === 1 ? ("Open " + bridgeObj.pastRoutes[0].label) : "Open missed schedule"
+                                    text: bridgeObj && bridgeObj.pastRoutes.length === 1 ? ("Open " + bridgeObj.pastRoutes[0].label) : "Open past schedule"
                                     color: "#7F1D1D"
                                     font.family: "Montserrat"
                                     font.pixelSize: TouchMetrics.bodyText

@@ -71,7 +71,7 @@ class NewScheduleStatusTests(unittest.TestCase):
         reassigned = AppBridge._search_selected_route(self._view(current), "Consumer 2", 10, False)
         self.assertEqual([(row["schedule_id"], row["id"]) for row in reassigned], [(202, 2)])
 
-    def test_refresh_selects_new_route_unless_reader_chose_a_past_route(self):
+    def _assignment_view(self):
         def signal():
             return SimpleNamespace(emit=lambda *args: None)
 
@@ -86,6 +86,54 @@ class NewScheduleStatusTests(unittest.TestCase):
         view._selected_route = lambda: next(
             (r for r in view._assigned_routes if r["scheduleId"] == view._selected_route_id), {}
         )
+        return view
+
+    def test_overdue_route_marks_only_unread_consumers_overdue(self):
+        route = database.get_assigned_routes(12)[0]
+        self.assertEqual(route["display_status"], "Overdue")
+        self.assertEqual(route["unread_count"], 2)
+        rows = database.get_zone_consumers_with_status("Zone 1", meter_reader_id=12, schedule_id=101)
+        self.assertEqual(
+            {row["id"]: row["deadline_status"] for row in rows},
+            {1: "Completed", 2: "Overdue 3d", 3: "Overdue 3d"},
+        )
+
+    def test_finishing_overdue_route_offline_refreshes_completed_status(self):
+        view = self._assignment_view()
+        AppBridge._refresh_local_assignment_views(view)
+        self.assertEqual(view._selected_route()["status"], "Overdue")
+        selected_id = view._selected_route_id
+        view._route_selected_by_user = True
+        for consumer_id, sync_status in ((2, "pending"), (3, "failed")):
+            database.save_reading(
+                consumer_id, 10, 10, schedule_id=101,
+                schedule_date=self.old_start, schedule_due_date=self.old_due,
+                reading_sync_status=sync_status, sync_reading_id=f"saved-{consumer_id}",
+            )
+            # A stale API snapshot must not undo a locally saved reading.
+            self._add_consumer(consumer_id, 101, False)
+        AppBridge._refresh_local_assignment_views(view)
+        self.assertEqual(view._selected_route_id, selected_id)
+        self.assertEqual(view._selected_route()["status"], "Completed")
+        route = database.get_assigned_routes(12)[0]
+        self.assertEqual((route["assignment_count"], route["unread_count"]), (3, 0))
+        rows = database.get_zone_consumers_with_status("Zone 1", meter_reader_id=12, schedule_id=101)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["deadline_status"] == "Completed" for row in rows))
+
+        database.update_reading_sync_state("saved-2", "conflict", "rejected")
+        AppBridge._refresh_local_assignment_views(view)
+        self.assertEqual(view._selected_route()["status"], "Overdue")
+        self.assertEqual(database.get_assigned_routes(12)[0]["unread_count"], 1)
+
+    def test_expired_route_without_cached_assignments_is_not_completed(self):
+        self._add_schedule(202, self.old_start, self.old_due)
+        route = next(row for row in database.get_assigned_routes(12) if row["schedule_id"] == 202)
+        self.assertEqual(route["assignment_count"], 0)
+        self.assertEqual(route["display_status"], "Overdue")
+
+    def test_refresh_selects_new_route_unless_reader_chose_a_past_route(self):
+        view = self._assignment_view()
         AppBridge._refresh_local_assignment_views(view)
         old_route_id = view._selected_route_id
         self._add_schedule(202, self.new_start, self.new_due)

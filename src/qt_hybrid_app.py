@@ -3227,9 +3227,7 @@ class AppBridge(QObject):
                 self.presentReadingChanged.emit()
                 self.dueDateChanged.emit()
                 self.validationMessageChanged.emit()
-                self.update_stats()
-                self._refresh_search_suggestions()
-                self._refresh_zone_consumers()
+                self._refresh_local_assignment_views()
                 self.alertRequested.emit(
                     "Reading Saved",
                     "Reading saved in SQLite. Bill payment date and penalties are pending server calculation.",
@@ -3277,9 +3275,7 @@ class AppBridge(QObject):
             self.consumptionChanged.emit()
             self.validationColorChanged.emit()
             self.validationMessageChanged.emit()
-            self.update_stats()
-            self._refresh_search_suggestions()
-            self._refresh_zone_consumers()
+            self._refresh_local_assignment_views()
             self.refreshPrintHistory()
             if result.get("printed", True):
                 message = "Receipt printed successfully."
