@@ -710,12 +710,12 @@ Rectangle {
                         border.width: 1
                         readonly property int rowCount: bridgeObj ? bridgeObj.zoneConsumers.length : 0
                         readonly property real columnsWidth: Math.max(0, width - 16 - 32)
-                        readonly property real meterColumnWidth: columnsWidth * 0.23
-                        readonly property real nameColumnWidth: columnsWidth * 0.23
-                        readonly property real statusColumnWidth: columnsWidth * 0.14
+                        readonly property real meterColumnWidth: columnsWidth * 0.20
+                        readonly property real nameColumnWidth: columnsWidth * 0.20
+                        readonly property real statusColumnWidth: columnsWidth * 0.20
                         readonly property real readingColumnWidth: columnsWidth * 0.14
                         readonly property real actionColumnWidth: columnsWidth * 0.26
-                        implicitHeight: Math.min(560, Math.max(160, 58 + rowCount * TouchMetrics.tableRowHeight))
+                        implicitHeight: Math.min(560, Math.max(160, 72 + rowCount * TouchMetrics.tableRowHeight))
 
                         ColumnLayout {
                             anchors.fill: parent
@@ -742,7 +742,7 @@ Rectangle {
 
                                 delegate: Rectangle {
                                     width: ListView.view.width
-                                    height: TouchMetrics.tableRowHeight
+                                    height: Math.max(TouchMetrics.tableRowHeight, readingStatusColumn.implicitHeight + 8)
                                     color: modelData.is_read ? "#E8F5E9" : "white"
 
                                     RowLayout {
@@ -765,12 +765,25 @@ Rectangle {
                                                 font.family: "Montserrat"; font.pixelSize: 9; color: "#64748B"; elide: Text.ElideRight; leftPadding: 8
                                             }
                                         }
-                                        Text {
+                                        ColumnLayout {
+                                            id: readingStatusColumn
                                             Layout.preferredWidth: detailsTable.statusColumnWidth
-                                            text: modelData.is_read ? (modelData.reading_sync_status === "synced" ? "Completed" : "Saved") : (modelData.deadline_status || "Pending")
-                                            font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; font.bold: true
-                                            color: modelData.is_read ? "#10B981" : ((modelData.deadline_status || "").indexOf("Overdue") === 0 ? "#DC2626" : ((modelData.deadline_status || "") !== "Pending" ? "#D97706" : "#64748B"))
-                                            verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+                                            spacing: 0
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: modelData.reading_status_label || "Pending"
+                                                font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; font.bold: true
+                                                color: modelData.is_read ? "#10B981" : ((modelData.deadline_status || "").indexOf("Overdue") === 0 ? "#DC2626" : "#64748B")
+                                                horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+                                            }
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: modelData.reading_sync_label || ""
+                                                visible: text.length > 0
+                                                font.family: "Montserrat"; font.pixelSize: 9
+                                                color: modelData.reading_sync_status === "failed" || modelData.reading_sync_status === "conflict" ? "#DC2626" : "#64748B"
+                                                horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+                                            }
                                         }
                                         Text { Layout.preferredWidth: detailsTable.readingColumnWidth; text: modelData.is_read ? (modelData.reading_value || "-") : "-"; font.family: "Montserrat"; font.pixelSize: TouchMetrics.helperText; color: "#0F172A"; verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
                                         RowLayout {

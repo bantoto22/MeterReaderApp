@@ -2618,7 +2618,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
         headers = [
             ("Meter", 10, "w"),
             ("Name", 16, "w"),
-            ("Status", 6, "center"),
+            ("Status", 16, "center"),
             ("Reading", 8, "center"),
             ("Action", 10, "center")
         ]
@@ -2654,7 +2654,7 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             is_read = consumer['is_read']
             bg_color = "#E8F5E9" if is_read else WHITE
             
-            row_frame = tk.Frame(rows_frame, bg=bg_color, height=36)
+            row_frame = tk.Frame(rows_frame, bg=bg_color, height=42)
             row_frame.pack(fill="x", pady=(0, 1))
             row_frame.pack_propagate(False)
             
@@ -2667,15 +2667,15 @@ class MeterReaderApp(tb.Window if tb else tk.Tk):
             tk.Label(row_frame, text=name, font=(FONT_FAMILY, 10),
                     bg=bg_color, fg=DARK_TEXT, width=15, anchor="w").pack(side="left", padx=3, pady=6)
             
-            # Status (width 6, centered)
-            status_text = "Read" if is_read else "Pending"
+            # Show reading and synchronization states on separate lines.
+            status_text = consumer.get("reading_status_label") or ("Read" if is_read else "Pending")
+            sync_text = consumer.get("reading_sync_label") or ""
+            if sync_text:
+                status_text += "\n" + sync_text
             status_color = SUCCESS_GREEN if is_read else MID_TEXT
             status_lbl = tk.Label(row_frame, text=status_text, font=(FONT_FAMILY, 8, "bold"),
-                    bg=bg_color, fg=status_color, width=6, anchor="center")
-            status_lbl.pack(side="left", padx=3, pady=6)
-            # Tooltip effect on hover
-            status_lbl.bind("<Enter>", lambda e, lbl=status_lbl, txt=status_text: lbl.config(text="Read" if txt == "Read" else "Pending"))
-            status_lbl.bind("<Leave>", lambda e, lbl=status_lbl, txt=status_text: lbl.config(text=txt))
+                    bg=bg_color, fg=status_color, width=16, anchor="center")
+            status_lbl.pack(side="left", padx=3, pady=0)
             
             # Reading (width 8, centered to align with header)
             reading_val = str(consumer['reading_value']) if is_read and consumer['reading_value'] else "-"

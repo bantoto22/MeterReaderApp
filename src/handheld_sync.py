@@ -162,6 +162,24 @@ def _update_local_reading_state(reading_id: str | None, sync_status: str, readin
         return
 
 
+def _apply_server_reading_state(reading: dict, response: dict) -> dict:
+    """Reconcile statuses while retaining the device's stable reading and bill IDs."""
+    confirmed = dict(reading)
+    server = response.get("meterreading") if isinstance(response, dict) else None
+    server = server if isinstance(server, dict) else {}
+    confirmed["reading_sync_status"] = str(
+        server.get("sync_status") or server.get("reading_sync_status") or "synced"
+    ).strip().lower()
+    status = str(server.get("reading_status") or "").strip()
+    if status:
+        confirmed["reading_status"] = status
+    _update_local_reading_state(
+        reading.get("reading_id"), confirmed["reading_sync_status"],
+        status or None,
+    )
+    return confirmed
+
+
 def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> str:
     """Return an operator-friendly diagnostic without discarding the raw error."""
     detail = str(exc or "Unknown error").strip() or "Unknown error"
@@ -2479,7 +2497,7 @@ class HandheldSyncDataAccess:
                 reading.get("bill_sync_id"),
             )
             queued = self._queue_for_sync("create", reading)
-            _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
+            _update_local_reading_state(reading.get("reading_id"), "pending")
             self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
@@ -2490,7 +2508,7 @@ class HandheldSyncDataAccess:
             reading.get("bill_sync_id"),
         )
         queued = self._queue_for_sync(operation, reading)
-        _update_local_reading_state(reading.get("reading_id"), "pending", "valid")
+        _update_local_reading_state(reading.get("reading_id"), "pending")
         if not self.is_online():
             self.local.log_audit(queued["id"], "pending", f"Queued offline {operation} operation", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
@@ -2498,6 +2516,7 @@ class HandheldSyncDataAccess:
             reading = self._ensure_billing_reference(reading)
             remote = self.remote.save_reading_bundle(reading)
             self.local.mark_target_synced(queued["id"], "backend", remote)
+            reading = _apply_server_reading_state(reading, remote)
             self._cache_confirmed_bill(reading, remote)
             if reading.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
                 saved_bill = remote.get("bill") if isinstance(remote, dict) else {}
@@ -2505,7 +2524,6 @@ class HandheldSyncDataAccess:
                     str(reading["bill_sync_id"]),
                     saved_bill.get("bill_id") if isinstance(saved_bill, dict) else None,
                 )
-            _update_local_reading_state(reading.get("reading_id"), "synced", "valid")
             self.local.log_audit(
                 queued["id"],
                 "success",
@@ -2531,7 +2549,7 @@ class HandheldSyncDataAccess:
             }
         except Exception as exc:
             self.local.mark_target_failed(queued["id"], "backend", str(exc))
-            _update_local_reading_state(reading.get("reading_id"), "failed", "valid")
+            _update_local_reading_state(reading.get("reading_id"), "failed")
             self.local.log_audit(queued["id"], "failed", f"Backend API save failed, queued for retry: {exc}", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
@@ -2642,6 +2660,7 @@ class HandheldSyncDataAccess:
                 payload = self._ensure_billing_reference(payload)
                 remote_result = self.remote.save_reading_bundle(payload)
                 self.local.mark_target_synced(queue_id, "backend", remote_result)
+                payload = _apply_server_reading_state(payload, remote_result)
                 self._cache_confirmed_bill(payload, remote_result)
                 if payload.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
                     saved_bill = remote_result.get("bill") if isinstance(remote_result, dict) else {}
@@ -2649,7 +2668,6 @@ class HandheldSyncDataAccess:
                         str(payload["bill_sync_id"]),
                         saved_bill.get("bill_id") if isinstance(saved_bill, dict) else None,
                     )
-                _update_local_reading_state(payload.get("reading_id"), "synced", "valid")
                 self._audit(
                     queue_id,
                     "success",
@@ -2672,7 +2690,7 @@ class HandheldSyncDataAccess:
                 )
                 try:
                     self.local.mark_target_failed(queue_id, "backend", str(exc))
-                    _update_local_reading_state(payload.get("reading_id"), "failed", "valid")
+                    _update_local_reading_state(payload.get("reading_id"), "failed")
                 except Exception as queue_exc:
                     diagnostic += "\n\n" + format_sync_error("Updating the local retry queue", queue_exc)
                 self._audit(queue_id, "failed", diagnostic, payload)

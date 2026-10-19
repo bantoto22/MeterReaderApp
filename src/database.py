@@ -1250,7 +1250,7 @@ def save_reading(
     """Insert a reading and attach it to the exact field assignment when available."""
     conn = get_connection()
     cur = conn.cursor()
-    normalized_status = str(reading_status or "valid").strip().lower()
+    normalized_status = str(reading_status or "valid").strip()
     normalized_sync = str(reading_sync_status or "pending").strip().lower()
     try:
         normalized_assignment_order = int(float(assignment_order)) if assignment_order not in (None, "") else None
@@ -1293,7 +1293,7 @@ def save_reading(
         (present_reading, present_reading, effective_reading_date, consumer_id),
     )
     if schedule_id not in (None, ""):
-        is_valid = normalized_status not in {"rejected", "deleted", "invalid"}
+        is_valid = normalized_status.lower() not in {"rejected", "deleted", "invalid"}
         conn.execute(
             """
             UPDATE reading_assignment
@@ -1326,13 +1326,13 @@ def update_reading_sync_state(
         conn.close()
         return False
     normalized_sync = str(sync_status or "pending").strip().lower()
-    normalized_reading = str(reading_status or row["reading_status"] or "valid").strip().lower()
+    normalized_reading = str(reading_status or row["reading_status"] or "valid").strip()
     conn.execute(
         "UPDATE readings SET reading_sync_status = ?, reading_status = ? WHERE id = ?",
         (normalized_sync, normalized_reading, row["id"]),
     )
     if row["schedule_id"] is not None:
-        valid = normalized_reading not in {"rejected", "deleted", "invalid"}
+        valid = normalized_reading.lower() not in {"rejected", "deleted", "invalid"}
         conn.execute(
             """
             UPDATE reading_assignment
@@ -1756,7 +1756,7 @@ def get_zone_consumers_with_status(
             r.consumption,
             COALESCE(r.reading_date, c.latest_reading_date) as reading_date,
             r.exception,
-            r.is_flagged
+            r.is_flagged, r.reading_status, r.reading_sync_status
            FROM consumers c
            JOIN zones z ON c.zone_id = z.id
            LEFT JOIN (
@@ -1825,7 +1825,7 @@ def get_zone_consumers_with_status(
             r.consumption,
             COALESCE(r.reading_date, c.latest_reading_date) as reading_date,
             r.exception,
-            r.is_flagged
+            r.is_flagged, r.reading_status, r.reading_sync_status
            FROM consumers c
            JOIN zones z ON c.zone_id = z.id
            LEFT JOIN (
@@ -1849,23 +1849,37 @@ def get_zone_consumers_with_status(
         if item.get("is_read"):
             item["deadline_status"] = "Completed"
             item["deadline_days"] = None
-            continue
-        try:
-            delta = (date.fromisoformat(due) - today).days if due else None
-        except ValueError:
-            delta = None
-        item["deadline_days"] = delta
-        if delta is None or delta > 2:
-            item["deadline_status"] = "Pending"
-        elif delta == 2:
-            item["deadline_status"] = "Due in 2d"
-        elif delta == 1:
-            item["deadline_status"] = "Due in 1d"
-        elif delta == 0:
-            item["deadline_status"] = "Due today"
         else:
-            overdue_days = abs(delta)
-            item["deadline_status"] = f"Overdue {overdue_days}d"
+            try:
+                delta = (date.fromisoformat(due) - today).days if due else None
+            except ValueError:
+                delta = None
+            item["deadline_days"] = delta
+            if delta is None or delta > 2:
+                item["deadline_status"] = "Pending"
+            elif delta == 2:
+                item["deadline_status"] = "Due in 2d"
+            elif delta == 1:
+                item["deadline_status"] = "Due in 1d"
+            elif delta == 0:
+                item["deadline_status"] = "Due today"
+            else:
+                overdue_days = abs(delta)
+                item["deadline_status"] = f"Overdue {overdue_days}d"
+
+        status = str(item.get("reading_status") or "").strip()
+        sync = str(item.get("reading_sync_status") or "").strip().lower()
+        item["reading_status_label"] = status or ("Read" if item.get("is_read") else item["deadline_status"])
+        if status.lower() == "valid" and sync != "synced":
+            item["reading_status_label"] = "Saved"
+        elif status.lower() == "pending" and not item.get("is_read"):
+            item["reading_status_label"] = item["deadline_status"]
+        item["reading_sync_label"] = ""
+        if item.get("is_read") or (status and status.lower() != "pending"):
+            item["reading_sync_label"] = {
+                "pending": "Waiting to sync", "failed": "Sync failed",
+                "conflict": "Sync conflict", "synced": "Synced",
+            }.get(sync, sync)
     return sort_and_mark_nearby(results)
 
 
@@ -2220,12 +2234,12 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                     assignment_order = None
                 reading_route_id = c.get("reading_route_id", c.get("Reading_Route_ID"))
                 reading_route_id = str(reading_route_id) if reading_route_id not in (None, "") else None
-                remote_status = str(c.get("reading_status") or "").strip().lower()
+                remote_status = str(c.get("reading_status") or "").strip()
                 raw_is_read = c.get("is_read")
                 remote_is_read = str(raw_is_read).strip().lower() in {"1", "true", "yes"}
-                remote_is_read = remote_is_read and remote_status not in {"rejected", "deleted", "invalid"}
-                assignment_status = "valid" if remote_is_read else (remote_status or "pending")
-                remote_sync = str(c.get("reading_sync_status") or ("synced" if remote_is_read else "pending")).strip().lower()
+                remote_is_read = remote_is_read and remote_status.lower() not in {"rejected", "deleted", "invalid"}
+                assignment_status = remote_status or ("valid" if remote_is_read else "pending")
+                remote_sync = str(c.get("reading_sync_status") or c.get("sync_status") or ("synced" if remote_is_read else "pending")).strip().lower()
                 cur.execute(
                     """
                     INSERT INTO reading_assignment (
@@ -2245,17 +2259,17 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                         reading_route_id = excluded.reading_route_id,
                         is_read = CASE
                             WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
-                             AND reading_assignment.reading_status = 'valid' THEN 1
+                             AND reading_assignment.is_read = 1 THEN 1
                             ELSE excluded.is_read
                         END,
                         reading_status = CASE
                             WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
-                             AND reading_assignment.reading_status = 'valid' THEN reading_assignment.reading_status
+                             AND reading_assignment.is_read = 1 THEN reading_assignment.reading_status
                             ELSE excluded.reading_status
                         END,
                         reading_sync_status = CASE
                             WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
-                             AND reading_assignment.reading_status = 'valid' THEN reading_assignment.reading_sync_status
+                             AND reading_assignment.is_read = 1 THEN reading_assignment.reading_sync_status
                             ELSE excluded.reading_sync_status
                         END,
                         updated_at = CURRENT_TIMESTAMP
