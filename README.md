@@ -114,8 +114,11 @@ The device does not store third-party cloud keys or PostgreSQL credentials.
 
 - Each meter reader must sign in online at least once so the device can cache a salted password hash and assigned route data.
 - While offline, the reader can sign in, browse cached schedules and consumers, and record readings locally.
-  Scheduled bills can use billing references reserved during the previous route sync. A bill without a reserved
-  reference needs a brief sync to prepare that reference before it can be previewed or printed.
+  Route sync reserves backend-issued billing references for every remaining reading day from each schedule's
+  start through its deadline, within the downloaded assignment window. Expired unread schedules prepare today's
+  reference. References remain in SQLite across restarts; each bill prints the same number it later uploads.
+  If that reading date has no cached reference, the device still saves the reading and queues it for sync,
+  but waits to print until it has the exact reference. It never prints a new receipt with `Billing Ref: N/A`.
 - Offline readings remain in the local SQLite queue and upload automatically or through `Sync Now` when the backend API becomes reachable.
 - An invalid or inactive account response from the backend is never bypassed with stale cached credentials.
 
@@ -191,11 +194,14 @@ from this Raspberry Pi app.
 
 ### Billing-reference lifecycle
 
-Before showing a new receipt, the device persists stable reading
-and bill UUIDs locally, calls `POST /api/handheld/billing-references/reserve`, and stores the returned
+During route sync, the device persists stable reading
+and bill UUIDs locally for each scheduled reading date, calls `POST /api/handheld/billing-references/reserve`, and stores the returned
 `SLRYYYY######` reference. Timeouts reuse the same UUIDs. The reading-bundle upload sends that exact reference and
 separate bill UUID. After the backend confirms the saved bill, the local reservation becomes `Used`; the printed
 reference remains permanently assigned to that bill and is never reused. Reprints retain the original reference.
+The backend binds each reservation to its bill date, so a reference for yesterday is never reassigned to
+today's bill. Preparing future scheduled dates uses the same backend sequence and separate bill UUIDs.
+Sync results report reference preparation failures; retry sync before leaving connectivity if any occur.
 
 ### Handheld UI
 

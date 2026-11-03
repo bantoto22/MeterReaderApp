@@ -2068,9 +2068,9 @@ class BackendApiClient:
             raise RuntimeError("Backend reading sync succeeded but did not return the authoritative response.bill.")
         saved_bill = data["bill"]
         if str(saved_bill.get("sync_id") or "") != bill_sync_id:
-            raise RuntimeError("Backend reading sync returned a bill with a different sync_id.")
+            raise ValueError("Backend reading sync returned a bill with a different sync_id.")
         if str(saved_bill.get("billing_reference") or "") != billing_reference:
-            raise RuntimeError("Backend reading sync returned a different billing_reference.")
+            raise ValueError("Backend reading sync returned a different billing_reference.")
         return data
 
     def upsert_meter_reading(self, payload: dict) -> dict:
@@ -2240,13 +2240,15 @@ class HandheldSyncDataAccess:
         except Exception as exc:
             self.local.log_audit(None, "failed", f"Could not cache confirmed backend bill: {exc}")
 
-    def preReserveAssignedBills(self, consumers: list[dict]) -> dict:
-        """Reserve today's bill references for unread assignments while online."""
+    def preReserveAssignedBills(self, consumers: list[dict], through_date: str | None = None) -> dict:
+        """Cache date-bound references for each remaining scheduled reading day."""
         result = {"ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": []}
         if not self.remote or not self.remote.is_online():
             self.last_pre_reservation_result = result
             return result
         today = _manila_current_date()
+        window_end = _parse_date(through_date or _device_schedule_window(today)[1]) or today
+        seen: set[tuple[int, int, str]] = set()
         for item in consumers or []:
             if not isinstance(item, dict):
                 result["skipped"] += 1
@@ -2260,32 +2262,45 @@ class HandheldSyncDataAccess:
                 or item.get("Start_Date")
             )
             billing_cycle = item.get("billing_cycle") or item.get("billing_month") or item.get("Billing_Month")
+            start_date = _parse_date(schedule_date)
+            end_date = _parse_date(
+                item.get("schedule_due_date") or item.get("Schedule_Due_Date")
+                or item.get("end_date") or item.get("End_Date")
+            ) or start_date
             if (consumer_id in (None, "") or schedule_id in (None, "")
-                    or not _parse_date(schedule_date) or _parse_date(schedule_date) > today
+                    or not start_date or start_date > window_end
                     or item.get("is_read") in (True, 1, "1")):
                 result["skipped"] += 1
                 continue
-            try:
-                existing = self.local.get_or_create_bill_reservation(
-                    int(consumer_id),
-                    today.isoformat(),
-                    schedule_id=schedule_id,
-                    billing_cycle=billing_cycle,
-                )
-                already_ready = bool(existing.get("billing_reference"))
-                prepared = self.prepareBillingReference(
-                    int(consumer_id),
-                    str(existing["bill_date"]),
-                    schedule_id=schedule_id,
-                    billing_cycle=billing_cycle,
-                )
-                if prepared.get("billing_reference"):
-                    result["ready"] += 1
-                    if not already_ready:
-                        result["reserved"] += 1
-            except Exception as exc:
-                result["failed"] += 1
-                result["errors"].append(f"Consumer {consumer_id}, schedule {schedule_id}: {exc}")
+            reading_day = max(today, start_date)
+            last_day = min(max(today, end_date), window_end)
+            while reading_day <= last_day:
+                bill_date = reading_day.isoformat()
+                reading_day += timedelta(days=1)
+                try:
+                    key = (int(consumer_id), int(schedule_id), bill_date)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    with self.operation_lock:
+                        existing = self.local.get_or_create_bill_reservation(
+                            int(consumer_id), bill_date,
+                            schedule_id=schedule_id, billing_cycle=billing_cycle,
+                        )
+                        already_ready = bool(existing.get("billing_reference"))
+                        prepared = self.prepareBillingReference(
+                            int(consumer_id), bill_date,
+                            schedule_id=schedule_id, billing_cycle=billing_cycle,
+                        )
+                    if prepared.get("billing_reference"):
+                        result["ready"] += 1
+                        if not already_ready:
+                            result["reserved"] += 1
+                except Exception as exc:
+                    result["failed"] += 1
+                    result["errors"].append(
+                        f"Consumer {consumer_id}, schedule {schedule_id}, date {bill_date}: {exc}"
+                    )
         self._audit(None, "success" if not result["failed"] else "failed", "Prepared offline billing references", result)
         self.last_pre_reservation_result = result
         return result
@@ -2333,7 +2348,7 @@ class HandheldSyncDataAccess:
                 )
                 if consumers:
                     self.local.cache_consumers(consumers)
-                    reservation_result = self.preReserveAssignedBills(consumers)
+                    reservation_result = self.preReserveAssignedBills(consumers, through_date=date_to)
                     self.local.log_audit(
                         None,
                         "success",
@@ -2417,16 +2432,28 @@ class HandheldSyncDataAccess:
             bill_sync_id = str(draft["bill_sync_id"])
             normalized_date = str(draft["bill_date"])
             if draft.get("billing_reference"):
-                return draft
-            if not self.remote or not self.remote.is_online():
-                if allow_unreserved_offline:
-                    return draft
-                raise RuntimeError(
-                    "No pre-reserved billing reference is available for this scheduled bill. "
-                    "Connect briefly and sync assigned routes before going offline."
+                BackendApiClient._validate_reserved_reference(
+                    bill_sync_id, normalized_date, draft["billing_reference"],
                 )
-            result = self.remote.reserve_billing_reference(bill_sync_id, normalized_date)
+                return draft
+            try:
+                if not self.remote or not self.remote.is_online():
+                    if allow_unreserved_offline:
+                        return draft
+                    raise RuntimeError(
+                        "No pre-reserved billing reference is available for this scheduled bill. "
+                        "Connect briefly and sync assigned routes before going offline."
+                    )
+                result = self.remote.reserve_billing_reference(bill_sync_id, normalized_date)
+            except (RuntimeError, PermissionError) as exc:
+                if not allow_unreserved_offline:
+                    raise
+                self._audit(None, "failed", f"Billing reference unavailable; keeping the local reading draft: {exc}", {
+                    "bill_sync_id": bill_sync_id, "bill_date": normalized_date,
+                })
+                return draft
             billing_reference = str(result.get("billing_reference") or "")
+            BackendApiClient._validate_reserved_reference(bill_sync_id, normalized_date, billing_reference)
             self.local.save_reserved_reference(bill_sync_id, billing_reference)
             prepared = {
                 **draft,

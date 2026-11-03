@@ -149,6 +149,8 @@ try:
         build_receipt_text,
         build_reprint_receipt_text,
         can_use_system_printer,
+        manila_current_date,
+        receipt_billing_reference as _receipt_billing_reference,
         print_test_receipt,
         send_to_system_printer,
     )
@@ -158,6 +160,8 @@ except ImportError:
         build_receipt_text,
         build_reprint_receipt_text,
         can_use_system_printer,
+        manila_current_date,
+        receipt_billing_reference as _receipt_billing_reference,
         print_test_receipt,
         send_to_system_printer,
     )
@@ -227,7 +231,7 @@ def _cached_bill_for_reading(context: dict, reading: dict) -> dict | None:
 
     def matches(bill: dict) -> bool:
         return bool(
-            bill.get("billing_reference") and bill.get("due_date")
+            re.fullmatch(r"SLR[0-9]{10}", str(bill.get("billing_reference") or "")) and bill.get("due_date")
             and _normalize_iso_date(bill.get("bill_date")) == reading_day
             and (not bill.get("schedule_id") or not reading.get("schedule_id")
                  or str(bill["schedule_id"]) == str(reading["schedule_id"]))
@@ -2565,7 +2569,8 @@ class AppBridge(QObject):
                 and latest_exception == str(row.get("exception") or "None")
                 and latest_reading_date == row_reading_date
             )
-        if latest_entry and latest_receipt_matches_current_row:
+        if (latest_entry and latest_receipt_matches_current_row
+                and _receipt_billing_reference(latest_entry.get("receipt_text"))):
             receipt = self._refresh_saved_receipt_penalty(latest_entry)
             latest_entry = {**latest_entry, "receipt_text": receipt}
         else:
@@ -2598,6 +2603,9 @@ class AppBridge(QObject):
                 "reader_name": self._reader_name,
                 "receipt_text": receipt,
             }
+        if not _receipt_billing_reference(receipt):
+            self.alertRequested.emit("Billing Reference Unavailable", "Sync this reading before printing its receipt.")
+            return
         if can_use_system_printer():
             try:
                 send_to_system_printer(receipt)
@@ -2717,7 +2725,7 @@ class AppBridge(QObject):
         exception = self._selected_exception
         route = self._selected_route()
         schedule = self._schedule_for_consumer(self._consumer)
-        reading_date = datetime.now().date().isoformat()
+        reading_date = manila_current_date().isoformat()
         captured_at = datetime.now().astimezone().isoformat()
         schedule_id = int(schedule.get("scheduleId")) if schedule.get("scheduleId") else None
         if schedule_id is None:
@@ -2778,6 +2786,13 @@ class AppBridge(QObject):
             apply_authoritative_bill(consumer_snapshot, local_bill),
             previous, present, exception, self._reader_name,
             reading_date=reading_date,
+        ) if billing_reference else (
+            f"Account: {consumer_snapshot.get('acct_no') or consumer_snapshot.get('name') or self._consumer['id']}\n"
+            f"Reading date: {reading_date}\nPrevious: {_format_reading(previous)}\n"
+            f"Present: {_format_reading(present)}\nUse: {_format_reading(consumption)} m3\n\n"
+            "No billing reference is cached for this reading date.\n\n"
+            "Save the reading on this device, then connect and tap Sync Now "
+            "before printing its receipt."
         )
         return {
             "job_type": "original",
@@ -2853,7 +2868,8 @@ class AppBridge(QObject):
         if not isinstance(job, dict):
             self.alertRequested.emit("Save Failed", "The prepared bill response was invalid.")
             return
-        self._open_print_preview("Receipt Preview", job["receipt_text"], "Save Reading", job)
+        title = "Receipt Preview" if job.get("billing_reference") else "Save Reading"
+        self._open_print_preview(title, job["receipt_text"], "Save Reading", job)
         self.update_stats()
         self._refresh_search_suggestions()
         self._refresh_zone_consumers()
@@ -2890,12 +2906,13 @@ class AppBridge(QObject):
             None,
         )
         try:
-            return build_receipt_text(
+            refreshed = build_receipt_text(
                 snapshot, _to_float(entry.get("previous_reading")),
                 _to_float(entry.get("present_reading")), entry.get("exception") or "None",
                 entry.get("reader_name") or self._reader_name,
                 reading_date=reading_date,
             )
+            return refreshed if _receipt_billing_reference(refreshed) == reference else original
         except (TypeError, ValueError):
             return original
 
@@ -2923,6 +2940,12 @@ class AppBridge(QObject):
             return
         original_printed_at = str(self._last_receipt_entry.get("printed_at") or "")
         refreshed_receipt = self._refresh_saved_receipt_penalty(self._last_receipt_entry)
+        if not _receipt_billing_reference(refreshed_receipt):
+            self.alertRequested.emit(
+                "Billing Reference Unavailable",
+                "Sync this reading, then open its receipt from the consumer list to print it with its billing reference.",
+            )
+            return
         source_entry = {**self._last_receipt_entry, "receipt_text": refreshed_receipt}
         preview_text = build_reprint_receipt_text(
             refreshed_receipt,
@@ -3070,7 +3093,7 @@ class AppBridge(QObject):
                             sync_reading_id=job.get("sync_reading_id"), captured_at=job.get("captured_at"),
                         )
                         cache_local_bill = getattr(self._sync_dal, "cacheLocalBill", None)
-                        if cache_local_bill and local_bill.get("sync_id"):
+                        if cache_local_bill and local_bill.get("sync_id") and local_bill.get("billing_reference"):
                             try:
                                 cache_local_bill(int(job["consumer_id"]), local_bill)
                             except Exception as exc:
@@ -3092,7 +3115,31 @@ class AppBridge(QObject):
                             errors = sync_result.get("errors") or []
                             detail = str(errors[0]) if errors else "The reserved reference conflicts with the bill."
                             raise RuntimeError(f"The backend rejected the bill. {detail}")
-                        authoritative_bill = _authoritative_bill_from_sync_result(sync_result)
+                        authoritative_bill = _authoritative_bill_from_sync_result(sync_result) or {}
+                        synced_reading = sync_result.get("reading") or {}
+                        reference = str(
+                            authoritative_bill.get("billing_reference")
+                            or synced_reading.get("billing_reference")
+                            or job.get("billing_reference") or ""
+                        ).strip()
+                        if not reference:
+                            self.printExecutionFinished.emit({
+                                "success": True, "job_type": "original", "pending_reference": True,
+                                "consumer_snapshot": consumer, "reading_id": reading_id,
+                                "present": present,
+                            })
+                            return
+                        if (not re.fullmatch(r"SLR[0-9]{10}", reference)
+                                or reference[3:7] != reading_date[:4]
+                                or (job.get("billing_reference") and reference != job["billing_reference"])):
+                            raise RuntimeError("The bill's billing reference does not match the prepared receipt.")
+                        consumer["billing_reference"] = reference
+                        local_bill["billing_reference"] = reference
+                        if cache_local_bill and not job.get("billing_reference"):
+                            try:
+                                cache_local_bill(int(job["consumer_id"]), local_bill)
+                            except Exception as exc:
+                                local_bill_cache_error = str(exc)
                         locally_calculated = _use_local_bill_for_display(authoritative_bill, local_bill)
                         try:
                             fresh_context = _display_consumer_context(self._sync_dal, int(job["consumer_id"]))
@@ -3110,6 +3157,11 @@ class AppBridge(QObject):
                         )
                     saved_receipt_id = None
                     history_error = None
+                    if not _receipt_billing_reference(receipt_text):
+                        raise RuntimeError("A billing reference is required before this receipt can be printed.")
+                    if (job.get("billing_reference")
+                            and _receipt_billing_reference(receipt_text) != job["billing_reference"]):
+                        raise RuntimeError("The receipt's billing reference changed after the reading was saved.")
                     try:
                         saved_receipt_id = save_receipt_print(
                             job["consumer_id"],
@@ -3165,6 +3217,8 @@ class AppBridge(QObject):
                     refreshed_source,
                     original_printed_at=str(source_entry.get("printed_at") or ""),
                 )
+                if not _receipt_billing_reference(receipt_text):
+                    raise RuntimeError("Sync this reading before printing its receipt with a billing reference.")
                 send_to_system_printer(receipt_text)
                 saved_id = None
                 history_error = None
@@ -3216,6 +3270,23 @@ class AppBridge(QObject):
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
             present = _to_float(result["present"])
+            if result.get("pending_reference"):
+                self._consumer["previous_reading"] = present
+                self._previous_reading = _format_reading(present)
+                self._present_reading = ""
+                self._consumption = "-"
+                self._validation_message = "Saved; billing reference pending sync"
+                self.previousReadingChanged.emit()
+                self.presentReadingChanged.emit()
+                self.consumptionChanged.emit()
+                self.validationMessageChanged.emit()
+                self._refresh_local_assignment_views()
+                self.alertRequested.emit(
+                    "Reading Saved",
+                    "Reading saved on this device. Connect and tap Sync Now before printing "
+                    "the receipt with its exact billing reference.",
+                )
+                return
             if result.get("pending_calculation"):
                 self._consumer["previous_reading"] = present
                 self._previous_reading = _format_reading(present)
@@ -3394,6 +3465,12 @@ class AppBridge(QObject):
             self.alertRequested.emit("Paper Error", f"Cannot print while paper status is {self._paper_status}.")
             return
         refreshed_receipt = self._refresh_saved_receipt_penalty(self._print_history_detail)
+        if not _receipt_billing_reference(refreshed_receipt):
+            self.alertRequested.emit(
+                "Billing Reference Unavailable",
+                "Sync this reading, then open its receipt from the consumer list to print it with its billing reference.",
+            )
+            return
         source_entry = {**self._print_history_detail, "receipt_text": refreshed_receipt}
         preview_text = build_reprint_receipt_text(
             refreshed_receipt,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import errno
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -60,6 +61,18 @@ def _receipt_line(char: str = "-") -> str:
 
 def _field_line(label: str, value) -> str:
     return "\n".join(_wrap_field_lines(label, value))
+
+
+def receipt_billing_reference(receipt_text: str) -> str:
+    """Read the single, exact billing reference printed on a receipt."""
+    references = []
+    for line in str(receipt_text or "").splitlines():
+        label, separator, value = line.partition(":")
+        if separator and label.strip() == "Billing Ref":
+            references.append(value.strip())
+    if len(references) == 1 and re.fullmatch(r"SLR[0-9]{10}", references[0]):
+        return references[0]
+    return ""
 
 
 def _money_line(label: str, value: float) -> str:
@@ -699,6 +712,8 @@ def print_test_receipt(device_path: str = RAW_PRINTER_DEVICE) -> str:
 
 
 def send_to_system_printer(receipt_text: str, printer_name: str | None = None) -> None:
+    if not receipt_billing_reference(receipt_text):
+        raise RuntimeError("An exact billing reference is required before printing this receipt. Sync the reading first.")
     if not can_use_system_printer():
         raise RuntimeError("No Linux print command is available. Install CUPS with lp or lpr on the Raspberry Pi.")
 

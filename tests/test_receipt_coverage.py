@@ -172,7 +172,10 @@ class ReceiptCoverageTests(unittest.TestCase):
         bridge._default_due_date_for_consumer = lambda consumer, reading_date: (
             AppBridge._default_due_date_for_consumer(bridge, consumer, reading_date)
         )
-        job = AppBridge._build_pending_receipt_job(bridge)
+        with patch("src.qt_hybrid_app.manila_current_date", return_value=date(2026, 9, 17)), patch(
+            "src.handheld_sync._manila_current_date", return_value=date(2026, 9, 17)
+        ):
+            job = AppBridge._build_pending_receipt_job(bridge)
         self.assertEqual(job["schedule_id"], 538)
         self.assertEqual(job["schedule_date"], "2026-08-27")
         self.assertEqual(job["schedule_due_date"], "2026-09-01")
