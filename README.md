@@ -295,10 +295,17 @@ active route automatically. They remain available under Past schedules, but the
 reader does not need to open that selector to discover or process them. Carry-over
 rows retain their expired schedule dates and original zone `schedule_id`.
 Schedule refreshes also download cancelled schedules so an old offline cache cannot keep offering
-them as active or overdue assignments. A reading already saved against a cancelled assignment stays
-in the local retry queue with its original reading ID, bill ID, and billing reference. Assignment
-rejections list those IDs in Sync Logs. An administrator must resolve the original assignment before
-the upload can succeed; the device never silently moves that reading to a different schedule.
+them as active or overdue assignments. A reading already saved against a cancelled assignment is
+retained in SQLite as **Needs review**, with its original reading ID, bill ID, and billing reference.
+It is excluded from upload retries and the active failure count, so other readings can sync normally.
+Settings shows the review count and saved references; Sync Logs retains the assignment details.
+Before uploading queued readings or an online save, the device checks the backend's cancelled
+schedules for the original reader and assignment dates. This handles stale offline schedule caches
+on the first sync. A cancellation confirmed after an assignment rejection is handled the same way.
+An assignment rejection without a confirmed cancellation remains an upload failure.
+If a fresh backend schedule download confirms the original schedule has been restored for the same
+reader, the original saved reading returns to the upload queue. The device never silently moves it
+to a different schedule or marks it synced without backend acceptance.
 
 Within a grouped route, the device uses `assignment_order` as the authoritative
 sequence and never redistributes consumers between readers. Rows without an order

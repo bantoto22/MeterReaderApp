@@ -813,6 +813,12 @@ class LocalSyncStore:
     def list_pending(self, target: str | None = None) -> list[dict]:
         raise NotImplementedError
 
+    def list_needs_review(self) -> list[dict]:
+        return []
+
+    def reconcile_cancelled_readings(self, resumable_schedule_ids: set[int] | None = None) -> dict:
+        return {"held": 0, "resumed": 0}
+
     def mark_target_synced(self, queue_id: int, target: str, server_payload: dict | None = None) -> None:
         raise NotImplementedError
 
@@ -940,7 +946,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     @staticmethod
     def _combined_status(backend_status: str) -> str:
         state = str(backend_status or "pending").lower()
-        return state if state in {"pending", "failed", "conflict", "synced"} else "pending"
+        return state if state in {"pending", "failed", "conflict", "synced", "needs_review"} else "pending"
 
     def _refresh_queue_status(self, conn: sqlite3.Connection, queue_id: int) -> None:
         row = conn.execute(
@@ -1686,6 +1692,56 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
+    def list_needs_review(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sync_queue_meter_readings WHERE backend_status = 'needs_review' ORDER BY id"
+            ).fetchall()
+        return [self._deserialize_row(row) for row in rows]
+
+    def reconcile_cancelled_readings(self, resumable_schedule_ids: set[int] | None = None) -> dict:
+        """Retain cancelled assignments outside the upload queue without changing their payloads."""
+        result = {"held": 0, "resumed": 0, "changes": []}
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, reading_id, payload, backend_status FROM sync_queue_meter_readings "
+                "WHERE backend_status IN ('pending', 'failed', 'needs_review')"
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"])
+                    schedule_id = int(payload.get("schedule_id"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                schedule = conn.execute(
+                    "SELECT status, meter_reader_id FROM reading_schedule WHERE schedule_id = ?", (schedule_id,)
+                ).fetchone()
+                if not schedule:
+                    continue
+                cancelled = str(schedule["status"] or "").strip().lower() == "cancelled"
+                if cancelled and row["backend_status"] != "needs_review":
+                    state = "needs_review"
+                    reason = f"Schedule {schedule_id} is cancelled. Saved reading and billing reference retained for review."
+                    result["held"] += 1
+                elif (row["backend_status"] == "needs_review" and not cancelled
+                      and schedule_id in (resumable_schedule_ids or set())
+                      and str(schedule["status"] or "").strip().lower() in {"scheduled", "in progress", "overdue", "completed"}
+                      and _safe_int(payload.get("meter_reader_id"), None) == schedule["meter_reader_id"]):
+                    state, reason = "pending", None
+                    result["resumed"] += 1
+                else:
+                    continue
+                conn.execute(
+                    "UPDATE sync_queue_meter_readings SET backend_status = ?, last_error = ? WHERE id = ?",
+                    (state, reason, row["id"]),
+                )
+                self._refresh_queue_status(conn, row["id"])
+                result["changes"].append({"queue_id": row["id"], "state": state, "reading": payload})
+            conn.commit()
+        for change in result["changes"]:
+            _update_local_reading_state(change["reading"].get("reading_id"), change["state"])
+        return result
+
     def get_latest_confirmed_bill(self, consumer_id: int) -> dict:
         with self._connect() as conn:
             rows = conn.execute(
@@ -2111,6 +2167,7 @@ class HandheldSyncDataAccess:
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
+        self.reconcileScheduleReadings()
 
     def _endpoint(self) -> str:
         return str(getattr(self.remote, "_url", "") or "")
@@ -2136,6 +2193,72 @@ class HandheldSyncDataAccess:
 
     def is_online(self) -> bool:
         return bool(self.remote and self.remote.is_online())
+
+    def reconcileScheduleReadings(self, schedules: list[dict] | None = None) -> dict:
+        reconcile = getattr(self.local, "reconcile_cancelled_readings", None)
+        if not callable(reconcile):
+            return {"held": 0, "resumed": 0}
+        fresh_ids = {
+            _safe_int(item.get("schedule_id", item.get("Schedule_ID")), None)
+            for item in schedules or [] if isinstance(item, dict)
+        }
+        with self.operation_lock:
+            result = reconcile(fresh_ids)
+        for change in result.get("changes", []):
+            payload = change["reading"]
+            held = change["state"] == "needs_review"
+            message = (
+                "Cancelled schedule: reading saved for review; excluded from upload retries."
+                if held else "Original schedule restored: saved reading returned to the upload queue."
+            )
+            details = (
+                f"{message}\nConsumer ID: {payload.get('consumer_id')}\n"
+                f"Schedule ID: {payload.get('schedule_id')}\n"
+                f"Billing reference: {payload.get('billing_reference') or 'Pending'}"
+            )
+            self._audit(change["queue_id"], "needs_review" if held else "pending", details, payload)
+        return result
+
+    def listReviewReadings(self) -> list[dict]:
+        getter = getattr(self.local, "list_needs_review", None)
+        return getter() if callable(getter) else []
+
+    def _reading_needs_review(self, queue_id: int) -> bool:
+        return any(row["id"] == queue_id for row in self.listReviewReadings())
+
+    def _refresh_cancelled_upload_schedules(self, readings: list[dict]) -> None:
+        """Confirm cancellations before uploading, even when the offline cache is stale."""
+        loader = getattr(self.remote, "load_reading_schedules", None)
+        cache = getattr(self.local, "cache_reading_schedules", None)
+        if not callable(loader) or not callable(cache):
+            return
+        by_reader: dict[int, list[dict]] = {}
+        for reading in readings:
+            reader_id = _safe_int(reading.get("meter_reader_id"), None)
+            if reader_id and _safe_int(reading.get("schedule_id"), None):
+                by_reader.setdefault(reader_id, []).append(reading)
+        for reader_id, items in by_reader.items():
+            starts = [_parse_date(item.get("schedule_date")) or date(1900, 1, 1) for item in items]
+            ends = [max(_parse_date(item.get("reading_date")) or _manila_current_date(), start)
+                    for item, start in zip(items, starts)]
+            date_from, date_to = min(starts).isoformat(), max(ends).isoformat()
+            wanted = {_safe_int(item.get("schedule_id"), None) for item in items}
+            try:
+                schedules = loader(reader_id, date_from, date_to, "Cancelled")
+                cancelled = [item for item in schedules if isinstance(item, dict)
+                             and _safe_int(item.get("schedule_id", item.get("Schedule_ID")), None) in wanted
+                             and str(item.get("status", item.get("Status")) or "").strip().lower() == "cancelled"
+                             and _safe_int(item.get("meter_reader_id", item.get("Meter_Reader_ID")), None) == reader_id]
+                if cancelled:
+                    cache(cancelled, reader_id, date_from, date_to)
+                    self.reconcileScheduleReadings()
+            except Exception as exc:
+                detail = str(exc).lower()
+                if isinstance(exc, PermissionError) or "http 401" in detail or "http 403" in detail:
+                    raise PermissionError("Sign in online again before synchronizing assignments.") from exc
+                self._audit(None, "pending", format_sync_error(
+                    "Checking cancelled schedules before upload", exc, self._endpoint(),
+                ))
 
     def _cache_remote_consumer_context(self, consumer_id: int, context: dict) -> dict:
         context = _flatten_backend_bill_context(context)
@@ -2355,6 +2478,7 @@ class HandheldSyncDataAccess:
                             if schedule_status != "Completed":
                                 raise
                     self.local.cache_reading_schedules(schedules, effective_reader_id, date_from, date_to)
+                    self.reconcileScheduleReadings(schedules)
 
                 consumers = self.remote.load_assigned_consumers(
                     effective_reader_id,
@@ -2541,6 +2665,9 @@ class HandheldSyncDataAccess:
             )
             queued = self._queue_for_sync("create", reading)
             _update_local_reading_state(reading.get("reading_id"), "pending")
+            self.reconcileScheduleReadings()
+            if self._reading_needs_review(queued["id"]):
+                return {"status": "needs_review", "queue": queued, "reading": reading}
             self.local.log_audit(queued["id"], "pending", "Queued reading for manual sync", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
@@ -2552,10 +2679,16 @@ class HandheldSyncDataAccess:
         )
         queued = self._queue_for_sync(operation, reading)
         _update_local_reading_state(reading.get("reading_id"), "pending")
+        self.reconcileScheduleReadings()
+        if self._reading_needs_review(queued["id"]):
+            return {"status": "needs_review", "queue": queued, "reading": reading}
         if not self.is_online():
             self.local.log_audit(queued["id"], "pending", f"Queued offline {operation} operation", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
         try:
+            self._refresh_cancelled_upload_schedules([reading])
+            if self._reading_needs_review(queued["id"]):
+                return {"status": "needs_review", "queue": queued, "reading": reading}
             reading = self._ensure_billing_reference(reading)
             remote = self.remote.save_reading_bundle(reading)
             self.local.mark_target_synced(queued["id"], "backend", remote)
@@ -2591,6 +2724,10 @@ class HandheldSyncDataAccess:
                 "errors": [str(exc)],
             }
         except Exception as exc:
+            if "not part of the selected reading assignment" in str(exc).lower():
+                self._refresh_cancelled_upload_schedules([reading])
+                if self._reading_needs_review(queued["id"]):
+                    return {"status": "needs_review", "queue": queued, "reading": reading}
             self.local.mark_target_failed(queued["id"], "backend", str(exc))
             _update_local_reading_state(reading.get("reading_id"), "failed")
             diagnostic = format_sync_error("Uploading saved reading", exc, self._endpoint(), reading=reading)
@@ -2629,13 +2766,22 @@ class HandheldSyncDataAccess:
         return None
 
     def get_sync_snapshot(self) -> dict:
+        self.reconcileScheduleReadings()
         pending = self.listPendingSyncReadings()
+        review = self.listReviewReadings()
         online = self.is_online()
         last_sync = self.get_last_successful_sync_time()
         return {
             "status": "Online" if online else "Offline",
             "pending_count": len(pending),
             "has_failed": any(row.get("status") == "failed" for row in pending),
+            "review_count": len(review),
+            "review_readings": [{
+                "consumer_id": row["payload"].get("consumer_id"),
+                "schedule_id": row["payload"].get("schedule_id"),
+                "billing_reference": row["payload"].get("billing_reference"),
+                "reason": row.get("last_error"),
+            } for row in review],
             "save_target": (
                 "Local SQLite Queue (Backend API retry pending)"
                 if pending
@@ -2656,9 +2802,11 @@ class HandheldSyncDataAccess:
             return self._sync_pending_readings()
 
     def _sync_pending_readings(self) -> dict:
+        self.reconcileScheduleReadings()
         pending = self.listPendingSyncReadings()
         if not pending:
-            return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": []}
+            return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
+                    "needs_review": len(self.listReviewReadings())}
         if not self.is_online():
             health_error = str(getattr(self.remote, "last_health_error", "") or "").strip()
             diagnostic = format_sync_error(
@@ -2667,7 +2815,13 @@ class HandheldSyncDataAccess:
                 self._endpoint(),
             )
             self._audit(None, "pending", diagnostic)
-            return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic]}
+            return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic],
+                    "needs_review": len(self.listReviewReadings())}
+        self._refresh_cancelled_upload_schedules([row["payload"] for row in pending])
+        pending = self.listPendingSyncReadings()
+        if not pending:
+            return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
+                    "needs_review": len(self.listReviewReadings())}
         self._audit(
             None,
             "pending",
@@ -2680,6 +2834,8 @@ class HandheldSyncDataAccess:
         errors: list[str] = []
         for row in pending:
             queue_id = row["id"]
+            if self._reading_needs_review(queue_id):
+                continue
             payload = dict(row["payload"])
             try:
                 existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
@@ -2727,6 +2883,10 @@ class HandheldSyncDataAccess:
                 errors.append(diagnostic)
                 conflicts += 1
             except Exception as exc:
+                if "not part of the selected reading assignment" in str(exc).lower():
+                    self._refresh_cancelled_upload_schedules([payload])
+                    if self._reading_needs_review(queue_id):
+                        continue
                 diagnostic = format_sync_error(
                     f"Uploading reading for consumer {payload.get('consumer_id', 'unknown')}",
                     exc,
@@ -2742,7 +2902,8 @@ class HandheldSyncDataAccess:
                 errors.append(diagnostic)
                 failed += 1
 
-        result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts, "errors": errors}
+        result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts, "errors": errors,
+                  "needs_review": len(self.listReviewReadings())}
         summary_status = "success" if failed == 0 and conflicts == 0 else "failed"
         self._audit(
             None,

@@ -647,6 +647,7 @@ class AppBridge(QObject):
     syncStatusChanged = Signal()
     syncStatusColorChanged = Signal()
     syncPendingCountChanged = Signal()
+    syncReviewCountChanged = Signal()
     backendStatusChanged = Signal()
     backendPendingCountChanged = Signal()
     backendLastSyncChanged = Signal()
@@ -748,6 +749,8 @@ class AppBridge(QObject):
         self._sync_status = "Offline"
         self._sync_status_color = "#475569"
         self._sync_pending_count = 0
+        self._sync_review_count = 0
+        self._sync_review_summary = ""
         self._backend_status = "Offline"
         self._backend_pending_count = 0
         self._backend_last_sync = "Never"
@@ -1407,6 +1410,14 @@ class AppBridge(QObject):
     def syncPendingCount(self) -> int:
         return self._sync_pending_count
 
+    @Property(int, notify=syncReviewCountChanged)
+    def syncReviewCount(self) -> int:
+        return self._sync_review_count
+
+    @Property(str, notify=syncReviewCountChanged)
+    def syncReviewSummary(self) -> str:
+        return self._sync_review_summary
+
     @Property(str, notify=backendStatusChanged)
     def backendStatus(self) -> str:
         return self._backend_status
@@ -1616,6 +1627,7 @@ class AppBridge(QObject):
         self.syncStatusChanged.emit()
         self.syncStatusColorChanged.emit()
         self.syncPendingCountChanged.emit()
+        self.syncReviewCountChanged.emit()
         self.backendStatusChanged.emit()
         self.backendPendingCountChanged.emit()
         self.backendLastSyncChanged.emit()
@@ -1695,6 +1707,12 @@ class AppBridge(QObject):
                 self._sync_status = "Sync Failed"
                 self._sync_status_color = "#EF4444"
             self._sync_pending_count = int(snapshot.get("pending_count", 0))
+            self._sync_review_count = int(snapshot.get("review_count", 0))
+            self._sync_review_summary = "\n".join(
+                f"Consumer {row.get('consumer_id')} · Schedule {row.get('schedule_id')} · "
+                f"{row.get('billing_reference') or 'Reference pending'}"
+                for row in snapshot.get("review_readings", [])
+            )
             self._backend_status = "Online" if snapshot.get("backend_online") else "Offline"
             if self._backend_status == "Online" and not was_backend_online:
                 self._start_heartbeat()
@@ -1708,8 +1726,11 @@ class AppBridge(QObject):
                 f"Endpoint: {self._backend_endpoint}\n"
                 f"Backend status: {self._backend_status}\n"
                 f"Queued readings: {self._backend_pending_count}\n"
+                f"Needs review: {self._sync_review_count}\n"
                 f"Automatic sync: {'Enabled' if self._auto_sync_enabled else 'Disabled'}"
             )
+            if self._sync_review_summary:
+                diagnostic_header += "\n" + self._sync_review_summary
             health_error = str(snapshot.get("backend_health_error") or "").strip()
             if self._backend_status == "Offline" and health_error:
                 diagnostic_header += "\n\n" + format_sync_error(
@@ -1820,7 +1841,11 @@ class AppBridge(QObject):
                     break
             except Exception:
                 continue
-        return replace_reading_schedules_from_sync(schedules, self._meter_reader_account_id, date_from, date_to)
+        updated = replace_reading_schedules_from_sync(schedules, self._meter_reader_account_id, date_from, date_to)
+        reconcile = getattr(self._sync_dal, "reconcileScheduleReadings", None)
+        if callable(reconcile):
+            reconcile(schedules)
+        return updated
 
     def _start_assigned_consumer_dataset_refresh(self) -> None:
         if not self._meter_reader_account_id or not self._sync_dal:
@@ -2114,6 +2139,7 @@ class AppBridge(QObject):
             pull_error = str(sync_result.get("pull_error") or "").strip()
             errors = [str(item).strip() for item in sync_result.get("errors", []) if str(item).strip()]
             pull_line = f"\nPulled: {self._last_pull_count}\nMirrored: {self._last_pull_mirror}"
+            review_line = f"\nNeeds review: {getattr(self, '_sync_review_count', sync_result.get('needs_review', 0))}"
             reference_line = (
                 f"\nOffline references ready: {sync_result.get('offline_references_ready', 0)}"
                 f"\nReference failures: {sync_result.get('offline_reference_failures', 0)}"
@@ -2126,7 +2152,7 @@ class AppBridge(QObject):
             )
             self.alertRequested.emit(
                 "Sync Finished with Problems" if has_problems else "Sync Complete",
-                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{pull_line}{reference_line}{error_line}{first_error_line}",
+                f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{review_line}{pull_line}{reference_line}{error_line}{first_error_line}",
             )
 
     def _save_to_sync_layer(
@@ -3111,6 +3137,12 @@ class AppBridge(QObject):
                         )
                         if not sync_result:
                             raise RuntimeError("The bill could not be persisted to the local retry queue.")
+                        if sync_result.get("status") == "needs_review":
+                            self.printExecutionFinished.emit({
+                                "success": True, "job_type": "original", "pending_review": True,
+                                "consumer_snapshot": consumer, "reading_id": reading_id, "present": present,
+                            })
+                            return
                         if sync_result.get("status") == "conflict":
                             errors = sync_result.get("errors") or []
                             detail = str(errors[0]) if errors else "The reserved reference conflicts with the bill."
@@ -3270,19 +3302,25 @@ class AppBridge(QObject):
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
             present = _to_float(result["present"])
-            if result.get("pending_reference"):
+            if result.get("pending_reference") or result.get("pending_review"):
+                needs_review = bool(result.get("pending_review"))
                 self._consumer["previous_reading"] = present
                 self._previous_reading = _format_reading(present)
                 self._present_reading = ""
                 self._consumption = "-"
-                self._validation_message = "Saved; billing reference pending sync"
+                self._validation_message = (
+                    "Saved; assignment needs review" if needs_review else "Saved; billing reference pending sync"
+                )
                 self.previousReadingChanged.emit()
                 self.presentReadingChanged.emit()
                 self.consumptionChanged.emit()
                 self.validationMessageChanged.emit()
                 self._refresh_local_assignment_views()
                 self.alertRequested.emit(
-                    "Reading Saved",
+                    "Reading Saved for Review" if needs_review else "Reading Saved",
+                    "This reading's schedule is cancelled. Its reading and billing reference are saved "
+                    "for assignment review. Other readings can continue syncing."
+                    if needs_review else
                     "Reading saved on this device. Connect and tap Sync Now before printing "
                     "the receipt with its exact billing reference.",
                 )

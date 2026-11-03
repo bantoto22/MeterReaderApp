@@ -781,7 +781,7 @@ Rectangle {
                                                 text: modelData.reading_sync_label || ""
                                                 visible: text.length > 0
                                                 font.family: "Montserrat"; font.pixelSize: 9
-                                                color: modelData.reading_sync_status === "failed" || modelData.reading_sync_status === "conflict" ? "#DC2626" : "#64748B"
+                                                color: modelData.reading_sync_status === "needs_review" ? "#B45309" : (modelData.reading_sync_status === "failed" || modelData.reading_sync_status === "conflict" ? "#DC2626" : "#64748B")
                                                 horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                                             }
                                         }

@@ -1878,7 +1878,7 @@ def get_zone_consumers_with_status(
         if item.get("is_read") or (status and status.lower() != "pending"):
             item["reading_sync_label"] = {
                 "pending": "Waiting to sync", "failed": "Sync failed",
-                "conflict": "Sync conflict", "synced": "Synced",
+                "conflict": "Sync conflict", "synced": "Synced", "needs_review": "Needs review",
             }.get(sync, sync)
     return sort_and_mark_nearby(results)
 
@@ -2258,17 +2258,17 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                         assignment_order = excluded.assignment_order,
                         reading_route_id = excluded.reading_route_id,
                         is_read = CASE
-                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed', 'needs_review')
                              AND reading_assignment.is_read = 1 THEN 1
                             ELSE excluded.is_read
                         END,
                         reading_status = CASE
-                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed', 'needs_review')
                              AND reading_assignment.is_read = 1 THEN reading_assignment.reading_status
                             ELSE excluded.reading_status
                         END,
                         reading_sync_status = CASE
-                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed')
+                            WHEN reading_assignment.reading_sync_status IN ('pending', 'failed', 'needs_review')
                              AND reading_assignment.is_read = 1 THEN reading_assignment.reading_sync_status
                             ELSE excluded.reading_sync_status
                         END,

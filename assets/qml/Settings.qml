@@ -231,6 +231,16 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: settingsRoot.compactScreen ? 6 : 9
                             Text { text: "Pending uploads: " + (bridgeObj ? bridgeObj.syncPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText }
+                            Text {
+                                visible: bridgeObj ? bridgeObj.syncReviewCount > 0 : false
+                                text: "Needs review: " + (bridgeObj ? bridgeObj.syncReviewCount : 0)
+                                      + " (cancelled schedule)\n" + (bridgeObj ? bridgeObj.syncReviewSummary : "")
+                                color: "#B45309"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                             Text { text: "Backend API: " + (bridgeObj ? bridgeObj.backendStatus : "Offline"); color: bridgeObj && bridgeObj.backendStatus === "Online" ? "#0F766E" : "#B45309"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; font.bold: true; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Funnel endpoint: " + (bridgeObj ? bridgeObj.backendEndpoint : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true }
                             Text { text: "Queued on device: " + (bridgeObj ? bridgeObj.backendPendingCount : 0); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
