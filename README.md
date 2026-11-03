@@ -294,6 +294,11 @@ Expired schedules with unread assignments are also carried into the prioritized
 active route automatically. They remain available under Past schedules, but the
 reader does not need to open that selector to discover or process them. Carry-over
 rows retain their expired schedule dates and original zone `schedule_id`.
+Schedule refreshes also download cancelled schedules so an old offline cache cannot keep offering
+them as active or overdue assignments. A reading already saved against a cancelled assignment stays
+in the local retry queue with its original reading ID, bill ID, and billing reference. Assignment
+rejections list those IDs in Sync Logs. An administrator must resolve the original assignment before
+the upload can succeed; the device never silently moves that reading to a different schedule.
 
 Within a grouped route, the device uses `assignment_order` as the authoritative
 sequence and never redistributes consumers between readers. Rows without an order

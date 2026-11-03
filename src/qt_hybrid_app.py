@@ -140,7 +140,7 @@ except ImportError:
         HandheldSyncDataAccess = None
         SyncConfig = None
 
-        def format_sync_error(stage: str, exc, endpoint: str = "") -> str:
+        def format_sync_error(stage: str, exc, endpoint: str = "", **_kwargs) -> str:
             return f"Stage: {stage}\nProblem: {exc}"
 
 try:
@@ -1810,7 +1810,7 @@ class AppBridge(QObject):
             try:
                 if hasattr(client, "is_online") and not client.is_online():
                     continue
-                for status in ("Scheduled", "In Progress", "Completed"):
+                for status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
                     try:
                         schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
                     except Exception:

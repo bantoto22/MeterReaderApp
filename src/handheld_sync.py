@@ -180,13 +180,21 @@ def _apply_server_reading_state(reading: dict, response: dict) -> dict:
     return confirmed
 
 
-def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> str:
+def format_sync_error(
+    stage: str, exc: Exception | str, endpoint: str = "", *, reading: dict | None = None,
+) -> str:
     """Return an operator-friendly diagnostic without discarding the raw error."""
     detail = str(exc or "Unknown error").strip() or "Unknown error"
     lowered = detail.lower()
     problem = "Unexpected sync error"
     action = "Open Sync Logs and report the full details below."
-    if "database is locked" in lowered or "database table is locked" in lowered:
+    if "not part of the selected reading assignment" in lowered:
+        problem = "The backend rejected this reading's schedule assignment"
+        action = (
+            "Check the original schedule, its cancellation status, and the assigned reader in the main system. "
+            "Resolve the assignment before retrying Sync Now. Keep the saved reading and its billing reference."
+        )
+    elif "database is locked" in lowered or "database table is locked" in lowered:
         problem = "The device's local SQLite database is busy"
         action = "Close duplicate device-app instances, restart the app, then run Sync Now once."
     elif any(method in lowered for method in ("cannot get /api/handheld", "cannot post /api/handheld")) or ("404" in lowered and "/api/handheld" in lowered):
@@ -224,6 +232,14 @@ def format_sync_error(stage: str, exc: Exception | str, endpoint: str = "") -> s
     lines = [f"Stage: {stage}", f"Problem: {problem}"]
     if endpoint:
         lines.append(f"Endpoint: {endpoint}")
+    for label, field in (
+        ("Consumer ID", "consumer_id"), ("Schedule ID", "schedule_id"),
+        ("Meter reader ID", "meter_reader_id"), ("Schedule date", "schedule_date"),
+        ("Reading date", "reading_date"), ("Reading sync ID", "reading_id"),
+        ("Bill sync ID", "bill_sync_id"), ("Billing reference", "billing_reference"),
+    ):
+        if reading and reading.get(field) not in (None, ""):
+            lines.append(f"{label}: {reading[field]}")
     lines.extend((f"Details: {detail}", f"Recommended action: {action}"))
     return "\n".join(lines)
 
@@ -2324,7 +2340,7 @@ class HandheldSyncDataAccess:
             try:
                 schedules: list[dict] = []
                 if effective_reader_id not in (None, ""):
-                    for schedule_status in ("Scheduled", "In Progress", "Completed"):
+                    for schedule_status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
                         try:
                             schedules.extend(
                                 self.remote.load_reading_schedules(
@@ -2577,7 +2593,8 @@ class HandheldSyncDataAccess:
         except Exception as exc:
             self.local.mark_target_failed(queued["id"], "backend", str(exc))
             _update_local_reading_state(reading.get("reading_id"), "failed")
-            self.local.log_audit(queued["id"], "failed", f"Backend API save failed, queued for retry: {exc}", reading)
+            diagnostic = format_sync_error("Uploading saved reading", exc, self._endpoint(), reading=reading)
+            self.local.log_audit(queued["id"], "failed", diagnostic, reading)
             return {"status": "queued", "queue": queued, "reading": reading}
 
     def saveMeterReading(self, payload: dict) -> dict:
@@ -2705,7 +2722,7 @@ class HandheldSyncDataAccess:
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc), target="backend")
                 _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")
-                diagnostic = format_sync_error("Validating queued reading", exc, self._endpoint())
+                diagnostic = format_sync_error("Validating queued reading", exc, self._endpoint(), reading=payload)
                 self._audit(queue_id, "conflict", diagnostic, payload)
                 errors.append(diagnostic)
                 conflicts += 1
@@ -2714,6 +2731,7 @@ class HandheldSyncDataAccess:
                     f"Uploading reading for consumer {payload.get('consumer_id', 'unknown')}",
                     exc,
                     self._endpoint(),
+                    reading=payload,
                 )
                 try:
                     self.local.mark_target_failed(queue_id, "backend", str(exc))
