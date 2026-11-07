@@ -1906,11 +1906,21 @@ def get_zone_consumers_with_status(
     return sort_and_mark_nearby(results)
 
 
-def replace_consumers_from_sync(consumers: list[dict]) -> int:
+def replace_consumers_from_sync(consumers: list[dict], *, report: dict | None = None) -> int:
     """
     Mirror consumer records from the backend API/cache into local SQLite.
     Returns number of consumer rows upserted.
     """
+    if report is not None:
+        report.clear()
+        report.update({"received": len(consumers), "mirrored": 0, "skipped": 0, "skip_reasons": {}})
+
+    def _record_skip(reason: str) -> None:
+        if report is not None:
+            report["skipped"] += 1
+            reasons = report["skip_reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
+
     if not consumers:
         return 0
 
@@ -2021,6 +2031,8 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         c = {key: _sqlite_safe(value) for key, value in c.items()}
         meter_no = _real_meter_no(c)
         if not meter_no:
+            reason = "Placeholder meter number" if str(c.get("meter_no") or "").strip() else "Missing meter number"
+            _record_skip(reason)
             continue
         consumer_id = c.get("id") or c.get("consumer_id")
         previous = cur.execute(
@@ -2037,6 +2049,7 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
         zone_name = (c.get("zone_name") or "Unassigned").strip()
         zone_id = zone_id_by_name.get(zone_name)
         if zone_id is None:
+            _record_skip("Zone unavailable")
             continue
 
         # Account numbers are identifiers, not numbers. Preserve every segment
@@ -2335,4 +2348,6 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
 
     conn.commit()
     conn.close()
+    if report is not None:
+        report["mirrored"] = upserted
     return upserted

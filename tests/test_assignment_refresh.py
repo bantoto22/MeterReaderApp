@@ -293,6 +293,42 @@ class AssignmentRefreshTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_243_pulled_146_mirrored_reports_97_rows_without_real_meters(self):
+        rows = [{
+            "id": consumer_id, "meter_no": f"MTR-{consumer_id}", "name": f"Consumer {consumer_id}",
+            "zone_name": "Zone 1", "schedule_id": 202, "is_read": False,
+        } for consumer_id in range(1, 244)]
+        for row in rows[146:196]:
+            row["meter_no"] = None
+        for row in rows[196:]:
+            row["meter_no"] = f"ACCT-{row['id']}"
+        self.remote.load_assigned_consumers = lambda *args: rows
+        self.dal.prefetchAssignedConsumerContexts = Mock(return_value={})
+        view = self.view()
+        for mode in ("manual", "automatic"):
+            with self.subTest(mode=mode):
+                if mode == "manual":
+                    AppBridge.syncNow(view)
+                    result = view.syncTaskFinished.emit.call_args.args[0]
+                    self.assertEqual(result["result"]["skipped_records"], 97)
+                    self.assertEqual(view.alertRequested.emit.call_args.args[0], "Sync Finished with Problems")
+                else:
+                    AppBridge._run_auto_pull(view)
+                    result = view.assignedDatasetFinished.emit.call_args.args[0]
+                    self.assertEqual(result["skipped_records"], 97)
+                self.assertEqual((result["pulled"], result["mirrored"]), (243, 146))
+                self.assertIn("Skipped rows: 97", view._assignment_download_summary)
+                self.assertIn("Missing meter number: 50", view._assignment_download_summary)
+                self.assertIn("Placeholder meter number: 47", view._assignment_download_summary)
+                self.assertIn("97 rows skipped", view._assignment_download_status)
+                connection = database.get_connection()
+                try:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM consumers").fetchone()[0], 146)
+                finally:
+                    connection.close()
+        self.assertTrue(any(entry.get("payload", {}).get("skipped") == 97
+                            for entry in self.dal.get_recent_audit_entries()))
+
 
 if __name__ == "__main__":
     unittest.main()

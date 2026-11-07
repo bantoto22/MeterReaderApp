@@ -299,7 +299,15 @@ def _assignment_download_window() -> tuple[str, str]:
     return _multi_day_assignment_window(manila_current_date())
 
 
-def _summarize_assignment_download(consumers: list[dict]) -> str:
+def _mirror_assigned_consumer_rows(sync_dal, consumers: list[dict]) -> tuple[int, dict]:
+    report: dict = {}
+    mirrored = replace_consumers_from_sync(consumers, report=report)
+    if report["skipped"]:
+        sync_dal._audit(None, "failed", "Assignment rows skipped while updating the device cache", report)
+    return mirrored, report
+
+
+def _summarize_assignment_download(consumers: list[dict], mirror_report: dict | None = None) -> str:
     consumer_ids: set[str] = set()
     schedule_ids: set[str] = set()
     assignments: set[tuple[str, str]] = set()
@@ -315,10 +323,17 @@ def _summarize_assignment_download(consumers: list[dict]) -> str:
             if key in assignments:
                 repeated += 1
             assignments.add(key)
-    return (
+    summary = (
         f"Unique consumers: {len(consumer_ids)} | Schedules: {len(schedule_ids)} | "
         f"Repeated assignment rows: {repeated}"
     )
+    if mirror_report is not None:
+        summary += f"\nSkipped rows: {mirror_report.get('skipped', 0)}"
+        reasons = mirror_report.get("skip_reasons") or {}
+        if reasons:
+            summary += " | " + " | ".join(f"{reason}: {count}" for reason, count in reasons.items())
+            summary += "\nCheck meter assignments in the main system for the skipped records."
+    return summary
 
 
 def _billing_month_date(value, fallback: str = "") -> str:
@@ -1192,7 +1207,7 @@ class AppBridge(QObject):
                         date_to,
                         require_online=True,
                     )
-                    mirrored = replace_consumers_from_sync(consumers)
+                    mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
                 pulled_zones = sorted({
                     str(item.get("zone_name") or "").strip()
                     for item in consumers if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
@@ -1202,7 +1217,8 @@ class AppBridge(QObject):
                     "success": True, "pulled": len(consumers), "mirrored": mirrored,
                     "zone": zone_name, "pulled_zones": pulled_zones,
                     "context_pull": context_pull,
-                    "download_summary": _summarize_assignment_download(consumers),
+                    "download_summary": _summarize_assignment_download(consumers, mirror_report),
+                    "skipped_records": mirror_report["skipped"],
                 })
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
@@ -1909,7 +1925,7 @@ class AppBridge(QObject):
                         date_to,
                         require_online=True,
                     )
-                    mirrored = replace_consumers_from_sync(consumers)
+                    mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
                 pulled_zones = sorted(
                     {
                         str(item.get("zone_name") or "").strip()
@@ -1926,7 +1942,8 @@ class AppBridge(QObject):
                         "schedules": schedule_count,
                         "pulled_zones": pulled_zones,
                         "context_pull": context_pull,
-                        "download_summary": _summarize_assignment_download(consumers),
+                        "download_summary": _summarize_assignment_download(consumers, mirror_report),
+                        "skipped_records": mirror_report["skipped"],
                     }
                 )
             except Exception as exc:
@@ -1973,6 +1990,8 @@ class AppBridge(QObject):
             self.syncLogsChanged.emit()
         else:
             self._assignment_download_status = "Fresh backend data"
+            if result.get("skipped_records"):
+                self._assignment_download_status += f"; {result['skipped_records']} rows skipped"
             self._assignment_download_error = ""
             self._assignment_download_summary = str(result.get("download_summary") or "")
             if zone_name:
@@ -2185,9 +2204,10 @@ class AppBridge(QObject):
             self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self._assignment_download_error = str((result.get("result") or {}).get("pull_error") or "")
-            self._assignment_download_status = (
-                "Download failed; using cached records" if self._assignment_download_error else "Fresh backend data"
-            )
+            self._assignment_download_status = "Download failed; using cached records" if self._assignment_download_error else "Fresh backend data"
+            skipped_records = int((result.get("result") or {}).get("skipped_records", 0))
+            if not self._assignment_download_error and skipped_records:
+                self._assignment_download_status += f"; {skipped_records} rows skipped"
             self._assignment_download_summary = (
                 "" if self._assignment_download_error else str(result.get("download_summary") or "")
             )
@@ -2213,7 +2233,7 @@ class AppBridge(QObject):
             first_error_line = f"\n\nFirst problem:\n{errors[0]}" if errors else ""
             has_problems = bool(
                 pull_error or errors or sync_result.get("failed") or sync_result.get("conflicts")
-                or sync_result.get("offline_reference_failures")
+                or sync_result.get("offline_reference_failures") or sync_result.get("skipped_records")
             )
             self.alertRequested.emit(
                 "Sync Finished with Problems" if has_problems else "Sync Complete",
@@ -3067,6 +3087,7 @@ class AppBridge(QObject):
                     result = self._sync_dal.syncPendingReadings()
                     pulled = 0
                     mirrored = 0
+                    mirror_report: dict = {}
                     try:
                         stage = "Downloading assigned schedules"
                         date_from, date_to = _assignment_download_window()
@@ -3087,7 +3108,8 @@ class AppBridge(QObject):
                             "offline_reference_failures": int(reservation_result.get("failed", 0)),
                         }
                         stage = "Updating the device consumer cache"
-                        mirrored = replace_consumers_from_sync(consumers)
+                        mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
+                        result = {**result, "skipped_records": mirror_report["skipped"]}
                     except Exception as pull_exc:
                         self._sync_dal._audit(None, "failed", format_sync_error(stage, pull_exc, self._backend_endpoint))
                         result = {
@@ -3098,7 +3120,7 @@ class AppBridge(QObject):
                 self.syncTaskFinished.emit({
                     "kind": "sync", "result": result, "pulled": pulled,
                     "mirrored": mirrored, "context_pull": context_pull,
-                    "download_summary": _summarize_assignment_download(consumers) if pulled else "",
+                    "download_summary": _summarize_assignment_download(consumers, mirror_report) if pulled else "",
                 })
             except Exception as exc:
                 self.syncTaskFinished.emit(

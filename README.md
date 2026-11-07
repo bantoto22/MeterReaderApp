@@ -203,6 +203,24 @@ The backend binds each reservation to its bill date, so a reference for yesterda
 today's bill. Preparing future scheduled dates uses the same backend sequence and separate bill UUIDs.
 Sync results report reference preparation failures; retry sync before leaving connectivity if any occur.
 
+To clean old unused local reference reservations on the Pi, close the device app
+and run these commands from the `MeterReaderApp` directory:
+
+```bash
+python3 src/offline_reference_cleanup.py
+python3 src/offline_reference_cleanup.py --apply
+```
+
+The first command previews counts without changing the database. The second
+verifies a full SQLite backup under `data/backups/`, rechecks links under a write
+lock, and removes only unchanged unused `Pending`/`Reserved` reservations dated
+before today in Asia/Manila. Current/future dates, used reservations, queued work
+(including failed, conflict, review, and synced records), saved readings, receipts,
+and cached bill references are retained. Unknown schema or invalid cached JSON
+stops cleanup. The command reports the backup path and number removed; running it
+again does not remove the protected records. Backend reservations and the shared
+reference-number sequence are not reset, and old numbers are never reused.
+
 ### Handheld UI
 
 - Sync badges are shown in Meter Entry: `Online`, `Offline`, `Pending Sync`, `Sync Failed`.
@@ -323,6 +341,12 @@ already on the device. They are not counts of newly created consumers. Settings,
 Diagnostics, and the manual sync result also show unique consumer and schedule
 counts and repeated rows with the same `(schedule_id, consumer_id)` in that
 download. The same consumer assigned to different schedules is valid history.
+Mirrored includes updates to existing rows; it does not exclude a row merely
+because it was downloaded before. Rows without a real meter number (empty or an
+`ACCT-`/`CID-` placeholder) are skipped. The sync summary and audit log report
+skipped-row counts and reasons, and manual sync reports problems when any rows
+were skipped. Correct the affected meter assignments in the main system before
+expecting those records to be available for reading on the device.
 
 A saved reading keeps its read marker for its original schedule when a stale
 unread assignment is mirrored, including after successful upload or app restart.
