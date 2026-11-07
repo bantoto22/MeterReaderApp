@@ -307,6 +307,30 @@ If a fresh backend schedule download confirms the original schedule has been res
 reader, the original saved reading returns to the upload queue. The device never silently moves it
 to a different schedule or marks it synced without backend acceptance.
 
+Sync Now and automatic assignment refreshes use today's date in Asia/Manila to
+download the past year and the current and next month of schedules. Viewing an
+older route does not narrow discovery of new assignments. Automatic assignment
+refresh runs every five minutes by default (`BACKEND_SYNC_INTERVAL_MS`, minimum
+300000 ms); Sync Now downloads immediately without restarting the app. Download
+failures are reported as pull warnings instead of counting cached records as a
+successful download. Cached routes and queued readings remain available offline.
+Settings and Diagnostics show whether the assignment download returned fresh
+backend data or failed while cached records remain in use. A reachable health
+endpoint does not hide a failed authenticated assignment download. Upload-only
+background work does not change the last assignment-download counts.
+Pulled and Mirrored count processed assignment rows, including updates to records
+already on the device. They are not counts of newly created consumers. Settings,
+Diagnostics, and the manual sync result also show unique consumer and schedule
+counts and repeated rows with the same `(schedule_id, consumer_id)` in that
+download. The same consumer assigned to different schedules is valid history.
+
+A saved reading keeps its read marker for its original schedule when a stale
+unread assignment is mirrored, including after successful upload or app restart.
+Startup and assignment refresh repair markers previously reset this way using
+the saved reading, including offline startup. A new schedule for the same consumer remains unread. Explicit backend
+rejection, deletion, or invalidation still reopens the original assignment;
+consumer/bill detail refreshes do not rewrite assignment read flags.
+
 Within a grouped route, the device uses `assignment_order` as the authoritative
 sequence and never redistributes consumers between readers. Rows without an order
 fall back to segment-aware account sorting, so `152-0`, `152-A1`, `152-A2`, and

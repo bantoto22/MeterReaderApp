@@ -2268,7 +2268,17 @@ class HandheldSyncDataAccess:
             {},
         )
         refreshed = {**cached, **context, "id": int(consumer_id)}
-        self.local.cache_consumers([refreshed])
+        # Consumer/bill detail is not a schedule-scoped assignment response.
+        # In particular, a bill's schedule_id must not reset that route's read flag.
+        for key in ("schedule_id", "Schedule_ID", "is_read", "reading_status", "reading_sync_status"):
+            if key in cached:
+                refreshed[key] = cached[key]
+            else:
+                refreshed.pop(key, None)
+        profile = dict(refreshed)
+        profile.pop("schedule_id", None)
+        profile.pop("Schedule_ID", None)
+        self.local.cache_consumers([profile])
         self.local.cache_consumer_context(int(consumer_id), context)
         return refreshed
 
@@ -2450,8 +2460,11 @@ class HandheldSyncDataAccess:
         zone_name: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        *,
+        require_online: bool = False,
         **kwargs,
     ) -> list[dict]:
+        """Read assignments, requiring a fresh download for explicit sync operations."""
         effective_reader_id = meter_reader_id or kwargs.get("meterReaderId") or kwargs.get("reader_id")
         effective_zone_name = zone_name or kwargs.get("zoneName")
         if not date_from or not date_to:
@@ -2503,12 +2516,23 @@ class HandheldSyncDataAccess:
                     return consumers
                 self.local.log_audit(
                     None,
-                    "failed",
+                    "success" if require_online else "failed",
+                    "Backend API returned no assigned consumers" if require_online else
                     "Backend API returned no assigned consumers; using local cache",
                     {"schedule_count": len(schedules)},
                 )
+                if require_online:
+                    # An empty response is a completed download, not permission to
+                    # count old cached assignments as freshly pulled records.
+                    return []
             except Exception as exc:
-                self.local.log_audit(None, "failed", f"Backend API load failed; using local cache: {exc}")
+                message = "Backend API load failed" if require_online else "Backend API load failed; using local cache"
+                self.local.log_audit(None, "failed", f"{message}: {exc}")
+                if require_online:
+                    raise
+
+        elif require_online:
+            raise RuntimeError("The Backend API is unreachable. Assigned consumers were not downloaded; cached records remain available.")
 
         cached = self.local.load_cached_consumers(effective_zone_name)
         self.local.log_audit(None, "success", "Loaded assigned consumers from local cache", {"count": len(cached)})

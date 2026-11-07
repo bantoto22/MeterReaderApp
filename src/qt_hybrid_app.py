@@ -294,6 +294,33 @@ def _multi_day_assignment_window(value: datetime.date) -> tuple[str, str]:
     return previous_start.isoformat(), end.isoformat()
 
 
+def _assignment_download_window() -> tuple[str, str]:
+    # Browsing an old route must not move discovery of new assignments into the past.
+    return _multi_day_assignment_window(manila_current_date())
+
+
+def _summarize_assignment_download(consumers: list[dict]) -> str:
+    consumer_ids: set[str] = set()
+    schedule_ids: set[str] = set()
+    assignments: set[tuple[str, str]] = set()
+    repeated = 0
+    for row in consumers:
+        consumer_id = str(row.get("id") or row.get("consumer_id") or "").strip()
+        schedule_id = str(row.get("schedule_id") or row.get("Schedule_ID") or "").strip()
+        if consumer_id:
+            consumer_ids.add(consumer_id)
+        if consumer_id and schedule_id:
+            schedule_ids.add(schedule_id)
+            key = (consumer_id, schedule_id)
+            if key in assignments:
+                repeated += 1
+            assignments.add(key)
+    return (
+        f"Unique consumers: {len(consumer_ids)} | Schedules: {len(schedule_ids)} | "
+        f"Repeated assignment rows: {repeated}"
+    )
+
+
 def _billing_month_date(value, fallback: str = "") -> str:
     raw = str(value or "").strip()
     if raw:
@@ -760,6 +787,9 @@ class AppBridge(QObject):
         self._last_sync = "Never"
         self._last_pull_mirror = 0
         self._last_pull_count = 0
+        self._assignment_download_status = "Not downloaded yet"
+        self._assignment_download_error = ""
+        self._assignment_download_summary = ""
         self._auto_pull_enabled = False
         self._auto_push_enabled = False
         self._auto_sync_enabled = self._load_auto_sync_enabled()
@@ -1154,12 +1184,13 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 with self._sync_dal.operation_lock:
-                    date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
+                    date_from, date_to = _assignment_download_window()
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id,
                         None if zone_name == "All zones" else zone_name,
                         date_from,
                         date_to,
+                        require_online=True,
                     )
                     mirrored = replace_consumers_from_sync(consumers)
                 pulled_zones = sorted({
@@ -1171,6 +1202,7 @@ class AppBridge(QObject):
                     "success": True, "pulled": len(consumers), "mirrored": mirrored,
                     "zone": zone_name, "pulled_zones": pulled_zones,
                     "context_pull": context_pull,
+                    "download_summary": _summarize_assignment_download(consumers),
                 })
             except Exception as exc:
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc), "zone": zone_name})
@@ -1454,6 +1486,14 @@ class AppBridge(QObject):
     def lastPullCount(self) -> int:
         return self._last_pull_count
 
+    @Property(str, notify=syncStatusChanged)
+    def assignmentDownloadStatus(self) -> str:
+        return self._assignment_download_status
+
+    @Property(str, notify=lastPullCountChanged)
+    def assignmentDownloadSummary(self) -> str:
+        return self._assignment_download_summary
+
     @Property(bool, notify=autoPullEnabledChanged)
     def autoPullEnabled(self) -> bool:
         return False
@@ -1703,7 +1743,8 @@ class AppBridge(QObject):
                 raise RuntimeError(snapshot["probe_error"])
             self._sync_status = str(snapshot.get("status", "Offline"))
             self._sync_status_color = "#10B981" if self._sync_status == "Online" else "#526176"
-            if snapshot.get("has_failed"):
+            download_error = str(getattr(self, "_assignment_download_error", "") or "")
+            if snapshot.get("has_failed") or (snapshot.get("backend_online") and download_error):
                 self._sync_status = "Sync Failed"
                 self._sync_status_color = "#EF4444"
             self._sync_pending_count = int(snapshot.get("pending_count", 0))
@@ -1727,8 +1768,13 @@ class AppBridge(QObject):
                 f"Backend status: {self._backend_status}\n"
                 f"Queued readings: {self._backend_pending_count}\n"
                 f"Needs review: {self._sync_review_count}\n"
-                f"Automatic sync: {'Enabled' if self._auto_sync_enabled else 'Disabled'}"
+                f"Automatic sync: {'Enabled' if self._auto_sync_enabled else 'Disabled'}\n"
+                f"Assignment download: {getattr(self, '_assignment_download_status', 'Not downloaded yet')}"
             )
+            if getattr(self, "_assignment_download_summary", ""):
+                diagnostic_header += "\n" + self._assignment_download_summary
+            if download_error:
+                diagnostic_header += "\n\n" + download_error
             if self._sync_review_summary:
                 diagnostic_header += "\n" + self._sync_review_summary
             health_error = str(snapshot.get("backend_health_error") or "").strip()
@@ -1825,22 +1871,15 @@ class AppBridge(QObject):
         if not self._sync_dal or not self._meter_reader_account_id:
             return 0
         schedules: list[dict] = []
-        for client in (getattr(self._sync_dal, "remote", None),):
-            if not client:
-                continue
+        client = getattr(self._sync_dal, "remote", None)
+        if not client or not client.is_online():
+            raise RuntimeError("The Backend API is unreachable. Assigned schedules were not downloaded; cached routes remain available.")
+        for status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
             try:
-                if hasattr(client, "is_online") and not client.is_online():
-                    continue
-                for status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
-                    try:
-                        schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
-                    except Exception:
-                        if status != "Completed":
-                            raise
-                if schedules:
-                    break
+                schedules.extend(client.load_reading_schedules(self._meter_reader_account_id, date_from, date_to, status))
             except Exception:
-                continue
+                if status != "Completed":
+                    raise
         updated = replace_reading_schedules_from_sync(schedules, self._meter_reader_account_id, date_from, date_to)
         reconcile = getattr(self._sync_dal, "reconcileScheduleReadings", None)
         if callable(reconcile):
@@ -1861,13 +1900,14 @@ class AppBridge(QObject):
         def _task() -> None:
             try:
                 with self._sync_dal.operation_lock:
-                    date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
+                    date_from, date_to = _assignment_download_window()
                     schedule_count = self._mirror_assigned_schedules(date_from, date_to)
                     consumers = self._sync_dal.loadAssignedConsumers(
                         self._meter_reader_account_id,
                         None,
                         date_from,
                         date_to,
+                        require_online=True,
                     )
                     mirrored = replace_consumers_from_sync(consumers)
                 pulled_zones = sorted(
@@ -1886,9 +1926,13 @@ class AppBridge(QObject):
                         "schedules": schedule_count,
                         "pulled_zones": pulled_zones,
                         "context_pull": context_pull,
+                        "download_summary": _summarize_assignment_download(consumers),
                     }
                 )
             except Exception as exc:
+                self._sync_dal._audit(None, "failed", format_sync_error(
+                    "Downloading assigned schedules and consumers", exc, self._backend_endpoint
+                ))
                 self.assignedDatasetFinished.emit({"success": False, "error": str(exc)})
 
         threading.Thread(target=_task, daemon=True).start()
@@ -1917,11 +1961,20 @@ class AppBridge(QObject):
         if zone_name:
             self._zone_refreshing.discard(zone_name)
         if not result.get("success"):
+            self._assignment_download_status = "Download failed; using cached records"
+            self._assignment_download_summary = ""
+            self.lastPullCountChanged.emit()
+            self._assignment_download_error = format_sync_error(
+                "Downloading assigned schedules and consumers", result.get("error", "Unknown error"), self._backend_endpoint
+            )
             if zone_name:
                 self._zone_refresh_attempted.discard(zone_name)
             self._sync_logs = f"Assigned schedule refresh failed: {result.get('error', 'Unknown error')}"
             self.syncLogsChanged.emit()
         else:
+            self._assignment_download_status = "Fresh backend data"
+            self._assignment_download_error = ""
+            self._assignment_download_summary = str(result.get("download_summary") or "")
             if zone_name:
                 self._zone_refresh_attempted.discard(zone_name)
             else:
@@ -1959,13 +2012,14 @@ class AppBridge(QObject):
             return
         if self._sync_dal:
             try:
-                date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
+                date_from, date_to = _assignment_download_window()
                 self._mirror_assigned_schedules(date_from, date_to)
                 consumers = self._sync_dal.loadAssignedConsumers(
                     self._meter_reader_account_id,
                     None,
                     date_from,
                     date_to,
+                    require_online=True,
                 )
                 replace_consumers_from_sync(consumers)
             except Exception as exc:
@@ -2127,9 +2181,16 @@ class AppBridge(QObject):
                 self.alertRequested.emit("Sync Failed", self._sync_logs)
             return
 
-        self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
         if "pulled" in result:
+            self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
+            self._assignment_download_error = str((result.get("result") or {}).get("pull_error") or "")
+            self._assignment_download_status = (
+                "Download failed; using cached records" if self._assignment_download_error else "Fresh backend data"
+            )
+            self._assignment_download_summary = (
+                "" if self._assignment_download_error else str(result.get("download_summary") or "")
+            )
             self.lastPullCountChanged.emit()
         self._refresh_local_assignment_views()
         self._reload_current_consumer_from_db()
@@ -2139,6 +2200,10 @@ class AppBridge(QObject):
             pull_error = str(sync_result.get("pull_error") or "").strip()
             errors = [str(item).strip() for item in sync_result.get("errors", []) if str(item).strip()]
             pull_line = f"\nPulled: {self._last_pull_count}\nMirrored: {self._last_pull_mirror}"
+            if "pulled" in result:
+                pull_line += f"\nAssignment download: {self._assignment_download_status}"
+                if self._assignment_download_summary:
+                    pull_line += "\n" + self._assignment_download_summary
             review_line = f"\nNeeds review: {getattr(self, '_sync_review_count', sync_result.get('needs_review', 0))}"
             reference_line = (
                 f"\nOffline references ready: {sync_result.get('offline_references_ready', 0)}"
@@ -3004,7 +3069,7 @@ class AppBridge(QObject):
                     mirrored = 0
                     try:
                         stage = "Downloading assigned schedules"
-                        date_from, date_to = _multi_day_assignment_window(self._selected_reading_date())
+                        date_from, date_to = _assignment_download_window()
                         self._mirror_assigned_schedules(date_from, date_to)
                         stage = "Downloading assigned consumers"
                         consumers = self._sync_dal.loadAssignedConsumers(
@@ -3012,6 +3077,7 @@ class AppBridge(QObject):
                             None,
                             date_from,
                             date_to,
+                            require_online=True,
                         )
                         pulled = len(consumers)
                         reservation_result = getattr(self._sync_dal, "last_pre_reservation_result", {}) or {}
@@ -3023,6 +3089,7 @@ class AppBridge(QObject):
                         stage = "Updating the device consumer cache"
                         mirrored = replace_consumers_from_sync(consumers)
                     except Exception as pull_exc:
+                        self._sync_dal._audit(None, "failed", format_sync_error(stage, pull_exc, self._backend_endpoint))
                         result = {
                             **result,
                             "pull_error": format_sync_error(stage, pull_exc, self._backend_endpoint),
@@ -3031,6 +3098,7 @@ class AppBridge(QObject):
                 self.syncTaskFinished.emit({
                     "kind": "sync", "result": result, "pulled": pulled,
                     "mirrored": mirrored, "context_pull": context_pull,
+                    "download_summary": _summarize_assignment_download(consumers) if pulled else "",
                 })
             except Exception as exc:
                 self.syncTaskFinished.emit(

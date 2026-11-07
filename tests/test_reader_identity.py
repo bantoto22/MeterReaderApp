@@ -27,7 +27,7 @@ class ReaderIdentityTests(unittest.TestCase):
                 client = BackendApiClient(SyncConfig(backend_api_base_url="https://example.test"))
                 for profile in profiles:
                     with self.subTest(profile=profile):
-                        payload = {"success": True, "user": {
+                        payload = {"success": True, "session_token": "test-device-session", "user": {
                             "id": 12, "username": "reader1", "role_id": 3, **profile,
                         }}
                         with patch.object(client, "_req", return_value=(200, payload)):

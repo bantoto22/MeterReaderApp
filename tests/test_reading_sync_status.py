@@ -155,6 +155,51 @@ class ReadingSyncStatusTests(unittest.TestCase):
         }])
         self._assert_confirmed()
 
+    def test_confirmed_reading_survives_stale_unread_assignment_refresh(self):
+        self.dal.saveMeterReading(self.payload)
+        database.replace_consumers_from_sync([self.consumer])
+        self._assert_confirmed()
+        self.assertTrue(self._display(meter_reader_id=12, schedule_id=101)["is_read"])
+
+    def test_startup_repairs_read_marker_from_saved_reading_while_offline(self):
+        self.dal.saveMeterReading(self.payload)
+        connection = database.get_connection()
+        try:
+            connection.execute("UPDATE reading_assignment SET is_read=0, reading_status='pending', reading_sync_status='pending'")
+            connection.commit()
+        finally:
+            connection.close()
+        restarted = HandheldSyncDataAccess(self._store(), self.remote)
+        self.assertEqual(restarted.listPendingSyncReadings(), [])
+        self.remote.online = False
+        database.init_db()
+        self._assert_confirmed()
+        self.assertTrue(self._display(meter_reader_id=12, schedule_id=101)["is_read"])
+
+    def test_confirmed_reading_does_not_complete_new_schedule_for_same_consumer(self):
+        self.dal.saveMeterReading(self.payload)
+        database.replace_reading_schedules_from_sync([{
+            "schedule_id": 202, "start_date": self.today, "due_date": self.today,
+            "zone_name": "Zone 1", "meter_reader_id": 12, "status": "Scheduled",
+        }], 12, self.today, self.today)
+        database.replace_consumers_from_sync([{**self.consumer, "schedule_id": 202}, self.consumer])
+        self.assertTrue(self._display(meter_reader_id=12, schedule_id=101)["is_read"])
+        self.assertFalse(self._display(meter_reader_id=12, schedule_id=202)["is_read"])
+
+    def test_explicit_backend_rejection_reopens_confirmed_assignment(self):
+        self.dal.saveMeterReading(self.payload)
+        database.replace_consumers_from_sync([{
+            **self.consumer, "reading_status": "Rejected", "reading_sync_status": "synced",
+        }])
+        display = self._display(meter_reader_id=12, schedule_id=101)
+        self.assertFalse(display["is_read"])
+        self.assertEqual(display["reading_status"], "Rejected")
+        # A later stale pending snapshot must not resurrect the rejected reading.
+        database.replace_consumers_from_sync([self.consumer])
+        display = self._display(meter_reader_id=12, schedule_id=101)
+        self.assertFalse(display["is_read"])
+        self.assertEqual(display["reading_status"], "Rejected")
+
     def test_missing_response_status_preserves_existing_reading_status(self):
         database.update_reading_sync_state(self.payload["reading_id"], "pending", "For review")
         self.remote.statuses = {}

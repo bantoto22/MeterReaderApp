@@ -350,6 +350,29 @@ def init_db():
         )
     """)
 
+    # Repair markers previously reset by stale cache mirrors, without requiring
+    # connectivity or changing an explicitly rejected/deleted assignment.
+    cur.execute("""
+        UPDATE reading_assignment
+        SET (is_read, reading_status, reading_sync_status) = (
+            SELECT
+                CASE WHEN lower(COALESCE(r.reading_status, 'valid')) IN ('rejected', 'deleted', 'invalid')
+                     THEN 0 ELSE 1 END,
+                COALESCE(r.reading_status, 'valid'),
+                COALESCE(r.reading_sync_status, 'pending')
+            FROM readings r
+            WHERE r.consumer_id = reading_assignment.consumer_id
+              AND r.schedule_id = reading_assignment.schedule_id
+            ORDER BY r.id DESC LIMIT 1
+        ), updated_at = CURRENT_TIMESTAMP
+        WHERE is_read = 0 AND lower(COALESCE(reading_status, 'pending')) IN ('', 'pending')
+          AND EXISTS (
+              SELECT 1 FROM readings r
+              WHERE r.consumer_id = reading_assignment.consumer_id
+                AND r.schedule_id = reading_assignment.schedule_id
+          )
+    """)
+
     # ── Seed data (only if tables are empty) ─────────────────────────────
     if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
         zones = ["Zone 1", "Zone 2", "Zone 3"]
@@ -2240,6 +2263,30 @@ def replace_consumers_from_sync(consumers: list[dict]) -> int:
                 remote_is_read = remote_is_read and remote_status.lower() not in {"rejected", "deleted", "invalid"}
                 assignment_status = remote_status or ("valid" if remote_is_read else "pending")
                 remote_sync = str(c.get("reading_sync_status") or c.get("sync_status") or ("synced" if remote_is_read else "pending")).strip().lower()
+                saved = cur.execute(
+                    """SELECT id, reading_status, reading_sync_status FROM readings
+                       WHERE consumer_id = ? AND schedule_id = ? ORDER BY id DESC LIMIT 1""",
+                    (local_consumer_id, schedule_row["schedule_id"]),
+                ).fetchone()
+                if saved:
+                    saved_status = str(saved["reading_status"] or "valid").strip()
+                    saved_sync = str(saved["reading_sync_status"] or "pending").strip().lower()
+                    saved_valid = saved_status.lower() not in {"rejected", "deleted", "invalid"}
+                    local_work_pending = saved_valid and saved_sync in {"pending", "failed", "needs_review"}
+                    stale_unread = not remote_is_read and remote_status.lower() in {"", "pending"}
+                    if local_work_pending or stale_unread:
+                        # A saved reading belongs to this exact assignment even
+                        # after upload. A stale unread/cache snapshot cannot undo it.
+                        remote_is_read = saved_valid
+                        assignment_status = saved_status
+                        remote_sync = saved_sync
+                    elif remote_status.lower() in {"rejected", "deleted", "invalid"} and saved_sync == "synced":
+                        # Retain an explicit backend invalidation so a later
+                        # pending snapshot cannot resurrect the old accepted state.
+                        cur.execute(
+                            "UPDATE readings SET reading_status = ?, reading_sync_status = ? WHERE id = ?",
+                            (assignment_status, remote_sync, saved["id"]),
+                        )
                 cur.execute(
                     """
                     INSERT INTO reading_assignment (

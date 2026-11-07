@@ -249,11 +249,28 @@ Rectangle {
                             Text { text: "Server database: " + (bridgeObj ? bridgeObj.backupState : "Not configured"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text { text: "Last Sync: " + (bridgeObj ? bridgeObj.lastSync : "Never"); color: "#526176"; font.family: "Montserrat"; font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                             Text {
+                                text: "Assignment download: " + (bridgeObj ? bridgeObj.assignmentDownloadStatus : "Not downloaded yet")
+                                color: bridgeObj ? bridgeObj.syncStatusColor : "#526176"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
                                 text: "Last download: "
                                       + (bridgeObj ? bridgeObj.lastPullCount : 0)
-                                      + " downloaded | "
+                                      + " assignment rows | "
                                       + (bridgeObj ? bridgeObj.lastPullMirror : 0)
-                                      + " updated on device"
+                                      + " processed on device"
+                                color: "#526176"
+                                font.family: "Montserrat"
+                                font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                visible: bridgeObj && bridgeObj.assignmentDownloadSummary !== ""
+                                text: bridgeObj ? bridgeObj.assignmentDownloadSummary : ""
                                 color: "#526176"
                                 font.family: "Montserrat"
                                 font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
@@ -311,8 +328,8 @@ Rectangle {
                                 Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
                                 text: bridgeObj && bridgeObj.autoSyncEnabled
-                                      ? "When enabled, pending readings sync automatically whenever the Backend API is reachable."
-                                      : "When disabled, readings stay on this device until Sync Now is tapped."
+                                      ? "Pending readings upload automatically. Schedules and consumer records refresh every " + Math.round(bridgeObj.pullInterval / 60) + " minutes while the Backend API is reachable."
+                                      : "Tap Sync Now to upload readings and download schedules and consumer records."
                                 color: "#526176"
                                 font.family: "Montserrat"
                                 font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText
