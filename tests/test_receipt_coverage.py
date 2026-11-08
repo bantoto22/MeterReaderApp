@@ -16,6 +16,8 @@ class ReceiptCoverageTests(unittest.TestCase):
             "due_days": 15, "previous_reading": 5,
             "schedule_payment_due_date": "2026-10-12",
             "latest_reading_date": "2026-08-20",
+            "coverage_policy_version": 1, "coverage_from": "2026-07-15",
+            "previous_schedule_date": "2026-07-15", "baseline_required": False,
             "date_covered_from": "2026-08-27", "date_covered_to": "2026-08-27",
         }
         self.reading = {
@@ -55,15 +57,15 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertNotIn("PHP   550.00", preview)
         self.assertNotIn("PHP   300.00", preview)
 
-    def test_late_reading_uses_meter_reading_dates_in_bill_receipt_and_reprint(self):
+    def test_late_reading_uses_completed_schedule_dates_in_bill_receipt_and_reprint(self):
         bill = _build_bill_payload(self.reading, self.consumer, 99, as_of_date=date(2026, 9, 17))
-        self.assertEqual(bill["date_covered_from"], "2026-08-20 00:00:00")
-        self.assertEqual(bill["date_covered_to"], "2026-09-17 00:00:00")
+        self.assertEqual(bill["date_covered_from"], "2026-07-15 00:00:00")
+        self.assertEqual(bill["date_covered_to"], "2026-08-27 00:00:00")
         receipt = build_receipt_text(
             apply_authoritative_bill(self.consumer, bill), 5, 7, "None", "Juan Dela Cruz",
             reading_date="2026-09-17",
         )
-        expected = "Coverage       : 2026-08-20 to\n                  2026-09-17"
+        expected = "Coverage       : 2026-07-15 to\n                  2026-08-27"
         self.assertIn(expected, receipt)
         self.assertIn("Reading Date   : 2026-09-17", receipt)
         self.assertIn(expected, build_reprint_receipt_text(receipt))
@@ -76,31 +78,32 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual(bill["amount_due"], 100)
         self.assertEqual(bill["total_after_due_date"], 110)
 
-    def test_reading_dates_override_schedule_and_backend_bill_dates(self):
+    def test_saved_bill_coverage_overrides_mutable_reading_context(self):
         snapshot = dict(self.consumer, schedule_date="2026-08-27", schedule_due_date="2026-09-01")
         snapshot = apply_authoritative_bill(snapshot, {
             "date_covered_from": "2026-09-17", "date_covered_to": "2026-09-17",
         })
         receipt = build_receipt_text(snapshot, 5, 7, "None", "Juan Dela Cruz", reading_date="2026-09-17")
-        self.assertIn("Coverage       : 2026-08-20 to\n                  2026-09-17", receipt)
+        self.assertIn("Coverage       : 2026-09-17 to\n                  2026-09-17", receipt)
 
     def test_offline_retry_preserves_previous_reading_snapshot(self):
-        reading = dict(self.reading, previous_reading_date="2026-08-20")
-        context = dict(self.consumer, latest_reading_date="2026-09-17")
+        reading = dict(self.reading, previous_reading_date="2026-08-20", coverage_from="2026-07-15")
+        context = dict(self.consumer, latest_reading_date="2026-09-17", coverage_from="2026-09-17")
         bill = _build_bill_payload(reading, context, 99)
-        self.assertEqual(bill["date_covered_from"], "2026-08-20 00:00:00")
-        self.assertEqual(bill["date_covered_to"], "2026-09-17 00:00:00")
+        self.assertEqual(bill["date_covered_from"], "2026-07-15 00:00:00")
+        self.assertEqual(bill["date_covered_to"], "2026-08-27 00:00:00")
 
-    def test_new_bill_does_not_reuse_july_schedule_or_prior_bill_due_date(self):
+    def test_late_bill_uses_selected_schedule_but_keeps_payment_due_date_separate(self):
         reading = dict(
             self.reading, reading_date="2026-09-23", bill_date="2026-09-23",
             schedule_date="2026-07-15", schedule_due_date="2026-07-14",
+            coverage_from="2026-06-15",
             due_date="2026-07-14",
         )
         bill = _build_bill_payload(reading, dict(self.consumer, due_date="2026-07-14"), 99)
         self.assertEqual(bill["bill_date"], "2026-09-23 00:00:00")
         self.assertEqual(bill["due_date"], "2026-10-08 00:00:00")
-        self.assertEqual(bill["date_covered_to"], "2026-09-23 00:00:00")
+        self.assertEqual(bill["date_covered_to"], "2026-07-15 00:00:00")
 
     def test_context_refresh_preserves_the_selected_assignment(self):
         from src.qt_hybrid_app import AppBridge
@@ -123,7 +126,7 @@ class ReceiptCoverageTests(unittest.TestCase):
             _sync_dal=SimpleNamespace(getConsumerContext=lambda _id: refreshed),
             _reload_current_consumer_from_db=lambda: None,
         )
-        with patch("src.qt_hybrid_app.replace_consumers_from_sync"):
+        with patch("src.qt_hybrid_app.replace_consumers_from_sync"), patch('src.qt_hybrid_app.get_schedule_payment_due_date', return_value=None):
             AppBridge._ensure_current_consumer_receipt_context(bridge, force_refresh=True)
         for key in ("schedule_id", "schedule_date", "schedule_due_date", "billing_cycle", "reading_route_id"):
             self.assertEqual(bridge._consumer[key], selected[key])
@@ -131,16 +134,16 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual((bridge._consumer["due_days"], bridge._consumer["late_fee"]), (9, 6))
 
         bridge._sync_dal.getConsumerContext = lambda _id: {**refreshed, "due_days": 20, "late_fee": 4}
-        with patch("src.qt_hybrid_app.replace_consumers_from_sync"):
+        with patch("src.qt_hybrid_app.replace_consumers_from_sync"), patch('src.qt_hybrid_app.get_schedule_payment_due_date', return_value=None):
             AppBridge._ensure_current_consumer_receipt_context(bridge, force_refresh=True)
         self.assertEqual((bridge._consumer["due_days"], bridge._consumer["late_fee"]), (20, 4))
 
     def test_missing_previous_date_does_not_invent_a_schedule_or_month_start(self):
-        consumer = dict(self.consumer, previous_reading_date=None)
+        consumer = dict(self.consumer, previous_reading_date=None, coverage_from=None, previous_schedule_date=None, date_covered_from=None, date_covered_to=None)
         bill = _build_bill_payload(dict(self.reading, previous_reading_date=None), consumer, 99)
         self.assertIsNone(bill["date_covered_from"])
         receipt = build_receipt_text(consumer, 0, 7, "None", "Juan Dela Cruz", reading_date="2026-09-17")
-        self.assertIn("Coverage       : N/A to\n                  2026-09-17", receipt)
+        self.assertIn("Coverage       : N/A to N/A", receipt)
 
     def test_preview_uses_consumers_linked_schedule_instead_of_current_route(self):
         try:
@@ -189,7 +192,7 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertEqual(job["previous_reading_date"], "2026-08-20")
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")
         self.assertIn("Reading Date   : " + job["reading_date"], job["receipt_text"])
-        self.assertIn("Coverage       : 2026-08-20 to", job["receipt_text"])
+        self.assertIn("Coverage       : 2026-07-15 to", job["receipt_text"])
         self.assertNotIn("Schedule End Date", job["receipt_text"])
         self.assertIn("Due Date       : 2026-10-12", job["receipt_text"])
         self.assertNotIn("Pending server", job["receipt_text"])
@@ -204,9 +207,10 @@ class ReceiptCoverageTests(unittest.TestCase):
         queued = AppBridge._save_to_sync_layer(
             bridge, 42, 7, 2, "None", False, job["reading_date"], job["due_date"],
             previous_reading_date_snapshot=job["previous_reading_date"],
+            coverage_snapshot=job['coverage_snapshot'],
             wait_for_result=True,
         )
         self.assertEqual(queued["previous_reading_date"], "2026-08-20")
         bill = _build_bill_payload(queued, queued, 99)
-        self.assertEqual(bill["date_covered_from"], "2026-08-20 00:00:00")
-        self.assertEqual(bill["date_covered_to"], job["reading_date"] + " 00:00:00")
+        self.assertEqual(bill["date_covered_from"], "2026-07-15 00:00:00")
+        self.assertEqual(bill["date_covered_to"], job["schedule_date"] + " 00:00:00")

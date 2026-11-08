@@ -178,8 +178,10 @@ def _billing_month_text(consumer: dict, reference_date: datetime.date) -> str:
 
 
 def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
-    start_value = previous_reading_date(consumer) or "N/A"
-    return f"{start_value} to {reference_date.isoformat()}"
+    # Saved bill dates are the receipt's authority, including later reprints.
+    start_value = _display_date(consumer.get('date_covered_from')) if consumer.get('date_covered_from') else 'N/A'
+    end_value = _display_date(consumer.get('date_covered_to')) if consumer.get('date_covered_to') else 'N/A'
+    return f"{start_value} to {end_value}"
 
 
 def _previous_bill_text(previous: float, carried_previous_bill: float | None) -> str:

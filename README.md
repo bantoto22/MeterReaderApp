@@ -279,6 +279,14 @@ ID, separate from the backend bill. It can be used for offline reprints and as
 the prior balance of a later offline reading when the last backend total is
 missing or zero. A complete backend bill takes precedence when it arrives.
 
+Before generating a receipt, the device validates the coverage dates on the
+specific bill selected for printing. Both dates must be valid calendar dates,
+and the start must not be later than the end. Invalid coverage holds printing
+for review while retaining the saved reading and exact billing reference.
+Cached bill reprints use the same validation; a penalty refresh with invalid
+coverage retains the previously saved receipt. See [Device smoke test](DEVICE_SMOKE_TEST.md)
+for the checks to perform on the Raspberry Pi after deploying an update.
+
 During each assigned-consumer pull, a bounded background refresh requests that
 same authenticated context endpoint for each assigned consumer before the app
 reports the pull complete. SQLite keeps the

@@ -223,6 +223,15 @@ def _use_local_bill_for_display(server_bill: dict | None, local_bill: dict) -> b
     )
 
 
+def _has_valid_bill_coverage(bill: dict | None) -> bool:
+    """Validate the saved coverage on one bill without borrowing other dates."""
+    if not bill:
+        return False
+    start = _normalize_iso_date(bill.get("date_covered_from"))
+    end = _normalize_iso_date(bill.get("date_covered_to"))
+    return bool(start and end and start <= end)
+
+
 def _cached_bill_for_reading(context: dict, reading: dict) -> dict | None:
     """Use the server bill when complete, otherwise the matching local calculation."""
     reading_day = _normalize_iso_date(reading.get("reading_date"))
@@ -238,8 +247,10 @@ def _cached_bill_for_reading(context: dict, reading: dict) -> dict | None:
         )
 
     if matches(local) and (not matches(server) or _use_local_bill_for_display(server, local)):
-        return local
-    return server if matches(server) else None
+        selected = local
+    else:
+        selected = server if matches(server) else None
+    return selected if _has_valid_bill_coverage(selected) else None
 
 
 def _format_reading(value) -> str:
@@ -2262,6 +2273,7 @@ class AppBridge(QObject):
         bill_date: str | None = None,
         billing_reference: str | None = None,
         previous_reading_date_snapshot: str | None = None,
+        coverage_snapshot: dict | None = None,
         wait_for_result: bool = False,
     ) -> dict | None:
         if not self._sync_dal:
@@ -2272,6 +2284,7 @@ class AppBridge(QObject):
         effective_reading_date = _normalize_iso_date(reading_date) or datetime.now().date().isoformat()
         effective_schedule_date = (
             _normalize_iso_date(schedule_date)
+            or _normalize_iso_date(schedule.get('startDate'))
             or _normalize_iso_date(route.get("startDate"))
             or _normalize_iso_date(self.selectedBillingDate)
             or effective_reading_date
@@ -2321,6 +2334,9 @@ class AppBridge(QObject):
             "bill_date": _normalize_iso_date(bill_date) or effective_reading_date,
             "billing_reference": billing_reference,
         }
+        frozen_coverage = coverage_snapshot if coverage_snapshot is not None else consumer
+        for key in ('coverage_policy_version','coverage_from','coverage_to','previous_schedule_date','previous_reading','baseline_required'):
+            payload[key] = frozen_coverage.get(key)
 
         def _save() -> dict | None:
             try:
@@ -2863,6 +2879,27 @@ class AppBridge(QObject):
         reading_route_id = self._consumer.get("reading_route_id")
         assignment_order = self._consumer.get("assignment_order")
         consumer_snapshot = dict(self._consumer)
+        assigned_coverage = (consumer_snapshot.get('reading_coverage_by_schedule') or {}).get(str(schedule_id))
+        if isinstance(assigned_coverage, dict):
+            consumer_snapshot.update(assigned_coverage)
+        # A completed offline reading can precede another downloaded cycle.
+        # Keep its frozen schedule boundary, even before the next online sync.
+        local_history = list(consumer_snapshot.get('local_bills') or [])
+        if isinstance(consumer_snapshot.get('local_bill'), dict):
+            local_history.append(consumer_snapshot['local_bill'])
+        for saved_bill in sorted(local_history, key=lambda item: str(item.get('date_covered_to') or '')):
+            boundary = _normalize_iso_date(saved_bill.get('date_covered_to'))
+            start = consumer_snapshot.get('coverage_from') or ''
+            if (saved_bill.get('meter_no') and saved_bill['meter_no'] == consumer_snapshot.get('meter_no')
+                    and saved_bill.get('date_covered_from') and boundary
+                    and start < boundary < schedule_date and saved_bill.get('current_reading') is not None):
+                consumer_snapshot.update(coverage_from=boundary, previous_schedule_date=boundary,
+                                         previous_reading=saved_bill['current_reading'], baseline_required=False)
+        if consumer_snapshot.get('previous_reading') is not None:
+            previous = _to_float(consumer_snapshot['previous_reading'])
+            consumption = present - previous
+        if consumption < 0:
+            raise RuntimeError('The present reading is lower than the verified previous reading. Review this account before billing.')
         consumer_snapshot["previous_reading_date"] = previous_reading_date(self._consumer)
         consumer_snapshot["billing_reference"] = billing_reference
         consumer_snapshot["schedule_date"] = schedule_date
@@ -2881,6 +2918,9 @@ class AppBridge(QObject):
                 "consumer_id": self._consumer["id"], "reading_id": sync_reading_id,
                 "bill_sync_id": bill_sync_id, "bill_date": bill_date,
                 "reading_date": reading_date,
+                "schedule_date": schedule_date,
+                "coverage_from": consumer_snapshot.get('coverage_from'),
+                "coverage_to": schedule_date,
                 "previous_reading_date": consumer_snapshot["previous_reading_date"],
                 "previous_reading": previous, "present_reading": present,
                 "consumption": consumption,
@@ -2892,16 +2932,18 @@ class AppBridge(QObject):
             "sync_id": bill_sync_id or sync_reading_id,
             "billing_reference": billing_reference,
             "schedule_id": schedule_id,
+            "meter_no": consumer_snapshot.get('meter_no'),
+            "current_reading": present,
         })
         receipt = build_receipt_text(
             apply_authoritative_bill(consumer_snapshot, local_bill),
             previous, present, exception, self._reader_name,
             reading_date=reading_date,
-        ) if billing_reference else (
+        ) if billing_reference and _has_valid_bill_coverage(local_bill) else (
             f"Account: {consumer_snapshot.get('acct_no') or consumer_snapshot.get('name') or self._consumer['id']}\n"
             f"Reading date: {reading_date}\nPrevious: {_format_reading(previous)}\n"
             f"Present: {_format_reading(present)}\nUse: {_format_reading(consumption)} m3\n\n"
-            "No billing reference is cached for this reading date.\n\n"
+            "A billing reference and verified reading coverage are required before printing.\n\n"
             "Save the reading on this device, then connect and tap Sync Now "
             "before printing its receipt."
         )
@@ -2917,6 +2959,7 @@ class AppBridge(QObject):
             "exception": exception,
             "reading_date": reading_date,
             "previous_reading_date": consumer_snapshot["previous_reading_date"],
+            "coverage_snapshot": {key: consumer_snapshot.get(key) for key in ('coverage_policy_version','coverage_from','previous_schedule_date','previous_reading','baseline_required')},
             "bill_date": bill_date,
             "due_date": None,
             "schedule_id": schedule_id,
@@ -3002,6 +3045,8 @@ class AppBridge(QObject):
         if not context or str(context.get("billing_reference") or "").strip() != reference:
             return original
         bill = context.get("bill") if isinstance(context.get("bill"), dict) else context
+        if not _has_valid_bill_coverage(bill):
+            return original
         original_total = next(
             (_to_float(line.rsplit("PHP", 1)[-1].strip()) for line in original.splitlines()
              if line.strip().startswith("TOTAL DUE") and "PHP" in line),
@@ -3223,6 +3268,7 @@ class AppBridge(QObject):
                             bill_sync_id=job.get("bill_sync_id"), bill_date=job.get("bill_date"),
                             billing_reference=job.get("billing_reference"),
                             previous_reading_date_snapshot=job.get("previous_reading_date"),
+                            coverage_snapshot=job.get('coverage_snapshot'),
                             wait_for_result=True,
                         )
                         if not sync_result:
@@ -3255,6 +3301,16 @@ class AppBridge(QObject):
                                 or reference[3:7] != reading_date[:4]
                                 or (job.get("billing_reference") and reference != job["billing_reference"])):
                             raise RuntimeError("The bill's billing reference does not match the prepared receipt.")
+                        locally_calculated = _use_local_bill_for_display(authoritative_bill, local_bill)
+                        bill_for_receipt = local_bill if locally_calculated else authoritative_bill
+                        # Check the same bill that will be rendered. A complete local
+                        # interval cannot make an incomplete server bill printable.
+                        if not _has_valid_bill_coverage(bill_for_receipt):
+                            self.printExecutionFinished.emit({
+                                'success': True, 'job_type': 'original', 'pending_review': True, 'review_reason': 'coverage',
+                                'consumer_snapshot': consumer, 'reading_id': reading_id, 'present': present,
+                            })
+                            return
                         consumer["billing_reference"] = reference
                         local_bill["billing_reference"] = reference
                         if cache_local_bill and not job.get("billing_reference"):
@@ -3262,14 +3318,13 @@ class AppBridge(QObject):
                                 cache_local_bill(int(job["consumer_id"]), local_bill)
                             except Exception as exc:
                                 local_bill_cache_error = str(exc)
-                        locally_calculated = _use_local_bill_for_display(authoritative_bill, local_bill)
                         try:
                             fresh_context = _display_consumer_context(self._sync_dal, int(job["consumer_id"]))
                         except Exception:
                             fresh_context = {}
                         consumer = apply_authoritative_bill(
                             {**consumer, **fresh_context},
-                            local_bill if locally_calculated else authoritative_bill,
+                            bill_for_receipt,
                         )
                         due_date = _normalize_iso_date(consumer.get("due_date"))
                         receipt_text = build_receipt_text(
@@ -3394,11 +3449,13 @@ class AppBridge(QObject):
             present = _to_float(result["present"])
             if result.get("pending_reference") or result.get("pending_review"):
                 needs_review = bool(result.get("pending_review"))
+                coverage_review = result.get("review_reason") == "coverage"
                 self._consumer["previous_reading"] = present
                 self._previous_reading = _format_reading(present)
                 self._present_reading = ""
                 self._consumption = "-"
                 self._validation_message = (
+                    "Saved; reading coverage needs review" if coverage_review else
                     "Saved; assignment needs review" if needs_review else "Saved; billing reference pending sync"
                 )
                 self.previousReadingChanged.emit()
@@ -3408,6 +3465,9 @@ class AppBridge(QObject):
                 self._refresh_local_assignment_views()
                 self.alertRequested.emit(
                     "Reading Saved for Review" if needs_review else "Reading Saved",
+                    "Reading saved on this device. Ask the Billing Officer to verify this account's opening "
+                    "reading and coverage in Bills Registry, then connect and tap Sync Now before printing."
+                    if coverage_review else
                     "This reading's schedule is cancelled. Its reading and billing reference are saved "
                     "for assignment review. Other readings can continue syncing."
                     if needs_review else

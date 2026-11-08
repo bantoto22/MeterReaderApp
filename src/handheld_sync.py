@@ -27,11 +27,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from .billing_policy import due_days as policy_due_days, late_fee_percent, payment_due_date
-    from .reading_dates import previous_reading_date
+    from .reading_dates import previous_reading_date, scheduled_coverage
     from .reader_identity import reader_display_name
 except ImportError:
     from billing_policy import due_days as policy_due_days, late_fee_percent, payment_due_date
-    from reading_dates import previous_reading_date
+    from reading_dates import previous_reading_date, scheduled_coverage
     from reader_identity import reader_display_name
 
 try:
@@ -638,10 +638,11 @@ def _build_bill_payload(
 
     bill_date = datetime.combine(reference_date, datetime.min.time())
     # Preserve the reading interval across offline retries and later billing.
-    coverage_start = previous_reading_date(reading if "previous_reading_date" in reading else context)
-    coverage_end = _reading_date(reading.get("reading_date"))
+    coverage_source = {**context, **reading}
+    coverage_start, coverage_day = scheduled_coverage(coverage_source)
+    coverage_end = _reading_date(coverage_day or reading.get("reading_date"))
     # Schedule deadlines belong to route assignments; they are not payment due dates.
-    due_date_obj = _parse_date(reading.get("schedule_payment_due_date")) or payment_due_date(coverage_end, due_days)
+    due_date_obj = _parse_date(reading.get("schedule_payment_due_date")) or payment_due_date(_reading_date(reading.get("reading_date")), due_days)
     due_date = datetime.combine(due_date_obj, datetime.min.time())
     amount_due = round(current_charge + concessionaire_fees + carried_balance + carried_penalty, 2)
     # The penalty is accrued only when overdue, but AFTER DUE is the amount
@@ -694,7 +695,7 @@ def _build_bill_payload(
 def _build_base_bill_payload(reading: dict) -> dict:
     """Fields required to issue a bill; the backend owns dates and penalties."""
     reading_day = _reading_date(reading.get("reading_date"))
-    start = previous_reading_date(reading)
+    start, coverage_end = scheduled_coverage(reading)
     consumption = _safe_int(reading.get("consumption"))
     charge = _compute_charge(
         consumption,
@@ -707,7 +708,7 @@ def _build_base_bill_payload(reading: dict) -> dict:
         "bill_date": reading_day.isoformat(),
         "billing_month": reading_day.strftime("%B %Y"),
         "date_covered_from": f"{start} 00:00:00" if start else None,
-        "date_covered_to": f"{reading_day.isoformat()} 00:00:00",
+        "date_covered_to": f"{coverage_end} 00:00:00" if coverage_end else None,
         "class_cost": round(charge, 2),
         "water_charge": round(charge, 2),
         "meter_maintenance_fee": _fee_value(reading, "water_meter_fee"),
@@ -1284,6 +1285,15 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     def cache_consumers(self, consumers: list[dict]) -> None:
         if not consumers:
             return
+        coverage_records = {}
+        for item in consumers:
+            if item.get('coverage_policy_version') != 1:
+                continue
+            consumer_id = item.get('id') or item.get('consumer_id')
+            schedule_id = item.get('schedule_id')
+            if consumer_id is not None and schedule_id is not None:
+                record = {key: item.get(key) for key in ('coverage_policy_version','coverage_from','coverage_to','previous_schedule_date','previous_reading','baseline_required')}
+                coverage_records.setdefault(int(consumer_id), {})[str(schedule_id)] = record
         sql = """
         INSERT INTO handheld_consumers_cache (
             id, meter_no, acct_no, name, address, zone_name, classification_id, classification_name,
@@ -1394,6 +1404,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                         ),
                     )
             conn.commit()
+
+        for consumer_id, records in coverage_records.items():
+            old = self.load_cached_consumer_context(consumer_id).get('reading_coverage_by_schedule') or {}
+            self.cache_consumer_context(consumer_id, {'reading_coverage_by_schedule': {**old, **records}})
 
     def load_cached_consumers(self, zone_name: str | None = None) -> list[dict]:
         base = """

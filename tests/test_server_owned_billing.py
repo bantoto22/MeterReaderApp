@@ -58,6 +58,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
         local_bill = {
             "sync_id": "bill-8", "consumer_id": 8, "schedule_id": 549,
             "bill_date": "2026-09-25 00:00:00", "due_date": "2026-10-12 00:00:00",
+            "date_covered_from": "2026-08-25 00:00:00", "date_covered_to": "2026-09-25 00:00:00",
             "billing_reference": "SLR2026000125", "water_charge": 100,
             "amount_due": 150, "total_after_due_date": 165,
             "previous_balance": 50, "previous_penalty": 0,
@@ -75,6 +76,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
             reopened.cache_consumer_context(8, {"bill": {
                 "sync_id": "bill-8", "bill_date": "2026-09-25",
                 "billing_reference": "SLR2026000125", "due_date": "2026-10-12",
+                "date_covered_from": "2026-08-25", "date_covered_to": "2026-09-25",
                 "amount_due": 0, "total_after_due_date": 0, "status": "Unpaid",
             }})
             saved = reopened.load_cached_consumer_context(8)
@@ -641,6 +643,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
             "minimum_rate": 100, "excess_rate_per_cubic": 15,
             "late_fee": 25, "bill": {
                 "billing_reference": reference, "due_date": "2026-10-12",
+                "date_covered_from": "2026-08-15", "date_covered_to": "2026-09-15",
                 "penalty_rate": 7.5, "amount_due": 220, "water_charge": 200,
                 "previous_balance": 120, "previous_penalty": 13.25,
                 "penalty": 15, "total_after_due_date": 235,
@@ -692,6 +695,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
                     "sync_id": "bill-8", "schedule_id": 549,
                     "billing_reference": "SLR2026000125",
                     "bill_date": "2026-09-25", "due_date": "2026-10-12",
+                    "date_covered_from": "2026-08-25", "date_covered_to": "2026-09-25",
                     "water_charge": 100, "amount_due": 150,
                     "total_after_due_date": 165,
                 },

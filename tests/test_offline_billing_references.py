@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.handheld_sync import BackendApiClient, HandheldSyncDataAccess, SQLiteLocalSyncStore, SyncConfig
-from src.qt_hybrid_app import AppBridge, _receipt_billing_reference
+from src.qt_hybrid_app import AppBridge, _cached_bill_for_reading, _receipt_billing_reference
 from src.receipt import send_to_system_printer
 
 
@@ -20,6 +20,7 @@ class ReservationBackend(BackendApiClient):
         self.saved = []
         self.lose_response = False
         self.wrong_response_reference = False
+        self.response_bill_overrides = {}
 
     def is_online(self):
         return self.online
@@ -52,8 +53,10 @@ class ReservationBackend(BackendApiClient):
             raise ValueError("The uploaded bill changed its reserved reference or date")
         self.saved.append({**payload["reading"], **bill, "bill_sync_id": bill["sync_id"]})
         response_bill = {**reserved, "sync_id": bill["sync_id"],
+                         "date_covered_from": bill["date_covered_from"], "date_covered_to": bill["date_covered_to"],
                          "consumer_id": payload["reading"]["consumer_id"], "due_date": "2027-01-15",
                          "amount_due": 100, "total_after_due_date": 110, "water_charge": 100}
+        response_bill.update(self.response_bill_overrides)
         if self.wrong_response_reference:
             response_bill["billing_reference"] = "SLR2027999999"
         return 200, {"bill": response_bill}
@@ -81,6 +84,8 @@ class OfflineBillingReferenceTests(unittest.TestCase):
             "schedule_due_date": "2027-01-02", "billing_cycle": "January 2027",
             "minimum_cubic": 10, "minimum_rate": 100, "excess_rate_per_cubic": 15,
             "previous_reading": 5, "previous_reading_date": "2026-12-01",
+            "coverage_policy_version": 1, "coverage_from": "2026-12-01",
+            "coverage_to": "2026-12-31", "baseline_required": False,
         }
         self.dal.local.cache_consumers([self.consumer])
 
@@ -89,7 +94,7 @@ class OfflineBillingReferenceTests(unittest.TestCase):
         store._db_path = self.path
         return HandheldSyncDataAccess(store, self.remote)
 
-    def bridge(self):
+    def bridge(self, *, immediate_sync=False):
         bridge = SimpleNamespace(
             _consumer=dict(self.consumer), _present_reading="7", _selected_exception="None",
             _reader_name="Test Reader", selectedBillingDate="2026-12-31", _selected_zone="Zone 1",
@@ -107,11 +112,14 @@ class OfflineBillingReferenceTests(unittest.TestCase):
         bridge._default_due_date_for_consumer = lambda consumer, day: "2027-01-15"
 
         def save(consumer_id, present, consumption, exception, flagged, reading_date, due_date, **kwargs):
-            return self.dal.queueMeterReading({
+            save_reading = self.dal.saveMeterReading if immediate_sync else self.dal.queueMeterReading
+            return save_reading({
                 "consumer_id": consumer_id, "present_reading": present, "consumption": consumption,
                 "reading_id": kwargs["sync_reading_id"], "reading_date": reading_date,
                 "bill_sync_id": kwargs["bill_sync_id"], "bill_date": kwargs["bill_date"],
                 "billing_reference": kwargs["billing_reference"], "schedule_id": kwargs["schedule_id"],
+                "schedule_date": kwargs["schedule_date"], "previous_reading": 5,
+                **kwargs["coverage_snapshot"],
             })
 
         bridge._save_to_sync_layer = save
@@ -218,6 +226,182 @@ class OfflineBillingReferenceTests(unittest.TestCase):
         sync = self.dal.syncPendingReadings()
         self.assertEqual((sync["synced"], sync["failed"]), (0, 1))
         self.assertEqual(len(self.dal.listPendingSyncReadings()), 1)
+
+    def test_schedule_coverage_survives_sqlite_restart_for_each_assignment(self):
+        second = {**self.consumer, 'schedule_id': 402, 'schedule_date': '2027-01-31',
+                  'coverage_to': '2027-01-31'}
+        self.dal.local.cache_consumers([self.consumer, second])
+        self.dal = self.reopen()
+        cached = self.dal.getCachedConsumerContext(8)['reading_coverage_by_schedule']
+        self.assertEqual(cached['401']['coverage_to'], '2026-12-31')
+        self.assertEqual(cached['402']['coverage_to'], '2027-01-31')
+        self.assertEqual(cached['401']['previous_reading'], 5)
+
+    def test_missing_coverage_retains_reading_without_printing(self):
+        self.prepare()
+        self.remote.online = False
+        bridge = self.bridge()
+        bridge._consumer.update(coverage_from=None, previous_schedule_date=None,
+                                coverage_to=None, previous_reading=None, baseline_required=True)
+        job = self.build_job(bridge)
+        self.assertNotIn('Coverage', job['receipt_text'])
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result['pending_review'])
+        self.assertEqual(result['review_reason'], 'coverage')
+        history.assert_not_called()
+        printer.assert_not_called()
+        self.assertEqual(len(self.reopen().listPendingSyncReadings()), 1)
+        bridge._refresh_local_assignment_views = Mock()
+        bridge.alertRequested = SimpleNamespace(emit=Mock())
+        for name in ('previousReadingChanged', 'presentReadingChanged', 'consumptionChanged', 'validationMessageChanged'):
+            setattr(bridge, name, SimpleNamespace(emit=Mock()))
+        AppBridge._finish_print_execution(bridge, result)
+        message = bridge.alertRequested.emit.call_args.args[1]
+        self.assertIn('Bills Registry', message)
+        self.assertNotIn('cancelled', message)
+
+    def assert_server_coverage_held_for_review(self, coverage):
+        self.remote.response_bill_overrides = coverage
+        bridge = self.bridge(immediate_sync=True)
+        job = self.build_job(bridge)
+        self.assertIsNotNone(job['local_bill']['date_covered_from'])
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result.get('pending_review'), result)
+        self.assertEqual(result['review_reason'], 'coverage')
+        history.assert_not_called()
+        printer.assert_not_called()
+        saved_bill = self.reopen().local.get_latest_confirmed_bill(8)
+        self.assertEqual(saved_bill['billing_reference'], job['billing_reference'])
+        self.assertEqual(saved_bill['sync_id'], job['bill_sync_id'])
+
+    def test_missing_server_coverage_cannot_borrow_valid_local_coverage(self):
+        self.assert_server_coverage_held_for_review({
+            'date_covered_from': None, 'date_covered_to': None,
+        })
+
+    def test_reversed_server_coverage_does_not_print(self):
+        self.assert_server_coverage_held_for_review({
+            'date_covered_from': '2027-02-01', 'date_covered_to': '2026-12-31',
+        })
+
+    def test_malformed_server_coverage_does_not_print(self):
+        self.assert_server_coverage_held_for_review({
+            'date_covered_from': 'not-a-date', 'date_covered_to': '2026-12-31',
+        })
+
+    def test_impossible_server_coverage_date_does_not_print(self):
+        self.assert_server_coverage_held_for_review({
+            'date_covered_from': '2026-02-30', 'date_covered_to': '2026-12-31',
+        })
+
+    def test_invalid_local_coverage_cannot_borrow_valid_server_coverage(self):
+        self.remote.response_bill_overrides = {
+            'amount_due': 0, 'total_after_due_date': 0, 'water_charge': 0,
+        }
+        bridge = self.bridge(immediate_sync=True)
+        job = self.build_job(bridge)
+        job['local_bill']['date_covered_from'] = None
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result.get('pending_review'), result)
+        self.assertEqual(result['review_reason'], 'coverage')
+        history.assert_not_called()
+        printer.assert_not_called()
+
+    def test_valid_server_coverage_prints_even_when_local_coverage_is_missing(self):
+        bridge = self.bridge(immediate_sync=True)
+        job = self.build_job(bridge)
+        job['local_bill']['date_covered_from'] = None
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result['printed'])
+        history.assert_called_once()
+        printer.assert_called_once()
+        self.assertIn('Coverage       : 2026-12-01 to\n                  2026-12-31', result['receipt_text'])
+        self.assertEqual(_receipt_billing_reference(result['receipt_text']), job['billing_reference'])
+
+    def test_valid_same_day_coverage_is_still_printable(self):
+        self.remote.response_bill_overrides = {
+            'date_covered_from': '2026-12-31', 'date_covered_to': '2026-12-31',
+        }
+        bridge = self.bridge(immediate_sync=True)
+        job = self.build_job(bridge)
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result['printed'])
+        printer.assert_called_once()
+        self.assertEqual(_receipt_billing_reference(result['receipt_text']), job['billing_reference'])
+
+    def test_corrected_coverage_can_reprint_after_restart_with_original_reference(self):
+        self.remote.response_bill_overrides = {
+            'date_covered_from': None, 'date_covered_to': None,
+        }
+        bridge = self.bridge(immediate_sync=True)
+        job = self.build_job(bridge)
+        result, history, printer = self.execute(bridge, job)
+        self.assertTrue(result.get('pending_review'), result)
+        printer.assert_not_called()
+        saved_bill = self.dal.local.get_latest_confirmed_bill(8)
+        # Simulate the next context download after the bill is corrected.
+        self.dal.local.cache_consumer_context(8, {'bill': {
+            **saved_bill, 'date_covered_from': '2026-12-01', 'date_covered_to': '2026-12-31',
+        }})
+        self.dal = self.reopen()
+        self.assert_offline_reprint_reference(job['billing_reference'])
+
+    def test_cached_reprint_checks_the_selected_bills_coverage(self):
+        local_bill = {
+            'billing_reference': 'SLR2027000001', 'bill_date': '2027-01-01',
+            'schedule_id': 401, 'due_date': '2027-01-15', 'amount_due': 100,
+            'total_after_due_date': 110, 'water_charge': 100,
+            'date_covered_from': '2026-12-01', 'date_covered_to': '2026-12-31',
+        }
+        reading = {'reading_date': '2027-01-01', 'schedule_id': 401}
+        for start, end in ((None, None), ('not-a-date', '2026-12-31'),
+                           ('2027-02-01', '2026-12-31')):
+            with self.subTest(start=start, end=end):
+                server_bill = {**local_bill, 'date_covered_from': start, 'date_covered_to': end}
+                self.assertIsNone(_cached_bill_for_reading({
+                    'bill': server_bill, 'local_bill': local_bill,
+                }, reading))
+        # A later corrected response can be printed using the same reference.
+        self.assertEqual(_cached_bill_for_reading({'bill': local_bill}, reading), local_bill)
+
+    def test_receipt_refresh_keeps_original_when_server_coverage_is_invalid(self):
+        original = ('Billing Ref    : SLR2027000001\nTOTAL DUE      : PHP   100.00\n'
+                    'Coverage       : 2026-12-01 to\n                  2026-12-31')
+        for start, end in ((None, None), ('not-a-date', '2026-12-31'),
+                           ('2027-02-01', '2026-12-31')):
+            with self.subTest(start=start, end=end):
+                context = {
+                    'billing_reference': 'SLR2027000001',
+                    'bill': {
+                        'billing_reference': 'SLR2027000001', 'amount_due': 100,
+                        'total_after_due_date': 110, 'due_date': '2027-01-15',
+                        'date_covered_from': start, 'date_covered_to': end,
+                    },
+                }
+                bridge = SimpleNamespace(
+                    _sync_dal=SimpleNamespace(getCachedConsumerContext=lambda _id: context),
+                    _reader_name='Test Reader',
+                )
+                refreshed = AppBridge._refresh_saved_receipt_penalty(bridge, {
+                    'consumer_id': 8, 'receipt_text': original,
+                    'previous_reading': 5, 'present_reading': 7,
+                })
+                self.assertEqual(refreshed, original)
+
+    def test_next_downloaded_cycle_uses_completed_offline_reading(self):
+        bridge = self.bridge()
+        bridge._consumer['local_bill'] = {
+            'date_covered_from': '2026-12-01', 'date_covered_to': '2026-12-15',
+            'meter_no': 'MTR-8', 'current_reading': 6,
+        }
+        job = self.build_job(bridge)
+        self.assertEqual(job['previous'], 6)
+        self.assertEqual(job['consumption'], 1)
+        self.assertEqual(job['local_bill']['date_covered_from'], '2026-12-15 00:00:00')
+        self.assertEqual(job['coverage_snapshot']['previous_reading'], 6)
+        # A replacement meter must never inherit that local observation.
+        bridge._consumer['local_bill']['meter_no'] = 'REPLACED-METER'
+        self.assertEqual(self.build_job(bridge)['previous'], 5)
 
     def test_receipt_refresh_cannot_replace_an_original_reference(self):
         original = "Billing Ref    : SLR2027000001\nTOTAL DUE      : PHP   100.00"

@@ -2238,7 +2238,7 @@ class HandheldSyncTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_receipt_uses_latest_reading_date_for_billing_period_start(self):
+    def test_receipt_uses_saved_coverage_instead_of_latest_capture_date(self):
         text = build_receipt_text(
             {
                 "id": 42,
@@ -2255,6 +2255,8 @@ class HandheldSyncTests(unittest.TestCase):
                 "late_fee": None,
                 "bill_status": "Paid",
                 "latest_reading_date": "2026-07-02",
+                "date_covered_from": "2026-06-15",
+                "date_covered_to": "2026-07-15",
             },
             previous=24,
             present=25,
@@ -2264,7 +2266,7 @@ class HandheldSyncTests(unittest.TestCase):
             as_of_date=date(2026, 7, 6),
         )
 
-        self.assertIn("Coverage       : 2026-07-02 to", text)
+        self.assertIn("Coverage       : 2026-06-15 to\n                  2026-07-15", text)
 
 
 if __name__ == "__main__":
