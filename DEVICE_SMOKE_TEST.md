@@ -1,6 +1,6 @@
 # Device check before the defense
 
-The local Windows test suite passes 236 tests. Raspberry Pi startup, backend
+The local Windows test suite passes 249 tests. Raspberry Pi startup, backend
 connectivity, and physical USB printing still need to be checked on the device.
 Use designated demo consumers and their assigned schedules for these steps.
 
@@ -15,6 +15,10 @@ Use designated demo consumers and their assigned schedules for these steps.
    failures. Check the demo consumers' opening readings and coverage in the main
    system before disconnecting. A successful health check alone does not verify
    an authenticated assignment download.
+   During manual sync, confirm the stage changes through upload, assignments,
+   reference preparation, and offline-record download. Repeat sync with the same
+   assignments on the same day; existing references must remain unchanged.
+   Record downloads that fail must produce **Sync Finished with Problems**.
 3. **Print online.** On the first demo consumer, enter its previous reading plus
    3 (for example, previous `100`, present `103`). Expect `3 m3` consumption.
    Save and print. Check the exact `SLRYYYY######` reference, consumer, meter,

@@ -12,7 +12,7 @@ Offline:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -1845,6 +1845,18 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         return [self._deserialize_row(row) for row in rows]
 
 
+class BackendRequestError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _interrupts_api_batch(exc: Exception) -> bool:
+    return isinstance(exc, PermissionError) or (isinstance(exc, BackendRequestError) and (
+        exc.status in (0, 401, 403, 429) or exc.status >= 500
+    ))
+
+
 class BackendApiClient:
     """HTTPS client for the Node backend exposed through Tailscale Funnel."""
 
@@ -1924,7 +1936,7 @@ class BackendApiClient:
 
     def _request_failure(self, status: int, path: str, data: object, fallback: str) -> RuntimeError:
         status_text = "Connection error" if status == 0 else f"HTTP {status}"
-        return RuntimeError(f"{status_text} {path}: {self._message(data, fallback)}")
+        return BackendRequestError(status, f"{status_text} {path}: {self._message(data, fallback)}")
 
     def _is_missing_record(self, status: int, data: object) -> bool:
         return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
@@ -2089,6 +2101,17 @@ class BackendApiClient:
             raise self._request_failure(http_status, "/api/reading-schedules", data, "Backend reading schedule lookup failed.")
         return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
+    def load_assignment_schedules(self, meter_reader_id, date_from, date_to) -> list[dict]:
+        """Download every status in one request, including cancelled schedules."""
+        status, data = self._req("GET", "/api/reading-schedules", query={
+            "meter_reader_id": meter_reader_id, "date_from": date_from, "date_to": date_to,
+        })
+        if status >= 400 or status == 0:
+            raise self._request_failure(status, "/api/reading-schedules", data, "Backend reading schedule lookup failed.")
+        if not isinstance(data, list):
+            raise RuntimeError("Backend reading schedule lookup did not return a list.")
+        return [row for row in data if isinstance(row, dict)]
+
     def load_assigned_consumers(
         self,
         meter_reader_id: int | str | None = None,
@@ -2195,6 +2218,7 @@ class HandheldSyncDataAccess:
         self.last_pre_reservation_result = {
             "ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": [],
         }
+        self.last_assignment_schedules: list[dict] | None = None
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -2347,7 +2371,7 @@ class HandheldSyncDataAccess:
             "local_bills": [bill],
         })
 
-    def prefetchAssignedConsumerContexts(self, consumers: list[dict]) -> dict:
+    def prefetchAssignedConsumerContexts(self, consumers: list[dict], *, progress=None) -> dict:
         """Cache detailed API records before an assignment is marked offline-ready."""
         result = {"requested": 0, "refreshed": 0, "failed": 0, "skipped": False}
         if not self.is_online():
@@ -2363,8 +2387,22 @@ class HandheldSyncDataAccess:
             if not ids:
                 return result
             result["requested"] = len(ids)
+            stopped = threading.Event()
+
+            def fetch_context(consumer_id):
+                if stopped.is_set():
+                    raise CancelledError()
+                try:
+                    return self.remote.get_consumer_context(consumer_id)
+                except Exception as exc:
+                    # Stop at the transport boundary, before another worker
+                    # can start queued requests during a shared outage.
+                    if _interrupts_api_batch(exc):
+                        stopped.set()
+                    raise
+
             with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(self.remote.get_consumer_context, consumer_id): consumer_id for consumer_id in ids}
+                futures = {pool.submit(fetch_context, consumer_id): consumer_id for consumer_id in ids}
                 for future in as_completed(futures):
                     try:
                         context = future.result()
@@ -2373,9 +2411,17 @@ class HandheldSyncDataAccess:
                             result["refreshed"] += 1
                         else:
                             result["failed"] += 1
+                    except CancelledError:
+                        result["failed"] += 1
                     except Exception as exc:
                         result["failed"] += 1
                         self.local.log_audit(None, "failed", f"Consumer context refresh failed: {exc}")
+                        if _interrupts_api_batch(exc):
+                            result["stopped_early"] = True
+                            for remaining in futures:
+                                remaining.cancel()
+                    if progress:
+                        progress(f"Downloading offline records: {result['refreshed'] + result['failed']}/{len(ids)}")
         finally:
             self._context_prefetch_lock.release()
         self.local.log_audit(
@@ -2420,10 +2466,10 @@ class HandheldSyncDataAccess:
         except Exception as exc:
             self.local.log_audit(None, "failed", f"Could not cache confirmed backend bill: {exc}")
 
-    def preReserveAssignedBills(self, consumers: list[dict], through_date: str | None = None) -> dict:
+    def preReserveAssignedBills(self, consumers: list[dict], through_date: str | None = None, *, check_online: bool = True, progress=None) -> dict:
         """Cache date-bound references for each remaining scheduled reading day."""
         result = {"ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": []}
-        if not self.remote or not self.remote.is_online():
+        if not self.remote or (check_online and not self.remote.is_online()):
             self.last_pre_reservation_result = result
             return result
         today = _manila_current_date()
@@ -2471,6 +2517,7 @@ class HandheldSyncDataAccess:
                         prepared = self.prepareBillingReference(
                             int(consumer_id), bill_date,
                             schedule_id=schedule_id, billing_cycle=billing_cycle,
+                            check_online=False,
                         )
                     if prepared.get("billing_reference"):
                         result["ready"] += 1
@@ -2481,6 +2528,17 @@ class HandheldSyncDataAccess:
                     result["errors"].append(
                         f"Consumer {consumer_id}, schedule {schedule_id}, date {bill_date}: {exc}"
                     )
+                    # Repeating a failed network/session request for every date
+                    # can turn one outage into hours of serial timeouts. Keep
+                    # the stable draft UUID and resume at the next sync.
+                    if _interrupts_api_batch(exc):
+                        result["stopped_early"] = True
+                if progress:
+                    progress(f"Preparing offline references: {result['ready']} ready, {result['failed']} problems")
+                if result.get("stopped_early"):
+                    break
+            if result.get("stopped_early"):
+                break
         self._audit(None, "success" if not result["failed"] else "failed", "Prepared offline billing references", result)
         self.last_pre_reservation_result = result
         return result
@@ -2493,10 +2551,12 @@ class HandheldSyncDataAccess:
         date_to: str | None = None,
         *,
         require_online: bool = False,
+        progress=None,
         **kwargs,
     ) -> list[dict]:
         """Read assignments, requiring a fresh download for explicit sync operations."""
         effective_reader_id = meter_reader_id or kwargs.get("meterReaderId") or kwargs.get("reader_id")
+        self.last_assignment_schedules = None
         effective_zone_name = zone_name or kwargs.get("zoneName")
         if not date_from or not date_to:
             default_from, default_to = _device_schedule_window()
@@ -2507,23 +2567,29 @@ class HandheldSyncDataAccess:
             try:
                 schedules: list[dict] = []
                 if effective_reader_id not in (None, ""):
-                    for schedule_status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
-                        try:
-                            schedules.extend(
-                                self.remote.load_reading_schedules(
-                                    effective_reader_id,
-                                    date_from,
-                                    date_to,
-                                    schedule_status,
+                    if progress:
+                        progress("Downloading assigned schedules...")
+                    load_all = getattr(self.remote, "load_assignment_schedules", None)
+                    if callable(load_all):
+                        schedules = load_all(effective_reader_id, date_from, date_to)
+                    else:
+                        # Compatibility with older client adapters.
+                        for schedule_status in ("Scheduled", "In Progress", "Overdue", "Completed", "Cancelled"):
+                            try:
+                                schedules.extend(
+                                    self.remote.load_reading_schedules(
+                                        effective_reader_id, date_from, date_to, schedule_status,
+                                    )
                                 )
-                            )
-                        except Exception:
-                            # Some backend versions do not accept Completed as a filter.
-                            if schedule_status != "Completed":
-                                raise
+                            except Exception:
+                                if schedule_status != "Completed":
+                                    raise
                     self.local.cache_reading_schedules(schedules, effective_reader_id, date_from, date_to)
                     self.reconcileScheduleReadings(schedules)
+                self.last_assignment_schedules = list(schedules)
 
+                if progress:
+                    progress("Downloading assigned consumers...")
                 consumers = self.remote.load_assigned_consumers(
                     effective_reader_id,
                     effective_zone_name,
@@ -2532,7 +2598,9 @@ class HandheldSyncDataAccess:
                 )
                 if consumers:
                     self.local.cache_consumers(consumers)
-                    reservation_result = self.preReserveAssignedBills(consumers, through_date=date_to)
+                    reservation_result = self.preReserveAssignedBills(
+                        consumers, through_date=date_to, check_online=False, progress=progress,
+                    )
                     self.local.log_audit(
                         None,
                         "success",
@@ -2613,6 +2681,7 @@ class HandheldSyncDataAccess:
         late_fee: float | int | str | None = None,
         allow_unreserved_offline: bool = False,
         existing_bill_sync_id: str | None = None,
+        check_online: bool = True,
     ) -> dict:
         with self.operation_lock:
             self._reject_duplicate_monthly_bill(consumer_id, bill_date, existing_bill_sync_id)
@@ -2632,7 +2701,7 @@ class HandheldSyncDataAccess:
                 )
                 return draft
             try:
-                if not self.remote or not self.remote.is_online():
+                if not self.remote or (check_online and not self.remote.is_online()):
                     if allow_unreserved_offline:
                         return draft
                     raise RuntimeError(

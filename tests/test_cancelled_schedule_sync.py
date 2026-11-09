@@ -109,9 +109,12 @@ class CancelledScheduleSyncTests(unittest.TestCase):
         self.assertEqual(len(self.dal.listReviewReadings()), 1)
         self.assert_saved_reading_unchanged()
 
-    def test_ui_schedule_refresh_also_downloads_cancellation(self):
+    def test_ui_schedule_refresh_reuses_downloaded_cancellation(self):
+        self.dal.loadAssignedConsumers(2, None, "2026-08-01", "2026-10-31", require_online=True)
+        requested_statuses = list(self.remote.filters)
         bridge = SimpleNamespace(_sync_dal=self.dal, _meter_reader_account_id=2)
         self.assertEqual(AppBridge._mirror_assigned_schedules(bridge, "2026-08-01", "2026-10-31"), 1)
+        self.assertEqual(self.remote.filters, requested_statuses)
         self.assertEqual(database.get_assigned_routes(2), [])
         self.assert_saved_reading_unchanged()
 

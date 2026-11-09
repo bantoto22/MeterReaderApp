@@ -129,6 +129,26 @@ The device does not store third-party cloud keys or PostgreSQL credentials.
 
 ### Offline Operation
 
+Sync downloads all schedule statuses in one request and reuses that response
+when updating the device's route list. During reference preparation, successful
+API responses replace repeated health prechecks; every reservation still uses
+authenticated HTTPS and validates the exact backend-issued reference. Cached
+references are reused on later syncs. A transport, session, rate-limit, or server
+failure stops the remaining batch for retry with the same saved UUIDs.
+Offline-record downloads use at most four workers and stop queued requests
+after a shared connection/session failure. The sync result reports incomplete
+record downloads instead of announcing complete offline readiness.
+
+Manual sync displays its current stage and reference/record progress. A manual
+and automatic route download cannot queue duplicate downloads behind each
+other. The first sync can still take longer because references must be prepared
+for every remaining scheduled reading day; later syncs retain those references.
+
+An isolated comparison with three consumers and three scheduled dates reduced
+the first sync from 36 API requests to 16, and a repeat sync from 18 to 7. Both
+versions prepared/reused the same nine date-bound references. These are simulated
+request counts, not measurements of Raspberry Pi sync duration.
+
 - Each meter reader must sign in online at least once so the device can cache a salted password hash and assigned route data.
 - While offline, the reader can sign in, browse cached schedules and consumers, and record readings locally.
   Route sync reserves backend-issued billing references for every remaining reading day from each schedule's
