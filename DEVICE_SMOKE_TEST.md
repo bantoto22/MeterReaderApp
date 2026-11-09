@@ -1,13 +1,15 @@
 # Device check before the defense
 
-The local Windows test suite passes 218 tests. Raspberry Pi startup, backend
+The local Windows test suite passes 236 tests. Raspberry Pi startup, backend
 connectivity, and physical USB printing still need to be checked on the device.
 Use designated demo consumers and their assigned schedules for these steps.
 
 1. **Deploy and start.** Close the Pi app and back up its `data` directory. Copy
    the updated `src` and `assets/qml` directories together, preserving the Pi's
    `.env` and existing `data`. Restart using the usual launcher. Confirm login
-   and route screens open without errors.
+   appears before storage preparation finishes. The button should show
+   **Preparing device...**, then **Log In**. A storage error should remain
+   visible with **Retry setup**. Confirm the reading screen opens after login.
 2. **Prepare online.** Sign in online and tap **Sync Now**. Confirm the assignment
    download succeeded with fresh backend data and reference preparation has no
    failures. Check the demo consumers' opening readings and coverage in the main

@@ -564,16 +564,22 @@ class LoginBridge(QObject):
     loginSuccess = Signal(dict)
     loginFailed = Signal()
     loginBusyChanged = Signal()
+    loginStatusChanged = Signal()
     loginAttemptFinished = Signal(bool, object, str)
+    databasePreparationFinished = Signal(bool, str)
     errorMessageChanged = Signal()
     clearInputsRequested = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, *, database_ready: bool = False) -> None:
         super().__init__()
         self._error_message = ""
-        self._login_busy = False
+        self._database_ready = database_ready
+        self._database_preparing = False
+        self._login_busy = not database_ready
+        self._login_status = "Log In" if database_ready else "Preparing device..."
         self._sync_dal = None
         self.loginAttemptFinished.connect(self._finish_login_attempt)
+        self.databasePreparationFinished.connect(self._finish_database_preparation)
 
     @Property(str, notify=errorMessageChanged)
     def errorMessage(self) -> str:
@@ -583,11 +589,56 @@ class LoginBridge(QObject):
     def loginBusy(self) -> bool:
         return self._login_busy
 
+    @Property(str, notify=loginStatusChanged)
+    def loginStatus(self) -> str:
+        return self._login_status
+
+    def prepare_database(self) -> None:
+        if self._database_ready or self._database_preparing:
+            return
+        self._database_preparing = True
+        self._login_busy = True
+        self._login_status = "Preparing device..."
+        self._error_message = ""
+        self.loginBusyChanged.emit()
+        self.loginStatusChanged.emit()
+        self.errorMessageChanged.emit()
+
+        def _task() -> None:
+            try:
+                init_db()
+            except Exception as exc:
+                self.databasePreparationFinished.emit(False, str(exc))
+                return
+            self.databasePreparationFinished.emit(True, "")
+
+        threading.Thread(target=_task, daemon=True, name="device-database-prepare").start()
+
+    @Slot(bool, str)
+    def _finish_database_preparation(self, success: bool, message: str) -> None:
+        self._database_preparing = False
+        self._database_ready = success
+        self._login_busy = False
+        self._login_status = "Log In" if success else "Retry setup"
+        self._error_message = "" if success else f"Unable to prepare device storage: {message}"
+        self.loginBusyChanged.emit()
+        self.loginStatusChanged.emit()
+        self.errorMessageChanged.emit()
+
+    def set_workspace_loading(self, loading: bool) -> None:
+        self._login_busy = loading
+        self._login_status = "Opening routes..." if loading else "Log In"
+        self.loginBusyChanged.emit()
+        self.loginStatusChanged.emit()
+
     @Slot(str, str)
     def attemptLogin(self, username, password):
         username = username.strip()
         password = password.strip()
         if self._login_busy:
+            return
+        if not self._database_ready:
+            self.prepare_database()
             return
         if not username or not password:
             self._error_message = "Please enter username and password"
@@ -596,8 +647,10 @@ class LoginBridge(QObject):
             return
 
         self._login_busy = True
+        self._login_status = "Logging in..."
         self._error_message = ""
         self.loginBusyChanged.emit()
+        self.loginStatusChanged.emit()
         self.errorMessageChanged.emit()
 
         def _task() -> None:
@@ -636,7 +689,9 @@ class LoginBridge(QObject):
     @Slot(bool, object, str)
     def _finish_login_attempt(self, success: bool, user: object, message: str) -> None:
         self._login_busy = False
+        self._login_status = "Log In"
         self.loginBusyChanged.emit()
+        self.loginStatusChanged.emit()
         if success and isinstance(user, dict):
             self._error_message = ""
             self.errorMessageChanged.emit()
@@ -3870,24 +3925,40 @@ class HybridMainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
+        self._init_login_page()
 
+    def _init_login_page(self) -> None:
         self.login_page = LoginPage()
-        self.main_page = MainContainerPage()
-
+        self.main_page = None
         self.stack.addWidget(self.login_page)
-        self.stack.addWidget(self.main_page)
-
         self.login_page.bridge.loginSuccess.connect(self._on_login_success)
-        self.main_page.bridge.logoutRequested.connect(self._on_logout_requested)
-        self.main_page.bridge.sessionExpired.connect(self._on_session_expired)
+        # Let Qt display the login page before database repairs and migrations.
+        QTimer.singleShot(0, self.login_page.bridge.prepare_database)
 
     def _on_login_success(self, user: dict) -> None:
-        self.stack.setCurrentWidget(self.main_page)
+        self.login_page.bridge.set_workspace_loading(True)
         QTimer.singleShot(0, lambda: self._complete_login_success(user))
 
     def _complete_login_success(self, user: dict) -> None:
-        self.main_page.bridge.set_user(user, self.login_page.bridge._sync_dal)
-        self.main_page.bridge.showWelcomeToast()
+        try:
+            if self.main_page is None:
+                page = MainContainerPage()
+                self.stack.addWidget(page)
+                page.bridge.logoutRequested.connect(self._on_logout_requested)
+                page.bridge.sessionExpired.connect(self._on_session_expired)
+                self.main_page = page
+            self.main_page.bridge.set_user(user, self.login_page.bridge._sync_dal)
+            self.stack.setCurrentWidget(self.main_page)
+            self.main_page.bridge.showWelcomeToast()
+        except Exception as exc:
+            self.stack.setCurrentWidget(self.login_page)
+            self.login_page.bridge._finish_login_attempt(False, None, f"Unable to open reading screen: {exc}")
+        finally:
+            self.login_page.bridge.set_workspace_loading(False)
+
+    def stop_background_work(self) -> None:
+        if self.main_page is not None:
+            self.main_page.bridge.stop_heartbeat()
 
     def _on_logout_requested(self) -> None:
         self.main_page.bridge.clear_user()
@@ -3905,12 +3976,11 @@ def run_qt_hybrid() -> int:
     if SyncConfig is None:
         raise RuntimeError("Sync module is unavailable.")
     SyncConfig.from_env(fail_fast=True)
-    init_db()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setFont(QFont("Montserrat", 10))
     app.setStyle("Fusion")
     win = HybridMainWindow()
-    app.aboutToQuit.connect(win.main_page.bridge.stop_heartbeat)
+    app.aboutToQuit.connect(win.stop_background_work)
     win.show()
     # Include the title bar and window borders when fitting the touchscreen.
     def fit_window_to_screen():

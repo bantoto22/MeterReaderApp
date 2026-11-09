@@ -222,7 +222,7 @@ Rectangle {
                             }
 
                             contentItem: Text {
-                                text: (typeof loginBridge !== "undefined" && loginBridge && loginBridge.loginBusy) ? "Logging in..." : "Log In"
+                                text: (typeof loginBridge !== "undefined" && loginBridge) ? loginBridge.loginStatus : "Log In"
                                 color: "white"
                                 font.pixelSize: TouchMetrics.buttonText
                                 font.family: "Montserrat"

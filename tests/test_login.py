@@ -23,7 +23,7 @@ class LoginTests(unittest.TestCase):
         }
         database.cache_meter_reader_credentials(self.user, "cached-secret")
         self.client = BackendApiClient(SyncConfig(backend_api_base_url="https://example.test/api"))
-        self.bridge = LoginBridge()
+        self.bridge = LoginBridge(database_ready=True)
         self.bridge._sync_dal = SimpleNamespace(authenticateMeterReader=self.client.authenticate_meter_reader)
         self.successes = []
         self.failures = []

@@ -92,6 +92,15 @@ def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: dict
 def init_db():
     """Create the tables if they don't exist and seed only local user accounts."""
     conn = get_connection()
+    try:
+        _initialize_database(conn)
+    finally:
+        # A failed background preparation must release its writer lock so the
+        # visible Retry setup action can safely open a fresh connection.
+        conn.close()
+
+
+def _initialize_database(conn):
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     cur = conn.cursor()
@@ -310,6 +319,8 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_schedule_consumer ON readings(schedule_id, consumer_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_reading_date ON readings(reading_date)")
+    # Startup repairs and cached consumer lookups need the latest row per consumer.
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_consumer_latest ON readings(consumer_id, reading_date DESC, id DESC)")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_sync_reading_id ON readings(sync_reading_id) WHERE sync_reading_id IS NOT NULL")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_assignment_deadline ON reading_assignment(schedule_due_date, is_read)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_receipt_prints_printed_at ON receipt_prints(printed_at)")
@@ -426,7 +437,6 @@ def init_db():
     )
 
     conn.commit()
-    conn.close()
 
 
 def seed_default_users():

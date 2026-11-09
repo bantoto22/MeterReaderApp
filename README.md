@@ -21,6 +21,15 @@ Meter_Reader/
 
 ## How to Run
 
+The login screen opens before preparing local storage. While SQLite setup and
+repair runs in the background, the login button shows **Preparing device...**.
+It changes to **Log In** when local storage is ready, or **Retry setup** with an
+error if preparation fails. The reading, route, and settings screens and device
+network checks are initialized after a successful online or cached login.
+The `idx_readings_consumer_latest` index supports startup's latest-reading
+repair using `(consumer_id, reading_date DESC, id DESC)` without changing saved
+readings or receipt references.
+
 ```bash
 python main.py
 ```
