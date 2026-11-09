@@ -309,7 +309,7 @@ class CancelledScheduleSyncTests(unittest.TestCase):
     def test_review_count_is_visible_while_overall_sync_status_stays_online(self):
         self.dal.loadAssignedConsumers(2, None, "2026-08-01", "2026-10-31")
         view = self.snapshot_view()
-        AppBridge._refresh_sync_snapshot(view)
+        AppBridge._refresh_sync_snapshot(view, self.dal.get_sync_snapshot())
         self.assertEqual(view._sync_status, "Online")
         self.assertEqual((view._sync_pending_count, view._sync_review_count), (0, 1))
         self.assertIn("SLR2026000305", view._sync_review_summary)
@@ -323,7 +323,7 @@ class CancelledScheduleSyncTests(unittest.TestCase):
         view._set_operation_busy = Mock()
         view._refresh_local_assignment_views = Mock()
         view._reload_current_consumer_from_db = Mock()
-        view._refresh_sync_snapshot = lambda: AppBridge._refresh_sync_snapshot(view)
+        view._refresh_sync_snapshot = Mock()
         view.alertRequested = SimpleNamespace(emit=Mock())
         AppBridge._finish_sync_task(view, {"kind": "sync", "result": self.dal.syncPendingReadings()})
         title, message = view.alertRequested.emit.call_args.args

@@ -705,7 +705,7 @@ class HandheldSyncTests(unittest.TestCase):
                 super().__init__(SyncConfig(backend_api_base_url="https://device.example.test/api"))
                 self.urls = []
 
-            def _req(self, method, path, *, query=None, payload=None, api_route=True):
+            def _req(self, method, path, *, query=None, payload=None, api_route=True, timeout=None):
                 base_url = self._api_url if api_route else self._root_url
                 normalized_path = path if path.startswith("/") else f"/{path}"
                 if api_route and normalized_path.startswith("/api/"):

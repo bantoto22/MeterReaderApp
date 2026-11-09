@@ -42,6 +42,8 @@ except ImportError:
 sqlite3.register_adapter(Decimal, float)
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
+DEFAULT_API_TIMEOUT_SECONDS = 30
+HEALTH_TIMEOUT_SECONDS = 10
 CONTEXT_HISTORY_KEYS = ("payments", "payment_history", "readings", "reading_history", "local_bills")
 CONTEXT_HISTORY_LIMIT = 15
 CONTEXT_PRIVATE_KEYS = frozenset({
@@ -724,6 +726,7 @@ class SyncConfig:
     sync_enabled: bool = False
     device_id: str = ""
     device_label: str = ""
+    api_timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, fail_fast: bool = False) -> "SyncConfig":
@@ -746,6 +749,12 @@ class SyncConfig:
         device_label = os.getenv("SLR_DEVICE_LABEL", "").strip() or device_id
         if len(device_label) > 200:
             raise RuntimeError("SLR_DEVICE_LABEL must be at most 200 characters.")
+        try:
+            api_timeout = int(os.getenv("BACKEND_API_TIMEOUT_SECONDS", str(DEFAULT_API_TIMEOUT_SECONDS)).strip())
+        except ValueError as exc:
+            raise RuntimeError("BACKEND_API_TIMEOUT_SECONDS must be an integer from 5 to 60.") from exc
+        if not 5 <= api_timeout <= 60:
+            raise RuntimeError("BACKEND_API_TIMEOUT_SECONDS must be an integer from 5 to 60.")
         backend_url = os.getenv("BACKEND_API_BASE_URL", "").rstrip("/")
         try:
             parsed_url = parse.urlsplit(backend_url)
@@ -774,6 +783,7 @@ class SyncConfig:
             sync_enabled=sync_enabled,
             device_id=device_id,
             device_label=device_label,
+            api_timeout_seconds=api_timeout,
         )
 
 
@@ -1851,6 +1861,7 @@ class BackendApiClient:
         self._session_token = ""
         self._device_id = str(cfg.device_id or "").strip()
         self._device_label = str(cfg.device_label or cfg.device_id or "").strip()
+        self._request_timeout = cfg.api_timeout_seconds
         self.last_health_error = ""
 
     def _req(
@@ -1861,8 +1872,9 @@ class BackendApiClient:
         query: dict | None = None,
         payload: dict | list | None = None,
         api_route: bool = True,
-        timeout: float = 5,
+        timeout: float | None = None,
     ) -> tuple[int, object]:
+        request_timeout = self._request_timeout if timeout is None else timeout
         base_url = self._api_url if api_route else self._root_url
         normalized_path = path if path.startswith("/") else f"/{path}"
         if api_route and normalized_path.startswith("/api/"):
@@ -1887,7 +1899,7 @@ class BackendApiClient:
             headers=headers,
         )
         try:
-            with request.urlopen(req, timeout=timeout) as resp:
+            with request.urlopen(req, timeout=request_timeout) as resp:
                 raw = resp.read().decode("utf-8").strip()
                 return resp.getcode(), json.loads(raw) if raw else {}
         except error.HTTPError as exc:
@@ -1897,6 +1909,11 @@ class BackendApiClient:
             except Exception:
                 return exc.code, {"error": raw or str(exc)}
         except Exception as exc:
+            if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+                return 0, {"error": (
+                    f"Request timed out after {request_timeout:g}s waiting for "
+                    f"{method} {parse.urlsplit(url).path}."
+                )}
             return 0, {"error": str(exc)}
 
     @staticmethod
@@ -1913,7 +1930,7 @@ class BackendApiClient:
         return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
 
     def is_online(self) -> bool:
-        status, response = self._req("GET", "/health", api_route=False)
+        status, response = self._req("GET", "/health", api_route=False, timeout=HEALTH_TIMEOUT_SECONDS)
         if 200 <= status < 300:
             self.last_health_error = ""
             return True

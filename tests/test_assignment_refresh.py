@@ -209,14 +209,14 @@ class AssignmentRefreshTests(unittest.TestCase):
         self.remote.consumer_error = "HTTP 401 /api/handheld/consumers: session expired"
         view = self.view()
         AppBridge.syncNow(view)
-        AppBridge._refresh_sync_snapshot(view)
+        AppBridge._refresh_sync_snapshot(view, self.dal.get_sync_snapshot())
         self.assertEqual(view._sync_status, "Sync Failed")
         self.assertIn("cached", view._assignment_download_status.lower())
         self.assertIn("HTTP 401", view._sync_logs)
         self.assertIn("Assignment download:", view._sync_logs)
         self.remote.consumer_error = None
         AppBridge.syncNow(view)
-        AppBridge._refresh_sync_snapshot(view)
+        AppBridge._refresh_sync_snapshot(view, self.dal.get_sync_snapshot())
         self.assertEqual(view._sync_status, "Online")
         self.assertEqual(view._assignment_download_error, "")
         self.assertEqual(view._assignment_download_status, "Fresh backend data")

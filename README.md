@@ -103,6 +103,14 @@ field work or discard readings.
 2. Set `BACKEND_API_BASE_URL=https://aspire.tail3de291.ts.net/api`.
 3. Enable sync by setting `HANDHELD_SYNC_ENABLED=1`.
 
+Data API calls wait up to 30 seconds for network operations by default, instead
+of the previous 5 seconds. Set `BACKEND_API_TIMEOUT_SECONDS` to an integer from
+5 to 60 in the device's `.env` to adjust this limit. Health checks and heartbeats
+use a shorter 10-second limit. These are socket operation timeouts, not a deadline
+for the entire sync, which may download many records. A timeout reports the
+request method, path, and limit; saved readings and billing references stay in
+SQLite for a later sync. Uploads are not automatically repeated inside a request.
+
 If sync is enabled and required env vars are missing, the sync layer raises a clear startup/config error.
 
 ### Local Storage
@@ -139,7 +147,9 @@ upload failure when there are no queued readings.
 
 Settings → Backend Logs also shows the current health-check failure when the
 upload queue is empty. The app rechecks the backend after a Wi-Fi connection,
-including when automatic sync is disabled.
+including when automatic sync is disabled, and once a minute while the app is
+running so recovery does not require disconnecting Wi-Fi. Checks run in the
+background and do not block the device screen while waiting for the network.
 
 If the Pi reaches the hostname but reports `SSL: UNEXPECTED_EOF_WHILE_READING`,
 check the Funnel's public HTTPS path. On the backend host, confirm that

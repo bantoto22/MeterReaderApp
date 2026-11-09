@@ -1095,6 +1095,7 @@ class AppBridge(QObject):
     def _tick_status_clock(self) -> None:
         self._status_time = datetime.now().strftime("%I:%M %p")
         self.statusTimeChanged.emit()
+        self._start_backend_probe()
 
     def _route_schedules(self, zone_name: str | None = None) -> list[dict]:
         route = self._selected_route()
@@ -1762,10 +1763,13 @@ class AppBridge(QObject):
         if not self._sync_dal:
             self._emit_sync_state()
             return
+        if snapshot is None:
+            # Health checks can wait on slow Funnel connections. Keep all
+            # network and queue inspection work off the Qt event thread.
+            self._start_backend_probe()
+            return
         try:
             was_backend_online = self._backend_status == "Online"
-            if snapshot is None:
-                snapshot = self._sync_dal.get_sync_snapshot()
             if snapshot.get("probe_error"):
                 raise RuntimeError(snapshot["probe_error"])
             self._sync_status = str(snapshot.get("status", "Offline"))
@@ -1842,10 +1846,11 @@ class AppBridge(QObject):
         if not self._sync_dal or self._backend_probe_in_flight:
             return
         self._backend_probe_in_flight = True
+        dal = self._sync_dal
 
         def _task() -> None:
             try:
-                snapshot = self._sync_dal.get_sync_snapshot()
+                snapshot = dal.get_sync_snapshot()
             except Exception as exc:
                 snapshot = {"probe_error": str(exc)}
             self.backendProbeFinished.emit(snapshot)
@@ -2235,7 +2240,7 @@ class AppBridge(QObject):
                 pull_line += f"\nAssignment download: {self._assignment_download_status}"
                 if self._assignment_download_summary:
                     pull_line += "\n" + self._assignment_download_summary
-            review_line = f"\nNeeds review: {getattr(self, '_sync_review_count', sync_result.get('needs_review', 0))}"
+            review_line = f"\nNeeds review: {sync_result.get('needs_review', getattr(self, '_sync_review_count', 0))}"
             reference_line = (
                 f"\nOffline references ready: {sync_result.get('offline_references_ready', 0)}"
                 f"\nReference failures: {sync_result.get('offline_reference_failures', 0)}"
