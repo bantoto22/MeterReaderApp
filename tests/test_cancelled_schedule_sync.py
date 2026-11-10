@@ -24,8 +24,8 @@ class AssignmentBackend:
         self.filters.append(status)
         return [{
             "schedule_id": 538, "meter_reader_id": 2, "zone_name": "Zone 1",
-            "start_date": "2026-08-27", "due_date": "2026-09-01",
-            "billing_month": "August 2026", "status": self.status,
+            "start_date": "2026-10-20", "due_date": "2026-10-31",
+            "billing_month": "October 2026", "status": self.status,
         }] if status == self.status else []
 
     def load_assigned_consumers(self, *args):
@@ -64,7 +64,7 @@ class CancelledScheduleSyncTests(unittest.TestCase):
         self.dal = HandheldSyncDataAccess(self.store, self.remote)
         schedule = {
             "schedule_id": 538, "meter_reader_id": 2, "zone_name": "Zone 1",
-            "start_date": "2026-08-27", "due_date": "2026-09-01", "status": "In Progress",
+            "start_date": "2026-10-20", "due_date": "2026-10-31", "status": "In Progress",
         }
         database.replace_reading_schedules_from_sync([schedule], 2, "2026-08-01", "2026-10-31")
         self.store.cache_reading_schedules([schedule], 2, "2026-08-01", "2026-10-31")
@@ -76,7 +76,7 @@ class CancelledScheduleSyncTests(unittest.TestCase):
         self.store.save_reserved_reference(draft["bill_sync_id"], "SLR2026000305")
         self.payload = {
             "consumer_id": 81, "schedule_id": 538, "meter_reader_id": 2,
-            "schedule_date": "2026-08-27", "reading_date": "2026-10-24",
+            "schedule_date": "2026-10-20", "reading_date": "2026-10-24",
             "present_reading": 10, "consumption": 5,
             "reading_id": draft["reading_sync_id"], "bill_sync_id": draft["bill_sync_id"],
             "bill_date": draft["bill_date"], "billing_reference": "SLR2026000305",
@@ -296,7 +296,7 @@ class CancelledScheduleSyncTests(unittest.TestCase):
     def test_review_does_not_resume_for_a_reassigned_reader(self):
         self.dal.loadAssignedConsumers(2, None, "2026-08-01", "2026-10-31")
         changed = {"schedule_id": 538, "meter_reader_id": 3, "zone_name": "Zone 1",
-                   "start_date": "2026-08-27", "due_date": "2026-09-01", "status": "Scheduled"}
+                   "start_date": "2026-10-20", "due_date": "2026-10-31", "status": "Scheduled"}
         self.store.cache_reading_schedules([changed], 3, "2026-08-01", "2026-10-31")
         self.dal.reconcileScheduleReadings([changed])
         self.assertEqual(self.dal.listPendingSyncReadings(), [])

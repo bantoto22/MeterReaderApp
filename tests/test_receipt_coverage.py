@@ -167,7 +167,7 @@ class ReceiptCoverageTests(unittest.TestCase):
             _ensure_current_consumer_receipt_context=lambda **kwargs: None,
             _selected_route=lambda: {"startDate": "2026-09-17", "dueDate": "2026-09-22"},
             _schedule_for_consumer=lambda consumer: {
-                "scheduleId": "538", "startDate": "2026-08-27", "dueDate": "2026-09-01",
+                "scheduleId": "538", "startDate": "2026-08-27", "dueDate": "2026-09-22",
                 "billingMonth": "August 2026",
             },
             _sync_dal=SimpleNamespace(prepareBillingReference=reserve),
@@ -181,7 +181,7 @@ class ReceiptCoverageTests(unittest.TestCase):
             job = AppBridge._build_pending_receipt_job(bridge)
         self.assertEqual(job["schedule_id"], 538)
         self.assertEqual(job["schedule_date"], "2026-08-27")
-        self.assertEqual(job["schedule_due_date"], "2026-09-01")
+        self.assertEqual(job["schedule_due_date"], "2026-09-22")
         self.assertEqual(reservations[0][1], job["reading_date"])
         self.assertEqual(job["bill_date"], job["reading_date"])
         self.assertIsNone(job["due_date"])

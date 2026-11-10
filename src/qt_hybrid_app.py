@@ -306,8 +306,9 @@ def _multi_day_assignment_window(value: datetime.date) -> tuple[str, str]:
 
 
 def _assignment_download_window() -> tuple[str, str]:
-    # Browsing an old route must not move discovery of new assignments into the past.
-    return _multi_day_assignment_window(manila_current_date())
+    today = manila_current_date()
+    _, end = _multi_day_assignment_window(today)
+    return today.isoformat(), end
 
 
 def _mirror_assigned_consumer_rows(sync_dal, consumers: list[dict]) -> tuple[int, dict]:
@@ -386,9 +387,13 @@ def _route_reading_date(
 
 
 def _group_route_rows(routes: list[dict], today: datetime.date | None = None) -> list[dict]:
-    """Group routes and carry expired unread schedules into the current route."""
+    """Show current and upcoming work without expired assignments or carry-over."""
     grouped: dict[tuple[str, str, str, str], dict] = {}
+    reference_text = (today or manila_current_date()).isoformat()
     for row in routes or []:
+        deadline = str(row.get("due_date") or row.get("start_date") or "")[:10]
+        if (deadline and deadline < reference_text) or str(row.get("status") or "").strip().lower() in {"overdue", "cancelled"}:
+            continue
         meter_reader_id = str(row.get("meter_reader_id") or "")
         start_date = str(row.get("start_date") or "")
         due_date = str(row.get("due_date") or start_date)
@@ -446,33 +451,6 @@ def _group_route_rows(routes: list[dict], today: datetime.date | None = None) ->
         )
         result.append(group)
 
-    reference = today or datetime.now().date()
-    reference_text = reference.isoformat()
-    current_groups = [
-        group for group in result
-        if str(group.get("startDate") or reference_text) <= reference_text <= str(group.get("dueDate") or reference_text)
-    ]
-    future_groups = [group for group in result if str(group.get("startDate") or "") > reference_text]
-    target = current_groups[0] if current_groups else (future_groups[0] if future_groups else None)
-    if target:
-        carry_schedules = []
-        for group in result:
-            if group is target or str(group.get("dueDate") or reference_text) >= reference_text:
-                continue
-            if str(group.get("meterReaderId") or "") != str(target.get("meterReaderId") or ""):
-                continue
-            for schedule in group.get("schedules") or []:
-                if int(schedule.get("unreadCount") or 0) > 0:
-                    carry_schedules.append({**schedule, "isCarryOver": True})
-        carry_schedules.sort(key=lambda item: (str(item.get("dueDate") or ""), _natural_display_key(item.get("zoneName"))))
-        if carry_schedules:
-            target["viewSchedules"] = carry_schedules + list(target.get("schedules") or [])
-            target["carryOverUnreadCount"] = sum(int(item.get("unreadCount") or 0) for item in carry_schedules)
-            target["zones"] = ["All zones"] + list(dict.fromkeys(
-                item["zoneName"] for item in target["viewSchedules"] if item.get("zoneName")
-            ))
-            target["offlineReady"] = all(item.get("offlineReady") for item in target["viewSchedules"])
-            target["label"] += f" • {target['carryOverUnreadCount']} overdue"
     return result
 
 
@@ -789,6 +767,7 @@ class AppBridge(QObject):
     printHistoryDetailChanged = Signal()
     printExecutionFinished = Signal(object)
     printPreparationFinished = Signal(object)
+    meterIssueSaveFinished = Signal(object)
     assignedDatasetFinished = Signal(object)
     heartbeatResult = Signal(int, int, object)
     sessionExpired = Signal()
@@ -920,6 +899,7 @@ class AppBridge(QObject):
         self.testPrintFinished.connect(self._finish_test_print)
         self.printExecutionFinished.connect(self._finish_print_execution)
         self.printPreparationFinished.connect(self._finish_print_preparation)
+        self.meterIssueSaveFinished.connect(self._finish_meter_issue_save)
         self.assignedDatasetFinished.connect(self._finish_assigned_consumer_dataset)
         self.heartbeatResult.connect(self._finish_heartbeat)
 
@@ -1841,7 +1821,8 @@ class AppBridge(QObject):
             self._sync_review_count = int(snapshot.get("review_count", 0))
             self._sync_review_summary = "\n".join(
                 f"Consumer {row.get('consumer_id')} · Schedule {row.get('schedule_id')} · "
-                f"{row.get('billing_reference') or 'Reference pending'}"
+                f"{row.get('billing_reference') or 'Reference pending'}\n"
+                f"Reason: {row.get('reason') or 'Check Sync Diagnostics for details.'}"
                 for row in snapshot.get("review_readings", [])
             )
             self._backend_status = "Online" if snapshot.get("backend_online") else "Offline"
@@ -2910,6 +2891,8 @@ class AppBridge(QObject):
         self.printPreviewRequested.emit(title, receipt_text, action_label)
 
     def _build_pending_receipt_job(self) -> dict:
+        if self._selected_exception != 'None':
+            raise RuntimeError('An unreadable meter must be saved as an issue before any billing.')
         self._reload_current_consumer_from_db()
         self._ensure_current_consumer_receipt_context(force_refresh=True)
         present = _to_float(self._present_reading)
@@ -2926,7 +2909,9 @@ class AppBridge(QObject):
         schedule_date = str(schedule.get("startDate") or route.get("startDate") or self.selectedBillingDate)
         schedule_due_date = str(schedule.get("dueDate") or route.get("dueDate") or schedule_date)
         schedule_payment_due_date = self._default_due_date_for_consumer(self._consumer, reading_date)
-        billing_cycle = str(schedule.get("billingMonth") or route.get("billingMonth") or self._consumer.get("billing_month") or "")
+        if not schedule_date <= reading_date <= schedule_due_date:
+            raise RuntimeError("This reading schedule is not active today. Sync and select a current schedule.")
+        billing_cycle = str(schedule.get("billingMonth") or route.get("billingMonth") or schedule_date[:7])
         if not self._sync_dal:
             raise RuntimeError("The local billing-reference store is unavailable.")
         reservation = self._sync_dal.prepareBillingReference(
@@ -2971,7 +2956,7 @@ class AppBridge(QObject):
         consumer_snapshot["schedule_date"] = schedule_date
         consumer_snapshot["schedule_due_date"] = schedule_due_date
         consumer_snapshot["schedule_payment_due_date"] = schedule_payment_due_date
-        flagged = consumption > 500 or exception != "None"
+        flagged = False
         required_tariff = ("minimum_cubic", "minimum_rate", "excess_rate_per_cubic")
         missing_tariff = [key for key in required_tariff if consumer_snapshot.get(key) in (None, "")]
         if missing_tariff:
@@ -3046,7 +3031,50 @@ class AppBridge(QObject):
         }
 
     @Slot()
+    def saveMeterIssue(self) -> None:
+        if self._operation_busy:
+            return
+        if not self._consumer or self._selected_exception == 'None' or not self._sync_dal:
+            self.alertRequested.emit('Meter issue','Select a consumer and the reason the meter cannot be read.')
+            return
+        schedule = self._schedule_for_consumer(self._consumer)
+        today = manila_current_date().isoformat()
+        if not schedule.get('scheduleId') or not str(schedule.get('startDate') or '') <= today <= str(schedule.get('dueDate') or ''):
+            self.alertRequested.emit('Schedule unavailable','Select a current reading assignment before reporting a meter issue.')
+            return
+        payload = {'record_type':'meter_issue','is_flagged':True,'reading_id':str(uuid.uuid4()),
+                   'consumer_id':self._consumer['id'],'meter_no':self._consumer.get('meter_no'),
+                   'meter_reader_id':self._meter_reader_account_id,'exception':self._selected_exception,
+                   'issue_reason':self._selected_exception,'reading_date':today,
+                   'captured_at':datetime.now().astimezone().isoformat(),
+                   'schedule_id':int(schedule['scheduleId']),'schedule_date':schedule.get('startDate'),
+                   'schedule_due_date':schedule.get('dueDate'),'billing_cycle':schedule.get('billingMonth')}
+        self._set_operation_busy(True,'Saving meter issue...')
+        def task():
+            try:
+                result = self._sync_dal.saveMeterReading(payload)
+                self.meterIssueSaveFinished.emit({'success':True,'synced':result.get('status')=='synced'})
+            except Exception as exc:
+                self.meterIssueSaveFinished.emit({'success':False,'error':str(exc)})
+        threading.Thread(target=task,daemon=True).start()
+
+    def _finish_meter_issue_save(self, result: dict) -> None:
+        self._set_operation_busy(False,'')
+        self._refresh_sync_snapshot()
+        if not result.get('success'):
+            self.alertRequested.emit('Meter issue not saved',result.get('error') or 'Try saving the issue again.')
+            return
+        self.update_stats()
+        self._refresh_zone_consumers()
+        self.alertRequested.emit('Meter issue saved',
+            ('The issue was synced to the office. ' if result.get('synced') else 'The issue is saved on this device and waiting to sync. ')
+            + 'Take an actual reading after repair before billing.')
+
+    @Slot()
     def printReceipt(self) -> None:
+        if self._selected_exception != 'None':
+            self.saveMeterIssue()
+            return
         if self._operation_busy:
             return
         if not self._consumer or not self._present_reading:
@@ -3323,7 +3351,9 @@ class AppBridge(QObject):
                     local_bill_cache_error = None
                     reading_id = int(job.get("reading_id") or 0)
                     if not reading_id:
-                        flagged = consumption > 500 or exception != "None"
+                        if exception != 'None':
+                            raise RuntimeError('An unreadable meter cannot create a bill. Save its issue report instead.')
+                        flagged = False
                         reading_id = save_reading(
                             job["consumer_id"], present, consumption, exception, flagged, reading_date,
                             schedule_id=job.get("schedule_id"), schedule_date=job.get("schedule_date"),

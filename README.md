@@ -2,6 +2,12 @@
 
 A handheld device application for field meter reading with receipt printing.
 
+Selecting a meter issue means the meter cannot be read. The action becomes
+**Save Meter Issue** and saves a durable offline report without a meter value,
+bill, or new billing reference. Sync sends the report to the office. Once the
+meter is repaired, select **None**, capture its actual reading, and bill normally.
+High consumption remains a confirmation warning for an actual reading.
+
 ## Folder Structure
 
 ```
@@ -355,10 +361,9 @@ their original IDs. “All zones” is a display filter only: consumer lookup,
 deadline state, offline completion, and reading submission always use the
 `schedule_id` belonging to the consumer's zone.
 
-Expired schedules with unread assignments are also carried into the prioritized
-active route automatically. They remain available under Past schedules, but the
-reader does not need to open that selector to discover or process them. Carry-over
-rows retain their expired schedule dates and original zone `schedule_id`.
+Expired schedules are excluded from device work. Current routes contain only
+their own active assignments; expired unread work is not carried forward.
+The backend assignment billing cycle is retained separately from old bill history.
 Schedule refreshes also download cancelled schedules so an old offline cache cannot keep offering
 them as active or overdue assignments. A reading already saved against a cancelled assignment is
 retained in SQLite as **Needs review**, with its original reading ID, bill ID, and billing reference.
@@ -373,8 +378,7 @@ reader, the original saved reading returns to the upload queue. The device never
 to a different schedule or marks it synced without backend acceptance.
 
 Sync Now and automatic assignment refreshes use today's date in Asia/Manila to
-download the past year and the current and next month of schedules. Viewing an
-older route does not narrow discovery of new assignments. Automatic assignment
+download current and upcoming assignments through the end of next month. Automatic assignment
 refresh runs every five minutes by default (`BACKEND_SYNC_INTERVAL_MS`, minimum
 300000 ms); Sync Now downloads immediately without restarting the app. Download
 failures are reported as pull warnings instead of counting cached records as a

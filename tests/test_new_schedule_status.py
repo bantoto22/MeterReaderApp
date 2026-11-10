@@ -51,7 +51,7 @@ class NewScheduleStatusTests(unittest.TestCase):
         view._selected_route_consumer_rows = lambda: AppBridge._selected_route_consumer_rows(view)
         return view
 
-    def test_new_route_shows_new_unread_and_only_unread_carry_over(self):
+    def test_new_route_shows_only_its_own_unread_assignments(self):
         self._add_schedule(202, self.new_start, self.new_due)
         self._add_consumer(1, 202, False)
         self._add_consumer(2, 202, False)
@@ -60,14 +60,12 @@ class NewScheduleStatusTests(unittest.TestCase):
         current_rows = AppBridge._selected_route_consumer_rows(self._view(current))
         self.assertEqual(
             {(row["schedule_id"], row["id"], row["is_read"]) for row in current_rows},
-            {(101, 3, 0), (202, 1, 0), (202, 2, 0)},
+            {(202, 1, 0), (202, 2, 0)},
         )
         search_rows = AppBridge._search_selected_route(self._view(current), "Consumer 1", 10, False)
         self.assertEqual([(row["schedule_id"], row["id"]) for row in search_rows], [(202, 1)])
 
-        past = next(group for group in grouped if group["startDate"] == self.old_start)
-        past_rows = AppBridge._selected_route_consumer_rows(self._view(past))
-        self.assertEqual({(row["id"], row["is_read"]) for row in past_rows}, {(1, 1), (2, 0), (3, 0)})
+        self.assertFalse(any(group["startDate"] == self.old_start for group in grouped))
         reassigned = AppBridge._search_selected_route(self._view(current), "Consumer 2", 10, False)
         self.assertEqual([(row["schedule_id"], row["id"]) for row in reassigned], [(202, 2)])
 
@@ -98,10 +96,10 @@ class NewScheduleStatusTests(unittest.TestCase):
             {1: "Completed", 2: "Overdue 3d", 3: "Overdue 3d"},
         )
 
-    def test_finishing_overdue_route_offline_refreshes_completed_status(self):
+    def test_expired_route_stays_hidden_while_its_saved_readings_are_retained(self):
         view = self._assignment_view()
         AppBridge._refresh_local_assignment_views(view)
-        self.assertEqual(view._selected_route()["status"], "Overdue")
+        self.assertEqual(view._selected_route(), {})
         selected_id = view._selected_route_id
         view._route_selected_by_user = True
         for consumer_id, sync_status in ((2, "pending"), (3, "failed")):
@@ -114,7 +112,7 @@ class NewScheduleStatusTests(unittest.TestCase):
             self._add_consumer(consumer_id, 101, False)
         AppBridge._refresh_local_assignment_views(view)
         self.assertEqual(view._selected_route_id, selected_id)
-        self.assertEqual(view._selected_route()["status"], "Completed")
+        self.assertEqual(view._selected_route(), {})
         route = database.get_assigned_routes(12)[0]
         self.assertEqual((route["assignment_count"], route["unread_count"]), (3, 0))
         rows = database.get_zone_consumers_with_status("Zone 1", meter_reader_id=12, schedule_id=101)
@@ -123,7 +121,7 @@ class NewScheduleStatusTests(unittest.TestCase):
 
         database.update_reading_sync_state("saved-2", "conflict", "rejected")
         AppBridge._refresh_local_assignment_views(view)
-        self.assertEqual(view._selected_route()["status"], "Overdue")
+        self.assertEqual(view._selected_route(), {})
         self.assertEqual(database.get_assigned_routes(12)[0]["unread_count"], 1)
 
     def test_expired_route_without_cached_assignments_is_not_completed(self):
@@ -132,7 +130,7 @@ class NewScheduleStatusTests(unittest.TestCase):
         self.assertEqual(route["assignment_count"], 0)
         self.assertEqual(route["display_status"], "Overdue")
 
-    def test_refresh_selects_new_route_unless_reader_chose_a_past_route(self):
+    def test_refresh_replaces_a_stale_past_selection_with_current_work(self):
         view = self._assignment_view()
         AppBridge._refresh_local_assignment_views(view)
         old_route_id = view._selected_route_id
@@ -144,7 +142,7 @@ class NewScheduleStatusTests(unittest.TestCase):
         view._selected_route_id = old_route_id
         view._route_selected_by_user = True
         AppBridge._refresh_local_assignment_views(view)
-        self.assertEqual(view._selected_route_id, old_route_id)
+        self.assertNotEqual(view._selected_route_id, old_route_id)
 
 
 if __name__ == "__main__":

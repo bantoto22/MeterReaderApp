@@ -87,6 +87,16 @@ class FakeLocalStore:
     def list_pending(self, target=None):
         return [q for q in self.queue if q["backend_status"] in ("pending", "failed")]
 
+    def list_needs_review(self):
+        return [row for row in self.queue if row["backend_status"] == "needs_review"]
+
+    def mark_needs_review(self, queue_id, reason):
+        for row in self.queue:
+            if row["id"] == queue_id:
+                row["backend_status"] = "needs_review"
+                row["last_error"] = reason
+                self._refresh_status(row)
+
     def mark_target_synced(self, queue_id, target, server_payload=None):
         for q in self.queue:
             if q["id"] == queue_id:
@@ -504,7 +514,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.dal.updateMeterReading(payload)
         self.assertEqual(len(self.remote.remote_rows), 1)
 
-    def test_conflict_marks_row(self):
+    def test_confirmed_duplicate_is_retained_for_review(self):
         self.remote.online = False
         local_ts = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc).isoformat()
         self.dal.saveMeterReading(
@@ -524,8 +534,9 @@ class HandheldSyncTests(unittest.TestCase):
         }
         self.remote.online = True
         result = self.dal.syncPendingReadings()
-        self.assertEqual(result["conflicts"], 1)
-        self.assertEqual(self.local.queue[0]["status"], "conflict")
+        self.assertEqual(result["conflicts"], 0)
+        self.assertEqual(result["needs_review"], 1)
+        self.assertEqual(self.local.queue[0]["status"], "needs_review")
 
     def test_backend_api_login_and_bundle_use_authenticated_reader(self):
         class FakeBackendApiClient(BackendApiClient):
@@ -659,7 +670,7 @@ class HandheldSyncTests(unittest.TestCase):
                 "consumer_id": 8,
                 "schedule_id": 401,
                 "schedule_date": "2026-09-06",
-                "schedule_due_date": "2026-09-22",
+                "schedule_due_date": "2026-09-23",
                 "billing_cycle": "September 2026",
                 "due_days": 15,
                 "late_fee": 10,
@@ -1101,7 +1112,7 @@ class HandheldSyncTests(unittest.TestCase):
                     "billing_month": "September 2026", "zone_name": "Zone 8",
                     "display_status": "Scheduled", "cache_verified_at": None, "cached_consumer_count": 0,
                 },
-            ]
+            ], today=date(2026, 9, 10)
         )
 
         self.assertEqual(len(grouped), 3)
@@ -1112,7 +1123,7 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(_zone_schedule(route, "", "402")["zoneName"], "Zone 2")
         self.assertTrue(route["offlineReady"])
 
-    def test_expired_unread_schedules_are_carried_into_current_route(self):
+    def test_expired_unread_schedules_are_removed_from_device_routes(self):
         from src.qt_hybrid_app import _group_route_rows, _zone_schedule
 
         grouped = _group_route_rows(
@@ -1150,10 +1161,9 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         current = next(group for group in grouped if group["billingMonth"] == "August 2026")
-        self.assertEqual(current["carryOverUnreadCount"], 2)
-        self.assertEqual(current["zones"], ["All zones", "Old Zone", "Current Zone"])
-        self.assertEqual(_zone_schedule(current, "Old Zone")["scheduleId"], "510")
-        self.assertTrue(_zone_schedule(current, "Old Zone")["isCarryOver"])
+        self.assertEqual(current["carryOverUnreadCount"], 0)
+        self.assertEqual(current["zones"], ["All zones", "Current Zone"])
+        self.assertEqual(_zone_schedule(current, "Old Zone"), {})
         self.assertNotIn("Finished Zone", current["zones"])
         self.assertNotIn("Other Reader Zone", current["zones"])
 

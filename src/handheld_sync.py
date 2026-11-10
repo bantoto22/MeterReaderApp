@@ -164,6 +164,13 @@ def _update_local_reading_state(reading_id: str | None, sync_status: str, readin
         return
 
 
+def _is_meter_issue_report(payload: dict) -> bool:
+    reason = str(payload.get("exception") or "").strip().lower()
+    return (payload.get("record_type") == "meter_issue"
+            or payload.get("is_flagged") in (True, 1, "true", "1")
+            or reason not in {"", "none"})
+
+
 def _apply_server_reading_state(reading: dict, response: dict) -> dict:
     """Reconcile statuses while retaining the device's stable reading and bill IDs."""
     confirmed = dict(reading)
@@ -172,7 +179,7 @@ def _apply_server_reading_state(reading: dict, response: dict) -> dict:
     confirmed["reading_sync_status"] = str(
         server.get("sync_status") or server.get("reading_sync_status") or "synced"
     ).strip().lower()
-    status = str(server.get("reading_status") or "").strip()
+    status = "Flagged" if isinstance(response, dict) and response.get("meter_issue_report") else str(server.get("reading_status") or "").strip()
     if status:
         confirmed["reading_status"] = status
     _update_local_reading_state(
@@ -336,7 +343,9 @@ def _flatten_backend_bill_context(payload: dict) -> dict:
         )
     bill = context.get("bill") or context.get("Bill")
     if isinstance(bill, dict):
+        assignment = {key: context[key] for key in ("schedule_id", "schedule_date", "schedule_due_date", "billing_cycle", "reading_route_id") if key in context}
         context.update(bill)
+        context.update(assignment)
         context["bill"] = dict(bill)
     policy = context.get("billing_policy")
     if isinstance(policy, dict):
@@ -827,6 +836,9 @@ class LocalSyncStore:
     def list_needs_review(self) -> list[dict]:
         return []
 
+    def mark_needs_review(self, queue_id: int, reason: str) -> None:
+        raise NotImplementedError
+
     def reconcile_cancelled_readings(self, resumable_schedule_ids: set[int] | None = None) -> dict:
         return {"held": 0, "resumed": 0}
 
@@ -1259,7 +1271,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 ).split("T", 1)[0].split(" ", 1)[0]
                 payment_due_date = _parse_date(item.get("payment_due_date") or item.get("Payment_Due_Date"))
                 schedule_date = start_date
-                billing_month = str(item.get("Billing_Month", item.get("billing_month")) or "").strip() or None
+                billing_month = str(item.get("Billing_Cycle") or item.get("billing_cycle") or item.get("Billing_Month") or item.get("billing_month") or schedule_date[:7]).strip() or None
                 zone_name = str(item.get("Zone_Name", item.get("zone_name")) or "").strip()
                 if not schedule_id or not schedule_date or not zone_name:
                     continue
@@ -1509,14 +1521,24 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                      AND backend_status != 'conflict'""",
                 (int(consumer_id), month),
             ).fetchall()
+        issue_bill_ids = set()
+        for row in queued:
+            try:
+                candidate = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if _is_meter_issue_report(candidate):
+                issue_bill_ids.add(str(candidate.get("bill_sync_id") or ""))
         for row in reservations:
-            if str(row["bill_sync_id"]) != excluded:
+            if str(row["bill_sync_id"]) != excluded and str(row["bill_sync_id"]) not in issue_bill_ids:
                 return dict(row)
         for row in queued:
             try:
                 payload = json.loads(row["payload"])
             except (TypeError, ValueError):
                 payload = {}
+            if _is_meter_issue_report(payload):
+                continue
             sync_id = str(payload.get("bill_sync_id") or payload.get("reading_id") or "")
             if sync_id != excluded:
                 return {"bill_sync_id": sync_id, "bill_date": row["reading_date"]}
@@ -1528,7 +1550,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             if str(bill.get("status") or "").lower() in {"cancelled", "canceled"}:
                 continue
             sync_id = str(bill.get("sync_id") or "")
-            if str(bill.get("bill_date") or "")[:7] == month and sync_id != excluded:
+            if str(bill.get("bill_date") or "")[:7] == month and sync_id != excluded and sync_id not in issue_bill_ids:
                 return bill
         return {}
 
@@ -1558,6 +1580,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 FROM local_billing_reference_reservations
                 WHERE consumer_id = ? AND schedule_id = ? AND bill_date = ?
                   AND status IN ('Pending', 'Reserved')
+                  AND NOT EXISTS (SELECT 1 FROM sync_queue_meter_readings q
+                    WHERE q.reading_id=local_billing_reference_reservations.reading_sync_id
+                    AND (json_extract(q.payload,'$.is_flagged')=1 OR json_extract(q.payload,'$.record_type')='meter_issue'))
                 ORDER BY created_at DESC
                 LIMIT 1
                 """
@@ -1569,6 +1594,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                        billing_reference, status, bill_id
                 FROM local_billing_reference_reservations
                 WHERE consumer_id = ? AND bill_date = ? AND status IN ('Pending', 'Reserved')
+                  AND NOT EXISTS (SELECT 1 FROM sync_queue_meter_readings q
+                    WHERE q.reading_id=local_billing_reference_reservations.reading_sync_id
+                    AND (json_extract(q.payload,'$.is_flagged')=1 OR json_extract(q.payload,'$.record_type')='meter_issue'))
                 ORDER BY created_at DESC
                 LIMIT 1
                 """
@@ -1716,6 +1744,19 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
+    def meter_issue_bill_ids(self, consumer_id: int) -> set[str]:
+        with self._connect() as conn:
+            rows=conn.execute('SELECT payload FROM sync_queue_meter_readings WHERE consumer_id=?',(int(consumer_id),)).fetchall()
+        result=set()
+        for row in rows:
+            try:
+                payload=json.loads(row['payload'])
+            except (TypeError,ValueError):
+                continue
+            if _is_meter_issue_report(payload) and payload.get('bill_sync_id'):
+                result.add(str(payload['bill_sync_id']))
+        return result
+
     def list_needs_review(self) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1728,18 +1769,43 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         result = {"held": 0, "resumed": 0, "changes": []}
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, reading_id, payload, backend_status FROM sync_queue_meter_readings "
-                "WHERE backend_status IN ('pending', 'failed', 'needs_review')"
+                "SELECT id, reading_id, payload, backend_status, last_error, conflict_reason FROM sync_queue_meter_readings "
+                "WHERE backend_status IN ('pending', 'failed', 'needs_review', 'conflict')"
             ).fetchall()
             for row in rows:
                 try:
                     payload = json.loads(row["payload"])
-                    schedule_id = int(payload.get("schedule_id"))
-                except (TypeError, ValueError, AttributeError):
+                except (TypeError, ValueError):
                     continue
+                reason = str((row["conflict_reason"] if row["backend_status"] == "conflict" else row["last_error"]) or row["conflict_reason"] or "")
+                if _is_meter_issue_report(payload):
+                    if row["backend_status"] in {"needs_review", "conflict"} and (
+                            _duplicate_reading_message(reason) or "outside" in reason.lower() or "cancelled" in reason.lower()):
+                        conn.execute("UPDATE sync_queue_meter_readings SET backend_status='pending',last_error=NULL,conflict_reason=NULL WHERE id=?",(row["id"],))
+                        self._refresh_queue_status(conn,row["id"])
+                        result["resumed"] += 1
+                        result["changes"].append({"queue_id":row["id"],"state":"pending","reading":payload,
+                            "reason":"Unreadable meter retained as a problem report; no bill will be created."})
+                    continue
+                schedule_id = _safe_int(payload.get("schedule_id"), None)
                 schedule = conn.execute(
-                    "SELECT status, meter_reader_id FROM reading_schedule WHERE schedule_id = ?", (schedule_id,)
-                ).fetchone()
+                    "SELECT status, meter_reader_id, schedule_date, due_date FROM reading_schedule WHERE schedule_id = ?", (schedule_id,)
+                ).fetchone() if schedule_id else None
+                capture = dict(payload)
+                if schedule:
+                    capture["schedule_date"] = capture.get("schedule_date") or schedule["schedule_date"]
+                    capture["schedule_due_date"] = capture.get("schedule_due_date") or schedule["due_date"]
+                review_reason = _invalid_capture_reason(capture)
+                if _duplicate_reading_message(reason):
+                    review_reason = reason
+                if review_reason and row["backend_status"] != "needs_review":
+                    conn.execute("UPDATE sync_queue_meter_readings SET backend_status='needs_review',last_error=? WHERE id=?", (review_reason,row["id"]))
+                    self._refresh_queue_status(conn,row["id"])
+                    result["held"] += 1
+                    result["changes"].append({"queue_id":row["id"],"state":"needs_review","reading":payload,"reason":review_reason})
+                    continue
+                if row["backend_status"] == "conflict":
+                    continue
                 if not schedule:
                     continue
                 cancelled = str(schedule["status"] or "").strip().lower() == "cancelled"
@@ -1748,6 +1814,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     reason = f"Schedule {schedule_id} is cancelled. Saved reading and billing reference retained for review."
                     result["held"] += 1
                 elif (row["backend_status"] == "needs_review" and not cancelled
+                      and "is cancelled." in reason
                       and schedule_id in (resumable_schedule_ids or set())
                       and str(schedule["status"] or "").strip().lower() in {"scheduled", "in progress", "overdue", "completed"}
                       and _safe_int(payload.get("meter_reader_id"), None) == schedule["meter_reader_id"]):
@@ -1765,6 +1832,12 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         for change in result["changes"]:
             _update_local_reading_state(change["reading"].get("reading_id"), change["state"])
         return result
+
+    def mark_needs_review(self, queue_id: int, reason: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE sync_queue_meter_readings SET backend_status='needs_review',last_error=? WHERE id=?", (str(reason)[:1000],queue_id))
+            self._refresh_queue_status(conn,queue_id)
+            conn.commit()
 
     def get_latest_confirmed_bill(self, consumer_id: int) -> dict:
         with self._connect() as conn:
@@ -1843,6 +1916,24 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         with self._connect() as conn:
             rows = conn.execute(sql, (max(1, min(limit, 200)),)).fetchall()
         return [self._deserialize_row(row) for row in rows]
+
+
+def _duplicate_reading_message(message: str) -> bool:
+    value = str(message).lower()
+    return any(text in value for text in ("already has a bill for", "is already read for", "server has a newer reading for the same consumer and date"))
+
+
+def _invalid_capture_reason(payload: dict) -> str:
+    captured = _parse_date(payload.get("reading_date"))
+    start = _parse_date(payload.get("schedule_date"))
+    end = _parse_date(payload.get("schedule_due_date"))
+    if captured and start and end and not start <= captured <= end:
+        return "Reading captured outside its assigned schedule dates. Saved reading and billing reference retained for office review."
+    return ""
+
+
+class ReadingReviewRequired(ValueError):
+    """A confirmed duplicate or invalid capture is retained without retrying."""
 
 
 class BackendRequestError(RuntimeError):
@@ -2150,7 +2241,7 @@ class BackendApiClient:
         status, data = self._req(
             "GET",
             "/api/handheld/readings/existing",
-            query={"consumer_id": int(consumer_id), "reading_date": reading_date},
+            query={"consumer_id": int(consumer_id), "reading_date": reading_date, "billing_cycle": str(reading_date)[:7]},
         )
         if self._is_missing_record(status, data):
             return None
@@ -2159,6 +2250,21 @@ class BackendApiClient:
         return data if isinstance(data, dict) and data else None
 
     def save_reading_bundle(self, payload: dict) -> dict:
+        if _is_meter_issue_report(payload):
+            report = dict(payload)
+            report["issue_reason"] = str(payload.get("issue_reason") or payload.get("exception") or "").strip()
+            if report["issue_reason"].lower() in {"", "none"}:
+                report["issue_reason"] = "Unable to read meter (legacy device flag)"
+            # Keep the original queued evidence, but transmit no bill or guessed values.
+            allowed = {"reading_id", "consumer_id", "schedule_id", "reading_date", "meter_no", "issue_reason"}
+            status, data = self._req("POST", "/api/handheld/meter-issues",
+                                     payload={key:value for key,value in report.items() if key in allowed})
+            if status >= 400 or status == 0:
+                raise self._request_failure(status, "/api/handheld/meter-issues", data, "Meter issue upload failed.")
+            saved = data.get("meter_issue_report") if isinstance(data, dict) else None
+            if not isinstance(saved, dict) or str(saved.get("sync_id")) != str(payload.get("reading_id")):
+                raise RuntimeError("The backend did not confirm this meter issue report.")
+            return data
         merged = dict(payload)
         if self._meter_reader_id is not None:
             merged.setdefault("meter_reader_id", self._meter_reader_id)
@@ -2187,7 +2293,10 @@ class BackendApiClient:
             payload={"reading": reading_payload, "bill": bill},
         )
         if status == 409:
-            raise ValueError(self._message(data, "The reserved billing reference conflicts with this bill."))
+            message = self._message(data, "The reserved billing reference conflicts with this bill.")
+            if (isinstance(data,dict) and data.get("code") in {"READING_ALREADY_RECORDED", "BILL_ALREADY_ISSUED", "READING_OUTSIDE_SCHEDULE"}) or _duplicate_reading_message(message):
+                raise ReadingReviewRequired(message)
+            raise ValueError(message)
         if status >= 400 or status == 0 or not isinstance(data, dict):
             raise self._request_failure(status, "/api/handheld/reading-bundles", data, "Backend reading sync failed.")
         if not isinstance(data.get("bill"), dict):
@@ -2263,7 +2372,7 @@ class HandheldSyncDataAccess:
             payload = change["reading"]
             held = change["state"] == "needs_review"
             message = (
-                "Cancelled schedule: reading saved for review; excluded from upload retries."
+                change.get("reason") or "Cancelled schedule: reading saved for review; excluded from upload retries."
                 if held else "Original schedule restored: saved reading returned to the upload queue."
             )
             details = (
@@ -2277,6 +2386,11 @@ class HandheldSyncDataAccess:
     def listReviewReadings(self) -> list[dict]:
         getter = getattr(self.local, "list_needs_review", None)
         return getter() if callable(getter) else []
+
+    def _hold_reading_for_review(self, queue_id: int, payload: dict, reason: str) -> None:
+        self.local.mark_needs_review(queue_id, reason)
+        _update_local_reading_state(payload.get("reading_id"), "needs_review")
+        self._audit(queue_id, "needs_review", reason, payload)
 
     def _reading_needs_review(self, queue_id: int) -> bool:
         return any(row["id"] == queue_id for row in self.listReviewReadings())
@@ -2357,6 +2471,14 @@ class HandheldSyncDataAccess:
                     for key in CONTEXT_BILL_FIELDS:
                         if context.get(key) is not None:
                             merged[key] = context[key]
+                    issue_ids_getter=getattr(self.local,'meter_issue_bill_ids',None)
+                    issue_ids=issue_ids_getter(consumer_id) if callable(issue_ids_getter) else set()
+                    # Hide old, unissued local drafts for unreadable meters from
+                    # future billing calculations; retain the stored audit data.
+                    if str((merged.get('local_bill') or {}).get('sync_id') or '') in issue_ids:
+                        merged.pop('local_bill',None)
+                    if isinstance(merged.get('local_bills'),list):
+                        merged['local_bills']=[bill for bill in merged['local_bills'] if str(bill.get('sync_id') or '') not in issue_ids]
                     return merged
             except (TypeError, ValueError):
                 continue
@@ -2493,13 +2615,15 @@ class HandheldSyncDataAccess:
                 item.get("schedule_due_date") or item.get("Schedule_Due_Date")
                 or item.get("end_date") or item.get("End_Date")
             ) or start_date
+            schedule_status = str(item.get("schedule_status") or item.get("Schedule_Status") or "").strip().lower()
             if (consumer_id in (None, "") or schedule_id in (None, "")
-                    or not start_date or start_date > window_end
+                    or not start_date or start_date > window_end or (end_date and end_date < today)
+                    or schedule_status in {"cancelled", "canceled", "overdue", "completed"}
                     or item.get("is_read") in (True, 1, "1")):
                 result["skipped"] += 1
                 continue
             reading_day = max(today, start_date)
-            last_day = min(max(today, end_date), window_end)
+            last_day = min(end_date, window_end)
             while reading_day <= last_day:
                 bill_date = reading_day.isoformat()
                 reading_day += timedelta(days=1)
@@ -2762,12 +2886,18 @@ class HandheldSyncDataAccess:
         reading.setdefault("created_at", _utc_now_iso())
         reading.setdefault("updated_at", _utc_now_iso())
         reading.setdefault("reading_date", datetime.now(timezone.utc).date().isoformat())
+        if _is_meter_issue_report(reading):
+            reading["record_type"] = "meter_issue"
+            reading["is_flagged"] = True
+            reading["billing_calculation_status"] = "Not billable: meter unreadable"
         return reading
 
     def _queue_for_sync(self, operation: str, reading: dict) -> dict:
         return self.local.enqueue_operation(operation, reading, backend_status="pending")
 
     def _ensure_billing_reference(self, reading: dict) -> dict:
+        if _is_meter_issue_report(reading):
+            return reading
         if not reading.get("bill_sync_id") or reading.get("billing_reference"):
             return reading
         reserved = self.prepareBillingReference(
@@ -2783,10 +2913,11 @@ class HandheldSyncDataAccess:
     def queueMeterReading(self, payload: dict) -> dict:
         with self.operation_lock:
             reading = self._normalize_reading(payload)
-            self._reject_duplicate_monthly_bill(
-                reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
-                reading.get("bill_sync_id"),
-            )
+            if not _is_meter_issue_report(reading):
+                self._reject_duplicate_monthly_bill(
+                    reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
+                    reading.get("bill_sync_id"),
+                )
             queued = self._queue_for_sync("create", reading)
             _update_local_reading_state(reading.get("reading_id"), "pending")
             self.reconcileScheduleReadings()
@@ -2797,10 +2928,11 @@ class HandheldSyncDataAccess:
 
     def _save_or_queue(self, operation: str, payload: dict) -> dict:
         reading = self._normalize_reading(payload)
-        self._reject_duplicate_monthly_bill(
-            reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
-            reading.get("bill_sync_id"),
-        )
+        if not _is_meter_issue_report(reading):
+            self._reject_duplicate_monthly_bill(
+                reading["consumer_id"], reading.get("bill_date") or reading["reading_date"],
+                reading.get("bill_sync_id"),
+            )
         queued = self._queue_for_sync(operation, reading)
         _update_local_reading_state(reading.get("reading_id"), "pending")
         self.reconcileScheduleReadings()
@@ -2810,7 +2942,7 @@ class HandheldSyncDataAccess:
             self.local.log_audit(queued["id"], "pending", f"Queued offline {operation} operation", reading)
             return {"status": "queued", "queue": queued, "reading": reading}
         try:
-            self._refresh_cancelled_upload_schedules([reading])
+            self._refresh_cancelled_upload_schedules([] if _is_meter_issue_report(reading) else [reading])
             if self._reading_needs_review(queued["id"]):
                 return {"status": "needs_review", "queue": queued, "reading": reading}
             reading = self._ensure_billing_reference(reading)
@@ -2818,7 +2950,7 @@ class HandheldSyncDataAccess:
             self.local.mark_target_synced(queued["id"], "backend", remote)
             reading = _apply_server_reading_state(reading, remote)
             self._cache_confirmed_bill(reading, remote)
-            if reading.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
+            if not _is_meter_issue_report(reading) and reading.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
                 saved_bill = remote.get("bill") if isinstance(remote, dict) else {}
                 self.local.mark_bill_reservation_used(
                     str(reading["bill_sync_id"]),
@@ -2837,6 +2969,9 @@ class HandheldSyncDataAccess:
                 "errors": [],
                 "queue": queued,
             }
+        except ReadingReviewRequired as exc:
+            self._hold_reading_for_review(queued["id"], reading, str(exc))
+            return {"status":"needs_review", "queue":queued, "reading":reading}
         except ValueError as exc:
             self.local.mark_conflict(queued["id"], str(exc), target="backend")
             _update_local_reading_state(reading.get("reading_id"), "conflict", "rejected")
@@ -2941,7 +3076,7 @@ class HandheldSyncDataAccess:
             self._audit(None, "pending", diagnostic)
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic],
                     "needs_review": len(self.listReviewReadings())}
-        self._refresh_cancelled_upload_schedules([row["payload"] for row in pending])
+        self._refresh_cancelled_upload_schedules([row["payload"] for row in pending if not _is_meter_issue_report(row["payload"])])
         pending = self.listPendingSyncReadings()
         if not pending:
             return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
@@ -2962,31 +3097,20 @@ class HandheldSyncDataAccess:
                 continue
             payload = dict(row["payload"])
             try:
-                existing = self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
+                existing = None if _is_meter_issue_report(payload) else self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
                 same_sync_id = bool(
                     existing
                     and str(existing.get("sync_id") or "") == str(payload.get("reading_id") or "")
                 )
-                if (
-                    existing
-                    and not same_sync_id
-                    and existing.get("updated_at")
-                    and payload.get("updated_at")
-                    and str(existing["updated_at"]) > str(payload["updated_at"])
-                ):
-                    reason = "Server has a newer reading for the same consumer and date."
-                    self.local.mark_conflict(queue_id, reason, existing, target="backend")
-                    _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")
-                    self._audit(queue_id, "conflict", f"Stage: Checking server version\nProblem: {reason}", {"local": payload, "server": existing})
-                    conflicts += 1
+                if existing and not same_sync_id:
+                    self._hold_reading_for_review(queue_id, payload, "This billing cycle already has a saved server reading. Office review is required; the local reading and reference are retained.")
                     continue
-
                 payload = self._ensure_billing_reference(payload)
                 remote_result = self.remote.save_reading_bundle(payload)
                 self.local.mark_target_synced(queue_id, "backend", remote_result)
                 payload = _apply_server_reading_state(payload, remote_result)
                 self._cache_confirmed_bill(payload, remote_result)
-                if payload.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
+                if not _is_meter_issue_report(payload) and payload.get("bill_sync_id") and hasattr(self.local, "mark_bill_reservation_used"):
                     saved_bill = remote_result.get("bill") if isinstance(remote_result, dict) else {}
                     self.local.mark_bill_reservation_used(
                         str(payload["bill_sync_id"]),
@@ -2999,6 +3123,8 @@ class HandheldSyncDataAccess:
                     {"reading_id": payload.get("reading_id")},
                 )
                 synced += 1
+            except ReadingReviewRequired as exc:
+                self._hold_reading_for_review(queue_id,payload,str(exc))
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc), target="backend")
                 _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")

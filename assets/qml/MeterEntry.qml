@@ -10,6 +10,7 @@ Rectangle {
     readonly property var bridgeObj: (typeof appBridge !== "undefined" && appBridge) ? appBridge : null
     readonly property bool showSuggestions: bridgeObj && bridgeObj.searchSuggestions && bridgeObj.searchSuggestions.length > 0
     readonly property bool compactScreen: width <= 420
+    readonly property bool meterUnreadable: bridgeObj && bridgeObj.selectedException !== "None"
     readonly property var currentConsumption: {
         if (!bridgeObj || bridgeObj.consumption === "-") return 0
         return parseFloat(bridgeObj.consumption)
@@ -25,6 +26,10 @@ Rectangle {
         if (!bridgeObj) return
         if (bridgeObj.accountNo === "-" || bridgeObj.consumerName === "-" || bridgeObj.consumerName === "Consumer not found") {
             showPrintAlert("Select Consumer", "Please select a consumer before printing.")
+            return
+        }
+        if (meterUnreadable) {
+            bridgeObj.saveMeterIssue()
             return
         }
         if (bridgeObj.presentReading.length === 0) {
@@ -587,7 +592,7 @@ Rectangle {
                             verticalAlignment: Text.AlignVCenter
                         }
                         Text {
-                            text: "PRINT"
+                            text: meterEntryRoot.meterUnreadable ? "SAVE METER ISSUE" : "PRINT"
                             font.bold: true
                             font.family: "Montserrat"
                             color: "white"

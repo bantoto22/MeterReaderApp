@@ -234,7 +234,7 @@ Rectangle {
                             Text {
                                 visible: bridgeObj ? bridgeObj.syncReviewCount > 0 : false
                                 text: "Needs review: " + (bridgeObj ? bridgeObj.syncReviewCount : 0)
-                                      + " (cancelled schedule)\n" + (bridgeObj ? bridgeObj.syncReviewSummary : "")
+                                      + "\n" + (bridgeObj ? bridgeObj.syncReviewSummary : "")
                                 color: "#B45309"
                                 font.family: "Montserrat"
                                 font.pixelSize: settingsRoot.compactScreen ? TouchMetrics.helperText + 1 : TouchMetrics.bodyText

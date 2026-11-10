@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import re
 import sqlite3
+import json
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -351,6 +352,7 @@ def _initialize_database(conn):
             SELECT r.present_reading
             FROM readings r
             WHERE r.consumer_id = consumers.id
+              AND COALESCE(r.is_flagged,0)=0 AND lower(r.reading_status) NOT IN ('flagged','rejected','deleted','invalid')
             ORDER BY r.reading_date DESC, r.id DESC
             LIMIT 1
         )
@@ -358,6 +360,7 @@ def _initialize_database(conn):
             SELECT 1
             FROM readings r
             WHERE r.consumer_id = consumers.id
+              AND COALESCE(r.is_flagged,0)=0 AND lower(r.reading_status) NOT IN ('flagged','rejected','deleted','invalid')
         )
     """)
 
@@ -367,7 +370,7 @@ def _initialize_database(conn):
         UPDATE reading_assignment
         SET (is_read, reading_status, reading_sync_status) = (
             SELECT
-                CASE WHEN lower(COALESCE(r.reading_status, 'valid')) IN ('rejected', 'deleted', 'invalid')
+                CASE WHEN r.is_flagged=1 OR lower(COALESCE(r.reading_status, 'valid')) IN ('rejected', 'deleted', 'invalid', 'flagged')
                      THEN 0 ELSE 1 END,
                 COALESCE(r.reading_status, 'valid'),
                 COALESCE(r.reading_sync_status, 'pending')
@@ -383,6 +386,15 @@ def _initialize_database(conn):
                 AND r.schedule_id = reading_assignment.schedule_id
           )
     """)
+
+    # A legacy meter-problem entry is an unsuccessful attempt, even offline.
+    # Preserve any genuine successful reading for this assignment.
+    cur.execute("""UPDATE reading_assignment SET is_read=0,reading_status='Flagged'
+        WHERE EXISTS (SELECT 1 FROM readings problem WHERE problem.consumer_id=reading_assignment.consumer_id
+          AND problem.schedule_id=reading_assignment.schedule_id AND problem.is_flagged=1)
+        AND NOT EXISTS (SELECT 1 FROM readings actual WHERE actual.consumer_id=reading_assignment.consumer_id
+          AND actual.schedule_id=reading_assignment.schedule_id AND COALESCE(actual.is_flagged,0)=0
+          AND lower(actual.reading_status) NOT IN ('flagged','rejected','deleted','invalid'))""")
 
     # ── Seed data (only if tables are empty) ─────────────────────────────
     if False and cur.execute("SELECT COUNT(*) FROM zones").fetchone()[0] == 0:
@@ -760,7 +772,7 @@ def replace_reading_schedules_from_sync(
             row.get("payment_due_date") or row.get("Payment_Due_Date")
         )
         schedule_date = start_date
-        billing_month = str(row.get("Billing_Month", row.get("billing_month")) or "").strip() or None
+        billing_month = str(row.get("Billing_Cycle") or row.get("billing_cycle") or row.get("Billing_Month") or row.get("billing_month") or (schedule_date or "")[:7]).strip() or None
         remote_zone_id = row.get("Zone_ID", row.get("zone_id"))
         zone_name = str(row.get("Zone_Name", row.get("zone_name")) or "").strip()
         meter_reader_value = row.get("Meter_Reader_ID", row.get("meter_reader_id", reader_id_int))
@@ -1315,18 +1327,13 @@ def save_reading(
             str(sync_reading_id or "").strip() or None, captured,
         ),
     )
-    conn.execute(
-        """
-        UPDATE consumers
-        SET previous_reading = ?,
-            latest_reading = ?,
-            latest_reading_date = ?
-        WHERE id = ?
-        """,
-        (present_reading, present_reading, effective_reading_date, consumer_id),
-    )
+    if not is_flagged:
+        conn.execute(
+            """UPDATE consumers SET previous_reading=?,latest_reading=?,latest_reading_date=? WHERE id=?""",
+            (present_reading,present_reading,effective_reading_date,consumer_id),
+        )
     if schedule_id not in (None, ""):
-        is_valid = normalized_status.lower() not in {"rejected", "deleted", "invalid"}
+        is_valid = not is_flagged and normalized_status.lower() not in {"rejected", "deleted", "invalid", "flagged"}
         conn.execute(
             """
             UPDATE reading_assignment
@@ -1352,7 +1359,7 @@ def update_reading_sync_state(
         return False
     conn = get_connection()
     row = conn.execute(
-        "SELECT id, consumer_id, schedule_id, reading_status FROM readings WHERE sync_reading_id = ? LIMIT 1",
+        "SELECT id, consumer_id, schedule_id, reading_status, is_flagged FROM readings WHERE sync_reading_id = ? LIMIT 1",
         (key,),
     ).fetchone()
     if not row:
@@ -1365,7 +1372,7 @@ def update_reading_sync_state(
         (normalized_sync, normalized_reading, row["id"]),
     )
     if row["schedule_id"] is not None:
-        valid = normalized_reading.lower() not in {"rejected", "deleted", "invalid"}
+        valid = not row["is_flagged"] and normalized_reading.lower() not in {"rejected", "deleted", "invalid", "flagged"}
         conn.execute(
             """
             UPDATE reading_assignment
@@ -1581,6 +1588,34 @@ def get_receipt_print_by_id(receipt_print_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def get_meter_issue_reports() -> list[dict]:
+    """Read durable issue reports from the offline transport queue, not readings."""
+    conn = get_connection()
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_queue_meter_readings'").fetchone():
+            return []
+        result = []
+        for row in conn.execute("SELECT payload,backend_status FROM sync_queue_meter_readings ORDER BY id"):
+            try:
+                payload = json.loads(row['payload'])
+            except (ValueError,TypeError):
+                continue
+            reason = str(payload.get('exception') or '').strip()
+            if not (payload.get('record_type')=='meter_issue' or payload.get('is_flagged') in (True,1,'true','1') or reason.lower() not in {'','none'}):
+                continue
+            repaired = conn.execute("""SELECT 1 FROM readings WHERE consumer_id=? AND COALESCE(is_flagged,0)=0
+                AND lower(reading_status) NOT IN ('flagged','rejected','deleted','invalid')
+                AND (date(reading_date)>date(?) OR (date(reading_date)=date(?)
+                  AND datetime(COALESCE(captured_at,reading_date))>=datetime(?))) LIMIT 1""",
+                (payload.get('consumer_id'),payload.get('reading_date'),payload.get('reading_date'),
+                 payload.get('captured_at') or payload.get('created_at') or str(payload.get('reading_date'))+'T23:59:59')).fetchone()
+            if not repaired:
+                result.append({**payload,'issue_sync_status':row['backend_status']})
+        return result
+    finally:
+        conn.close()
+
+
 def get_zone_stats(
     schedule_date: str | None = None,
     meter_reader_id: int | str | None = None,
@@ -1590,6 +1625,7 @@ def get_zone_stats(
     effective_date, effective_reader_id, use_schedule_filter = _effective_schedule_context(schedule_date, meter_reader_id)
     month_start, month_end = _month_bounds(effective_date)
     stats = {}
+    issue_reports = get_meter_issue_reports()
     if use_schedule_filter:
         zones = conn.execute(
             """
@@ -1616,7 +1652,7 @@ def get_zone_stats(
                 """SELECT COUNT(DISTINCT r.consumer_id)
                    FROM readings r
                    JOIN consumers c ON r.consumer_id = c.id
-                   WHERE c.zone_id = ?
+                   WHERE c.zone_id = ? AND COALESCE(r.is_flagged,0)=0 AND lower(r.reading_status) NOT IN ('flagged','rejected','deleted','invalid')
                      AND date(r.reading_date) >= date(?)
                      AND date(r.reading_date) <= date(?)""",
                 (z["id"], month_start, month_end),
@@ -1653,7 +1689,7 @@ def get_zone_stats(
                 """SELECT COUNT(DISTINCT r.consumer_id)
                    FROM readings r
                    JOIN consumers c ON r.consumer_id = c.id
-                   WHERE c.zone_id = ?""", (z["id"],)
+                   WHERE c.zone_id = ? AND COALESCE(r.is_flagged,0)=0 AND lower(r.reading_status) NOT IN ('flagged','rejected','deleted','invalid')""", (z["id"],)
             ).fetchone()[0]
             flagged = conn.execute(
                 """SELECT COUNT(*)
@@ -1662,7 +1698,15 @@ def get_zone_stats(
                    WHERE c.zone_id = ? AND r.is_flagged = 1""", (z["id"],)
             ).fetchone()[0]
 
-        stats[z["name"]] = {"households": total, "read": read, "flagged": flagged}
+        issue_consumers = {report.get('consumer_id') for report in issue_reports
+                           if not use_schedule_filter or month_start <= str(report.get('reading_date') or '')[:10] <= month_end}
+        zone_issues = {row['id'] for row in conn.execute('SELECT id FROM consumers WHERE zone_id=?',(z['id'],)) if row['id'] in issue_consumers}
+        legacy_issues = {row['consumer_id'] for row in conn.execute("""SELECT DISTINCT problem.consumer_id FROM readings problem
+            JOIN consumers c ON c.id=problem.consumer_id WHERE c.zone_id=? AND problem.is_flagged=1
+            AND NOT EXISTS (SELECT 1 FROM readings actual WHERE actual.consumer_id=problem.consumer_id
+              AND COALESCE(actual.is_flagged,0)=0 AND lower(actual.reading_status) NOT IN ('flagged','rejected','deleted','invalid')
+              AND date(actual.reading_date)>=date(problem.reading_date))""",(z['id'],))}
+        stats[z["name"]] = {"households": total, "read": read, "flagged": len(zone_issues | legacy_issues)}
 
     conn.close()
     return stats
@@ -1733,7 +1777,7 @@ def get_zone_consumers_with_status(
         LEFT JOIN readings r ON r.id = (
             SELECT MAX(r2.id) FROM readings r2
             WHERE r2.consumer_id = ra.consumer_id AND r2.schedule_id = ra.schedule_id
-              AND lower(COALESCE(r2.reading_status, 'valid')) NOT IN ('rejected', 'deleted', 'invalid')
+              AND lower(COALESCE(r2.reading_status, 'valid')) NOT IN ('rejected', 'deleted', 'invalid', 'flagged')
         )
         WHERE ra.schedule_id = ? AND ra.zone_name = ?
         """
@@ -1874,6 +1918,7 @@ def get_zone_consumers_with_status(
     conn.close()
     results = [dict(r) for r in rows]
     today = date.today()
+    issue_reports = get_meter_issue_reports()
     for item in results:
         due = _normalize_schedule_date(item.get("schedule_due_date") or item.get("due_date"))
         scheduled = _normalize_schedule_date(item.get("schedule_date"))
@@ -1913,6 +1958,15 @@ def get_zone_consumers_with_status(
                 "pending": "Waiting to sync", "failed": "Sync failed",
                 "conflict": "Sync conflict", "synced": "Synced", "needs_review": "Needs review",
             }.get(sync, sync)
+        issue = next((report for report in reversed(issue_reports)
+                      if str(report.get('consumer_id'))==str(item.get('id'))
+                      and (selected_schedule_id is None or str(report.get('schedule_id'))==str(selected_schedule_id))),None)
+        if issue and not item.get('is_read'):
+            item.update(is_flagged=True,reading_value=None,consumption=None,
+                        reading_status='Flagged',reading_status_label='Flagged: unable to read',
+                        exception=issue.get('issue_reason') or issue.get('exception'),
+                        reading_sync_status=issue['issue_sync_status'],
+                        reading_sync_label='Issue synced' if issue['issue_sync_status']=='synced' else 'Issue waiting to sync')
     return sort_and_mark_nearby(results)
 
 
@@ -2283,18 +2337,18 @@ def replace_consumers_from_sync(consumers: list[dict], *, report: dict | None = 
                 remote_status = str(c.get("reading_status") or "").strip()
                 raw_is_read = c.get("is_read")
                 remote_is_read = str(raw_is_read).strip().lower() in {"1", "true", "yes"}
-                remote_is_read = remote_is_read and remote_status.lower() not in {"rejected", "deleted", "invalid"}
+                remote_is_read = remote_is_read and remote_status.lower() not in {"rejected", "deleted", "invalid", "flagged"}
                 assignment_status = remote_status or ("valid" if remote_is_read else "pending")
                 remote_sync = str(c.get("reading_sync_status") or c.get("sync_status") or ("synced" if remote_is_read else "pending")).strip().lower()
                 saved = cur.execute(
-                    """SELECT id, reading_status, reading_sync_status FROM readings
+                    """SELECT id, reading_status, reading_sync_status, is_flagged FROM readings
                        WHERE consumer_id = ? AND schedule_id = ? ORDER BY id DESC LIMIT 1""",
                     (local_consumer_id, schedule_row["schedule_id"]),
                 ).fetchone()
                 if saved:
                     saved_status = str(saved["reading_status"] or "valid").strip()
                     saved_sync = str(saved["reading_sync_status"] or "pending").strip().lower()
-                    saved_valid = saved_status.lower() not in {"rejected", "deleted", "invalid"}
+                    saved_valid = not saved["is_flagged"] and saved_status.lower() not in {"rejected", "deleted", "invalid", "flagged"}
                     local_work_pending = saved_valid and saved_sync in {"pending", "failed", "needs_review"}
                     stale_unread = not remote_is_read and remote_status.lower() in {"", "pending"}
                     if local_work_pending or stale_unread:
@@ -2303,7 +2357,7 @@ def replace_consumers_from_sync(consumers: list[dict], *, report: dict | None = 
                         remote_is_read = saved_valid
                         assignment_status = saved_status
                         remote_sync = saved_sync
-                    elif remote_status.lower() in {"rejected", "deleted", "invalid"} and saved_sync == "synced":
+                    elif remote_status.lower() in {"rejected", "deleted", "invalid", "flagged"} and saved_sync == "synced":
                         # Retain an explicit backend invalidation so a later
                         # pending snapshot cannot resurrect the old accepted state.
                         cur.execute(

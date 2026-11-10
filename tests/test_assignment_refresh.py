@@ -125,7 +125,7 @@ class AssignmentRefreshTests(unittest.TestCase):
         self.assertIn(202, {row["schedule_id"] for row in database.get_assigned_routes(12)})
         rows = database.get_zone_consumers_with_status("Zone 1", meter_reader_id=12, schedule_id=202)
         self.assertEqual([row["id"] for row in rows], [1])
-        self.assertTrue(all(window == ("2025-11-01", "2026-12-31") for window in self.remote.windows))
+        self.assertTrue(all(window == ("2026-11-07", "2026-12-31") for window in self.remote.windows))
 
     def test_manual_sync_discovers_new_schedule_while_viewing_old_route(self):
         view = self.view()
