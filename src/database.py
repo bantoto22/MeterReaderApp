@@ -349,7 +349,10 @@ def _initialize_database(conn):
     cur.execute("""
         UPDATE consumers
         SET previous_reading = (
-            SELECT r.present_reading
+            SELECT CASE WHEN consumers.latest_reading IS NOT NULL AND (
+                date(consumers.latest_reading_date)>date(r.reading_date)
+                OR (date(consumers.latest_reading_date)=date(r.reading_date) AND lower(r.reading_sync_status)='synced')
+            ) THEN consumers.latest_reading ELSE r.present_reading END
             FROM readings r
             WHERE r.consumer_id = consumers.id
               AND COALESCE(r.is_flagged,0)=0 AND lower(r.reading_status) NOT IN ('flagged','rejected','deleted','invalid')

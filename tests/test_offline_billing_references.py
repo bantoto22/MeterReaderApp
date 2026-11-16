@@ -40,7 +40,7 @@ class ReservationBackend(BackendApiClient):
             raise RuntimeError("Connection lost after reserving the number")
         return dict(result)
 
-    def find_existing_reading(self, consumer_id, reading_date):
+    def find_existing_reading(self, consumer_id, reading_date, *, billing_cycle=None, include_bill_month=False):
         return None
 
     def _req(self, method, path, *, payload=None, **kwargs):

@@ -139,6 +139,30 @@ class BackendConnectionTests(unittest.TestCase):
         view._start_heartbeat.assert_called_once()
         dal.syncPendingReadings.assert_not_called()
 
+    def test_backend_recovery_refreshes_assignments_without_a_wifi_change(self):
+        dal = Mock()
+        dal.get_recent_audit_entries.return_value = []
+        view = SimpleNamespace(
+            _sync_dal=dal, _backend_status="Offline", _backend_endpoint="https://example.test/api",
+            _auto_sync_enabled=True, _meter_reader_account_id="12",
+            _start_heartbeat=Mock(), _run_auto_pull=Mock(), _emit_sync_state=Mock(),
+            syncLogsChanged=Mock(), backendLogsChanged=Mock(),
+        )
+        AppBridge._refresh_sync_snapshot(view, {"backend_online": True, "status": "Online"})
+        view._run_auto_pull.assert_called_once()
+        AppBridge._refresh_sync_snapshot(view, {"backend_online": True, "status": "Online"})
+        view._run_auto_pull.assert_called_once()
+
+    def test_disabled_auto_sync_does_not_start_failure_retry_timer(self):
+        view = SimpleNamespace(
+            _sync_dal=Mock(), _auto_sync_enabled=False, _pull_interval=300,
+            _assignment_download_error="Connection failed", _assignment_retry_count=1,
+            _assignment_refresh_timer=Mock(),
+        )
+        AppBridge._reset_auto_pull_timer(view)
+        view._assignment_refresh_timer.stop.assert_called_once()
+        view._assignment_refresh_timer.start.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

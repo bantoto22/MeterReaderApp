@@ -149,6 +149,52 @@ class AssignmentRefreshTests(unittest.TestCase):
         self.assertTrue(any(schedule["scheduleId"] == "202" for route in view._assigned_routes
                             for schedule in route["schedules"]))
 
+    def test_upload_preflight_error_does_not_prevent_download_and_next_sync_recovers(self):
+        view = self.view()
+        with patch.object(self.dal, "syncPendingReadings", side_effect=ConnectionError("Upload connection failed")):
+            AppBridge.syncNow(view)
+        self.assert_new_assignment_downloaded()
+        result = view.syncTaskFinished.emit.call_args.args[0]
+        self.assertEqual(result["kind"], "sync")
+        self.assertEqual(result["pulled"], 1)
+        self.assertIn("Upload connection failed", result["result"]["errors"][0])
+        self.assertEqual(view.alertRequested.emit.call_args.args[0], "Sync Finished with Problems")
+        view._set_operation_busy.assert_called_with(False, "")
+        AppBridge.syncNow(view)
+        self.assertEqual(view.alertRequested.emit.call_args.args[0], "Sync Complete")
+
+    def test_failed_download_can_retry_on_same_running_instance(self):
+        view = self.view()
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                refresh = AppBridge._run_auto_pull if automatic else AppBridge.syncNow
+                self.remote.consumer_error = "Request timed out downloading consumers"
+                refresh(view)
+                self.assertIn("failed", view._assignment_download_status.lower())
+                self.assertFalse(view._assigned_dataset_refreshing)
+                self.remote.consumer_error = None
+                refresh(view)
+                self.assert_new_assignment_downloaded()
+                self.assertEqual(view._assignment_download_error, "")
+                self.assertEqual(view._assignment_download_status, "Fresh backend data")
+
+    def test_failed_auto_download_retries_soon_then_restores_normal_interval(self):
+        view = self.view()
+        view._pull_interval = 300
+        view._assignment_refresh_timer = Mock()
+        self.remote.consumer_error = "Request timed out downloading consumers"
+        for seconds in (30, 60, 120, 240, 300):
+            AppBridge._run_auto_pull(view)
+            view._assignment_refresh_timer.setInterval.assert_called_with(seconds * 1000)
+            view._assignment_refresh_timer.start.assert_called()
+        view._pull_interval = 900
+        AppBridge._run_auto_pull(view)
+        view._assignment_refresh_timer.setInterval.assert_called_with(300000)
+        self.remote.consumer_error = None
+        AppBridge._run_auto_pull(view)
+        view._assignment_refresh_timer.setInterval.assert_called_with(900000)
+        self.assertEqual(view._assignment_retry_count, 0)
+
     def test_zone_refresh_discovers_new_assignment_while_viewing_old_route(self):
         view = self.view()
         view._zone_refreshing = set()

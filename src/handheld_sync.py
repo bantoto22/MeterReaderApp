@@ -16,6 +16,7 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import math
 import os
 import re
 import sqlite3
@@ -40,6 +41,11 @@ except ImportError:
     from sqlite_support import connect_sqlite
 
 sqlite3.register_adapter(Decimal, float)
+
+try:
+    from .review_queue import ReviewQueue
+except ImportError:
+    from review_queue import ReviewQueue
 
 BACKGROUND_SYNC_INTERVAL_SECONDS = 300
 DEFAULT_API_TIMEOUT_SECONDS = 30
@@ -892,7 +898,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     @staticmethod
     def _deserialize_row(row: sqlite3.Row) -> dict:
         data = dict(row)
-        for key in ("payload", "server_payload"):
+        for key in ("payload", "server_payload", "review_server_record"):
             if key in data and isinstance(data[key], str) and data[key]:
                 try:
                     data[key] = json.loads(data[key])
@@ -969,7 +975,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
     @staticmethod
     def _combined_status(backend_status: str) -> str:
         state = str(backend_status or "pending").lower()
-        return state if state in {"pending", "failed", "conflict", "synced", "needs_review"} else "pending"
+        return state if state in {"pending", "failed", "conflict", "synced", "needs_review", "archived"} else "pending"
 
     def _refresh_queue_status(self, conn: sqlite3.Connection, queue_id: int) -> None:
         row = conn.execute(
@@ -1139,6 +1145,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 {
                     "backend_status": "TEXT NOT NULL DEFAULT 'pending'",
                     "backend_synced_at": "TEXT",
+                    "reviewed_at": "TEXT",
+                    "review_resolution": "TEXT",
+                    "review_server_record": "TEXT",
                 },
             )
             existing_queue_columns = {
@@ -1527,7 +1536,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 candidate = json.loads(row["payload"])
             except (TypeError, ValueError):
                 continue
-            if _is_meter_issue_report(candidate):
+            if _is_meter_issue_report(candidate) or row['backend_status']=='archived':
                 issue_bill_ids.add(str(candidate.get("bill_sync_id") or ""))
         for row in reservations:
             if str(row["bill_sync_id"]) != excluded and str(row["bill_sync_id"]) not in issue_bill_ids:
@@ -1537,7 +1546,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 payload = json.loads(row["payload"])
             except (TypeError, ValueError):
                 payload = {}
-            if _is_meter_issue_report(payload):
+            if _is_meter_issue_report(payload) or row['backend_status']=='archived':
                 continue
             sync_id = str(payload.get("bill_sync_id") or payload.get("reading_id") or "")
             if sync_id != excluded:
@@ -1746,14 +1755,14 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
     def meter_issue_bill_ids(self, consumer_id: int) -> set[str]:
         with self._connect() as conn:
-            rows=conn.execute('SELECT payload FROM sync_queue_meter_readings WHERE consumer_id=?',(int(consumer_id),)).fetchall()
+            rows=conn.execute('SELECT payload,backend_status FROM sync_queue_meter_readings WHERE consumer_id=?',(int(consumer_id),)).fetchall()
         result=set()
         for row in rows:
             try:
                 payload=json.loads(row['payload'])
             except (TypeError,ValueError):
                 continue
-            if _is_meter_issue_report(payload) and payload.get('bill_sync_id'):
+            if (_is_meter_issue_report(payload) or row['backend_status']=='archived') and payload.get('bill_sync_id'):
                 result.add(str(payload['bill_sync_id']))
         return result
 
@@ -1763,6 +1772,42 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                 "SELECT * FROM sync_queue_meter_readings WHERE backend_status = 'needs_review' ORDER BY id"
             ).fetchall()
         return [self._deserialize_row(row) for row in rows]
+
+    def list_archived_reviews(self) -> list[dict]:
+        with self._connect() as conn:
+            rows=conn.execute("SELECT * FROM sync_queue_meter_readings WHERE backend_status='archived' ORDER BY reviewed_at DESC,id DESC").fetchall()
+        return [self._deserialize_row(row) for row in rows]
+
+    def archive_review_duplicate(self,queue_id:int,payload:dict,office:dict) -> None:
+        with self._connect() as conn:
+            row=conn.execute("SELECT payload FROM sync_queue_meter_readings WHERE id=? AND backend_status='needs_review'",(queue_id,)).fetchone()
+            if not row or json.loads(row['payload'])!=payload:
+                raise ValueError('The saved entry changed; check it again before archiving.')
+            changed=conn.execute("""UPDATE sync_queue_meter_readings SET backend_status='archived',
+                reviewed_at=CURRENT_TIMESTAMP,review_resolution='Office-confirmed duplicate',review_server_record=?
+                WHERE id=? AND backend_status='needs_review' AND payload=?""",
+                (json.dumps(office,sort_keys=True),queue_id,row['payload'])).rowcount
+            if changed!=1:raise ValueError('The saved entry changed while archiving. Nothing was cleared.')
+            self._refresh_queue_status(conn,queue_id)
+            conn.commit()
+
+    def confirm_office_cycle(self,office:dict) -> None:
+        with self._connect() as conn:
+            conn.execute("""UPDATE reading_assignment SET is_read=1,reading_status='Recorded',reading_sync_status='synced'
+                WHERE consumer_id=? AND billing_cycle=?""",(int(office['consumer_id']),office['billing_cycle']))
+            conn.execute("""UPDATE handheld_assignments_cache SET is_read=1,reading_status='Recorded',reading_sync_status='synced'
+                WHERE consumer_id=? AND billing_cycle=?""",(int(office['consumer_id']),office['billing_cycle']))
+            conn.commit()
+
+    def restore_archived_review(self,queue_id:int) -> dict:
+        with self._connect() as conn:
+            row=conn.execute("SELECT payload FROM sync_queue_meter_readings WHERE id=? AND backend_status='archived'",(queue_id,)).fetchone()
+            if not row:raise ValueError('This archived entry is no longer available.')
+            changed=conn.execute("UPDATE sync_queue_meter_readings SET backend_status='needs_review',review_resolution='Restored to review' WHERE id=? AND backend_status='archived'",(queue_id,)).rowcount
+            if changed!=1:raise ValueError('This entry changed. Refresh the list.')
+            self._refresh_queue_status(conn,queue_id)
+            conn.commit()
+            return json.loads(row['payload'])
 
     def reconcile_cancelled_readings(self, resumable_schedule_ids: set[int] | None = None) -> dict:
         """Retain cancelled assignments outside the upload queue without changing their payloads."""
@@ -1920,7 +1965,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 
 def _duplicate_reading_message(message: str) -> bool:
     value = str(message).lower()
-    return any(text in value for text in ("already has a bill for", "is already read for", "server has a newer reading for the same consumer and date"))
+    return any(text in value for text in ("already has a bill for", "is already read for", "server has a newer reading for the same consumer and date", "this billing cycle already has a saved server reading"))
 
 
 def _invalid_capture_reason(payload: dict) -> str:
@@ -2228,8 +2273,9 @@ class BackendApiClient:
             if isinstance(row, dict)
         ] if isinstance(data, list) else []
 
-    def get_consumer_context(self, consumer_id: int) -> dict:
-        status, data = self._req("GET", f"/api/handheld/consumers/{int(consumer_id)}/context")
+    def get_consumer_context(self, consumer_id: int, *, include_today: bool = False) -> dict:
+        options={'query':{'include_today':'1'}} if include_today else {}
+        status, data = self._req("GET", f"/api/handheld/consumers/{int(consumer_id)}/context",**options)
         if self._is_missing_record(status, data):
             return {}
         if status >= 400 or status == 0 or not isinstance(data, dict):
@@ -2237,11 +2283,13 @@ class BackendApiClient:
             raise self._request_failure(status, path, data, "Backend consumer-context lookup failed.")
         return _flatten_backend_bill_context(data)
 
-    def find_existing_reading(self, consumer_id: int, reading_date: str) -> dict | None:
+    def find_existing_reading(self, consumer_id: int, reading_date: str, *, billing_cycle: str | None = None, include_bill_month: bool = False) -> dict | None:
+        query={"consumer_id":int(consumer_id),"reading_date":reading_date,"billing_cycle":billing_cycle or str(reading_date)[:7]}
+        if include_bill_month:query['include_bill_month']='1'
         status, data = self._req(
             "GET",
             "/api/handheld/readings/existing",
-            query={"consumer_id": int(consumer_id), "reading_date": reading_date, "billing_cycle": str(reading_date)[:7]},
+            query=query,
         )
         if self._is_missing_record(status, data):
             return None
@@ -2331,6 +2379,7 @@ class HandheldSyncDataAccess:
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
+        self._review_queue=ReviewQueue(self.local,self.remote,_duplicate_reading_message,_is_meter_issue_report,self._audit,_update_local_reading_state,self._refresh_review_baseline)
         self.reconcileScheduleReadings()
 
     def _endpoint(self) -> str:
@@ -2387,10 +2436,41 @@ class HandheldSyncDataAccess:
         getter = getattr(self.local, "list_needs_review", None)
         return getter() if callable(getter) else []
 
+    def reviewEntries(self,archived=False) -> list[dict]:
+        return self._review_queue.entries(archived)
+
+    def checkReviewEntry(self,queue_id:int) -> dict:
+        with self.operation_lock:return self._review_queue.check(int(queue_id))
+
+    def resolveReviewEntry(self,queue_id:int,token:str) -> str:
+        with self.operation_lock:return self._review_queue.resolve(int(queue_id),token)
+
+    def restoreReviewEntry(self,queue_id:int) -> None:
+        with self.operation_lock:self._review_queue.restore(int(queue_id))
+
     def _hold_reading_for_review(self, queue_id: int, payload: dict, reason: str) -> None:
         self.local.mark_needs_review(queue_id, reason)
         _update_local_reading_state(payload.get("reading_id"), "needs_review")
         self._audit(queue_id, "needs_review", reason, payload)
+
+    def _ignore_confirmed_duplicate(self, queue_id: int) -> str | None:
+        """Keep the existing office record and retire only its extra device entry."""
+        row=next((row for row in self.listReviewReadings() if row['id']==queue_id),None)
+        if (not row or row.get('review_resolution')=='Restored to review'
+                or not _duplicate_reading_message(row.get('last_error') or row.get('conflict_reason'))
+                or _is_meter_issue_report(row['payload'])):
+            return None
+        try:
+            checked=self._review_queue.check(queue_id)
+            result=self._review_queue.resolve(queue_id,checked['token'])
+            self._audit(queue_id,'success','Existing office reading kept; extra device entry automatically ignored.',
+                        {'office':checked['office'],'resolution':result})
+            return result
+        except Exception as exc:
+            # No confirmed office record means no automatic removal. Preserve
+            # the durable original reason and field evidence for a later retry.
+            self._audit(queue_id,'needs_review',f'Duplicate verification deferred: {exc}')
+            return None
 
     def _reading_needs_review(self, queue_id: int) -> bool:
         return any(row["id"] == queue_id for row in self.listReviewReadings())
@@ -2428,6 +2508,30 @@ class HandheldSyncDataAccess:
                 self._audit(None, "pending", format_sync_error(
                     "Checking cancelled schedules before upload", exc, self._endpoint(),
                 ))
+
+    def _refresh_review_baseline(self, payload: dict) -> None:
+        """Refresh the office baseline before retiring an extra local reading."""
+        consumer_id=int(payload['consumer_id'])
+        context=self.remote.get_consumer_context(consumer_id,include_today=True)
+        if (not isinstance(context,dict) or str(context.get('id',context.get('consumer_id')))!=str(consumer_id)
+                or context.get('previous_reading') is None or 'latest_reading_date' not in context):
+            raise ValueError('The current office meter baseline is unavailable. Nothing was archived; sync and check again.')
+        baseline=float(context['previous_reading'])
+        if not math.isfinite(baseline):raise ValueError('The office meter baseline is invalid. Nothing was archived.')
+        self._cache_remote_consumer_context(consumer_id,context)
+        with self.local._connect() as conn:
+            # Preserve genuine newer offline work, while excluding the duplicate
+            # the user has just confirmed should be kept only in history.
+            pending=conn.execute("""SELECT present_reading FROM readings
+                WHERE consumer_id=? AND COALESCE(sync_reading_id,'')<>?
+                  AND COALESCE(is_flagged,0)=0 AND lower(reading_status) NOT IN ('flagged','rejected','deleted','invalid')
+                  AND lower(reading_sync_status) NOT IN ('synced','archived')
+                  AND date(reading_date)>=date(COALESCE(?, '0001-01-01'))
+                ORDER BY reading_date DESC,id DESC LIMIT 1""",
+                (consumer_id,str(payload.get('reading_id') or ''),context.get('latest_reading_date'))).fetchone()
+            conn.execute('UPDATE consumers SET previous_reading=?,latest_reading=?,latest_reading_date=? WHERE id=?',
+                (pending['present_reading'] if pending else baseline,context.get('latest_reading'),context.get('latest_reading_date'),consumer_id))
+            conn.commit()
 
     def _cache_remote_consumer_context(self, consumer_id: int, context: dict) -> dict:
         context = _flatten_backend_bill_context(context)
@@ -2473,7 +2577,7 @@ class HandheldSyncDataAccess:
                             merged[key] = context[key]
                     issue_ids_getter=getattr(self.local,'meter_issue_bill_ids',None)
                     issue_ids=issue_ids_getter(consumer_id) if callable(issue_ids_getter) else set()
-                    # Hide old, unissued local drafts for unreadable meters from
+                    # Hide unissued drafts for unreadable or archived entries from
                     # future billing calculations; retain the stored audit data.
                     if str((merged.get('local_bill') or {}).get('sync_id') or '') in issue_ids:
                         merged.pop('local_bill',None)
@@ -2971,6 +3075,8 @@ class HandheldSyncDataAccess:
             }
         except ReadingReviewRequired as exc:
             self._hold_reading_for_review(queued["id"], reading, str(exc))
+            if self._ignore_confirmed_duplicate(queued['id']):
+                return {"status":"duplicate_ignored","queue":queued,"reading":reading}
             return {"status":"needs_review", "queue":queued, "reading":reading}
         except ValueError as exc:
             self.local.mark_conflict(queued["id"], str(exc), target="backend")
@@ -3063,7 +3169,10 @@ class HandheldSyncDataAccess:
     def _sync_pending_readings(self) -> dict:
         self.reconcileScheduleReadings()
         pending = self.listPendingSyncReadings()
-        if not pending:
+        duplicate_reviews=[row for row in self.listReviewReadings()
+                           if _duplicate_reading_message(row.get('last_error') or row.get('conflict_reason'))
+                           and row.get('review_resolution')!='Restored to review']
+        if not pending and not duplicate_reviews:
             return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
                     "needs_review": len(self.listReviewReadings())}
         if not self.is_online():
@@ -3076,11 +3185,14 @@ class HandheldSyncDataAccess:
             self._audit(None, "pending", diagnostic)
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic],
                     "needs_review": len(self.listReviewReadings())}
+        ignored=0
+        for row in duplicate_reviews:
+            if self._ignore_confirmed_duplicate(row['id']):ignored+=1
         self._refresh_cancelled_upload_schedules([row["payload"] for row in pending if not _is_meter_issue_report(row["payload"])])
         pending = self.listPendingSyncReadings()
         if not pending:
             return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
-                    "needs_review": len(self.listReviewReadings())}
+                    "needs_review": len(self.listReviewReadings()),"ignored_duplicates":ignored}
         self._audit(
             None,
             "pending",
@@ -3090,6 +3202,7 @@ class HandheldSyncDataAccess:
         synced = 0
         failed = 0
         conflicts = 0
+        stopped_early = False
         errors: list[str] = []
         for row in pending:
             queue_id = row["id"]
@@ -3097,13 +3210,15 @@ class HandheldSyncDataAccess:
                 continue
             payload = dict(row["payload"])
             try:
-                existing = None if _is_meter_issue_report(payload) else self.remote.find_existing_reading(payload["consumer_id"], payload["reading_date"])
+                existing = None if _is_meter_issue_report(payload) else self.remote.find_existing_reading(
+                    payload["consumer_id"],payload["reading_date"],billing_cycle=payload.get('billing_cycle') or str(payload['reading_date'])[:7])
                 same_sync_id = bool(
                     existing
                     and str(existing.get("sync_id") or "") == str(payload.get("reading_id") or "")
                 )
                 if existing and not same_sync_id:
-                    self._hold_reading_for_review(queue_id, payload, "This billing cycle already has a saved server reading. Office review is required; the local reading and reference are retained.")
+                    self._hold_reading_for_review(queue_id, payload, "This billing cycle already has a saved server reading. The local reading and reference are retained until the office record is verified.")
+                    if self._ignore_confirmed_duplicate(queue_id):ignored+=1
                     continue
                 payload = self._ensure_billing_reference(payload)
                 remote_result = self.remote.save_reading_bundle(payload)
@@ -3125,6 +3240,7 @@ class HandheldSyncDataAccess:
                 synced += 1
             except ReadingReviewRequired as exc:
                 self._hold_reading_for_review(queue_id,payload,str(exc))
+                if self._ignore_confirmed_duplicate(queue_id):ignored+=1
             except ValueError as exc:
                 self.local.mark_conflict(queue_id, str(exc), target="backend")
                 _update_local_reading_state(payload.get("reading_id"), "conflict", "rejected")
@@ -3151,9 +3267,17 @@ class HandheldSyncDataAccess:
                 self._audit(queue_id, "failed", diagnostic, payload)
                 errors.append(diagnostic)
                 failed += 1
+                if _interrupts_api_batch(exc):
+                    # One connection/session outage affects the whole batch.
+                    # Leave remaining entries untouched for the next attempt,
+                    # and let manual sync proceed to downloading assignments.
+                    stopped_early = True
+                    break
 
         result = {"status": "done", "synced": synced, "failed": failed, "conflicts": conflicts, "errors": errors,
-                  "needs_review": len(self.listReviewReadings())}
+                  "needs_review": len(self.listReviewReadings()),"ignored_duplicates":ignored}
+        if stopped_early:
+            result["stopped_early"] = True
         summary_status = "success" if failed == 0 and conflicts == 0 else "failed"
         self._audit(
             None,

@@ -180,6 +180,153 @@ Rectangle {
         background: Rectangle { color: "white"; radius: 8; border.color: "#D8E1EC" }
     }
 
+    Dialog {
+        id: reviewConfirmDialog
+        objectName: "confirmReviewResolution"
+        property int queueId: 0
+        property string checkToken: ""
+        property bool alreadySaved: false
+        title: alreadySaved ? "Confirm saved entry" : "Archive duplicate"
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 520)
+        modal: true
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: reviewConfirmDialog.alreadySaved
+                    ? "The office has confirmed this exact reading and reference. Only the device's sync status will change."
+                    : "This extra device entry will stop uploading and leave Needs review. Its original values and reference will remain in History. The office reading and bill will stay unchanged."
+                color: "#172B4D"
+            }
+            CheckBox {
+                id: confirmOfficeRecord
+                objectName: "confirmOfficeReading"
+                text: "I confirm the office record is the one to keep."
+                Layout.fillWidth: true
+                contentItem: Text { text: confirmOfficeRecord.text; leftPadding: confirmOfficeRecord.indicator.width + confirmOfficeRecord.spacing; wrapMode: Text.WordWrap; color: "#172B4D" }
+            }
+        }
+        footer: DialogButtonBox {
+            Button { text: "Cancel"; DialogButtonBox.buttonRole: DialogButtonBox.RejectRole; onClicked: reviewConfirmDialog.close() }
+            Button {
+                objectName: "confirmReviewResolutionButton"
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+                text: reviewConfirmDialog.alreadySaved ? "Confirm saved" : "Archive duplicate"
+                enabled: confirmOfficeRecord.checked && bridgeObj && !bridgeObj.operationBusy
+                onClicked: {
+                    bridgeObj.resolveReviewEntry(reviewConfirmDialog.queueId, reviewConfirmDialog.checkToken)
+                    reviewConfirmDialog.close()
+                }
+            }
+        }
+        onOpened: confirmOfficeRecord.checked = false
+    }
+
+    Dialog {
+        id: reviewDialog
+        objectName: "reviewQueueDialog"
+        property bool showHistory: false
+        title: showHistory ? "Archived duplicates" : "Saved readings needing review"
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 24, 640)
+        height: Math.min(parent.height - 40, 620)
+        modal: true
+        standardButtons: Dialog.Close
+        contentItem: ColumnLayout {
+            RowLayout {
+                Layout.fillWidth: true
+                Button {
+                    text: reviewDialog.showHistory ? "Needs review" : "History"
+                    onClicked: { reviewDialog.showHistory = !reviewDialog.showHistory; if (bridgeObj) bridgeObj.refreshReviewEntries() }
+                }
+                Button { text: "Refresh list"; onClicked: { if (bridgeObj) bridgeObj.refreshReviewEntries() } }
+            }
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: reviewDialog.showHistory ? "Archived entries remain saved here and are excluded from uploads."
+                    : "Check the office record, compare both entries, then confirm which record to keep."
+                color: "#526176"
+            }
+            ScrollView {
+                id: reviewScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: availableWidth
+                Column {
+                    width: reviewScroll.availableWidth
+                    spacing: 12
+                    Repeater {
+                        model: bridgeObj ? (reviewDialog.showHistory ? bridgeObj.archivedReviewEntries : bridgeObj.reviewEntries) : []
+                        delegate: Rectangle {
+                            width: reviewScroll.availableWidth
+                            implicitHeight: reviewCardColumn.implicitHeight + 24
+                            height: implicitHeight
+                            color: "#F8FAFD"
+                            radius: 6
+                            border.color: "#D8E1EC"
+                            ColumnLayout {
+                                id: reviewCardColumn
+                                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                                anchors.margins: 12
+                                spacing: 9
+                                Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "Consumer " + modelData.consumer_id + " · Schedule " + modelData.schedule_id; font.bold: true; color: "#172B4D" }
+                                Text { Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; text: "Device reference: " + modelData.reference + "\nDate: " + modelData.reading_date; color: "#172B4D" }
+                                Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: modelData.reason; color: "#8A4B08" }
+                                Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "Device — previous: " + modelData.previous + ", present: " + modelData.present + ", use: " + modelData.consumption; color: "#172B4D" }
+                                Text {
+                                    Layout.fillWidth: true; wrapMode: Text.WrapAnywhere
+                                    visible: !!modelData.office.reading_id
+                                    text: "Office — previous: " + (modelData.office.previous || "0") + ", present: " + (modelData.office.present || "0")
+                                        + ", use: " + (modelData.office.consumption || "0") + "\nOffice reference: " + (modelData.office.reference || "No bill issued")
+                                        + "\nMonth: " + (modelData.office.billing_cycle || "") + "; reading date: " + (modelData.office.reading_date || "")
+                                    color: "#172B4D"
+                                }
+                                Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; visible: modelData.values_differ; text: "The dates or values differ. Confirm with the billing office before archiving."; color: "#9A3412"; font.bold: true }
+                                ActionButton {
+                                    Layout.fillWidth: true
+                                    visible: !reviewDialog.showHistory
+                                    text: "Check office record"
+                                    enabled: bridgeObj && !bridgeObj.operationBusy
+                                    onClicked: bridgeObj.checkReviewEntry(modelData.id)
+                                }
+                                ActionButton {
+                                    Layout.fillWidth: true
+                                    visible: !reviewDialog.showHistory && modelData.can_resolve
+                                    text: modelData.action === "confirm_synced" ? "Confirm already saved" : "Archive duplicate"
+                                    enabled: bridgeObj && !bridgeObj.operationBusy
+                                    onClicked: {
+                                        reviewConfirmDialog.queueId = modelData.id
+                                        reviewConfirmDialog.checkToken = modelData.token
+                                        reviewConfirmDialog.alreadySaved = modelData.action === "confirm_synced"
+                                        reviewConfirmDialog.open()
+                                    }
+                                }
+                                ActionButton {
+                                    Layout.fillWidth: true
+                                    visible: reviewDialog.showHistory
+                                    text: "Restore to review"
+                                    enabled: bridgeObj && !bridgeObj.operationBusy
+                                    onClicked: bridgeObj.restoreReviewEntry(modelData.id)
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        width: reviewScroll.availableWidth
+                        wrapMode: Text.WordWrap
+                        visible: bridgeObj && (reviewDialog.showHistory ? bridgeObj.archivedReviewEntries.length === 0 : bridgeObj.reviewEntries.length === 0)
+                        text: reviewDialog.showHistory ? "No archived duplicates." : "No readings need review."
+                        color: "#172B4D"
+                    }
+                }
+            }
+        }
+    }
+
     ScrollablePage {
         anchors.fill: parent
         maxContentWidth: 460
@@ -355,6 +502,11 @@ Rectangle {
                             hoverColor: "#1F2937"
                             Layout.fillWidth: true
                             onClicked: logsDialog.open()
+                        }
+                        ActionButton {
+                            text: bridgeObj && bridgeObj.syncReviewCount > 0 ? "Review saved entries" : "Review history"
+                            Layout.fillWidth: true
+                            onClicked: { if (bridgeObj) bridgeObj.refreshReviewEntries(); reviewDialog.showHistory = false; reviewDialog.open() }
                         }
                         ActionButton {
                             text: "Backend Logs"

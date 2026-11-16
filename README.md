@@ -367,6 +367,16 @@ The backend assignment billing cycle is retained separately from old bill histor
 Schedule refreshes also download cancelled schedules so an old offline cache cannot keep offering
 them as active or overdue assignments. A reading already saved against a cancelled assignment is
 retained in SQLite as **Needs review**, with its original reading ID, bill ID, and billing reference.
+On **Settings -> Sync Now**, entries reported as already billed or already read
+are checked against the office account and billing month. Confirmed extra entries
+are automatically archived, leaving the office record unchanged and allowing the
+remaining readings to sync. No manual review is needed for those duplicates.
+Their original payloads and references remain in **Settings -> Review history ->
+History**; reserved references are retained and never reused. The meter baseline
+is refreshed before archiving, without replacing newer unsynced field readings.
+An unavailable or changed office record remains saved until it can be verified.
+Other review reasons remain visible. **Restore to review** retains an archived
+entry for office follow-up without retrying its upload or auto-archiving it again.
 It is excluded from upload retries and the active failure count, so other readings can sync normally.
 Settings shows the review count and saved references; Sync Logs retains the assignment details.
 Before uploading queued readings or an online save, the device checks the backend's cancelled
@@ -387,6 +397,15 @@ Settings and Diagnostics show whether the assignment download returned fresh
 backend data or failed while cached records remain in use. A reachable health
 endpoint does not hide a failed authenticated assignment download. Upload-only
 background work does not change the last assignment-download counts.
+If a download fails with automatic sync enabled, the running app retries after
+30 seconds, then 60, 120, and 240 seconds, capped at five minutes. A successful
+download restores the configured refresh interval. Backend recovery also triggers
+a download when Wi-Fi has remained connected. Sync Now still attempts the
+download if the upload preflight fails, and a connection, authentication,
+rate-limit, or server outage stops the upload batch after its first failed
+request instead of waiting for the same failure on every queued reading.
+All unaccepted readings retain their original IDs and billing references for
+retry. An expired online session still requires signing in online again.
 Pulled and Mirrored count processed assignment rows, including updates to records
 already on the device. They are not counts of newly created consumers. Settings,
 Diagnostics, and the manual sync result also show unique consumer and schedule

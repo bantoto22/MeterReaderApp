@@ -156,7 +156,7 @@ class FakeRemoteStore:
     def _key(self, consumer_id, reading_date):
         return f"{consumer_id}:{reading_date}"
 
-    def find_existing_reading(self, consumer_id, reading_date):
+    def find_existing_reading(self, consumer_id, reading_date, *, billing_cycle=None, include_bill_month=False):
         if not self.online:
             raise RuntimeError("remote offline")
         if self.fail_reads:
@@ -241,6 +241,33 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["errors"], [])
         self.assertFalse(self.local.audit)
+
+    def test_global_upload_failure_stops_batch_and_retries_saved_work_without_restart(self):
+        from src.handheld_sync import BackendRequestError
+
+        for status in (0, 401, 403, 429, 503):
+            with self.subTest(status=status):
+                local = FakeLocalStore()
+                remote = FakeRemoteStore()
+                dal = HandheldSyncDataAccess(local, remote)
+                originals = []
+                for consumer_id in range(1, 4):
+                    row = dal.queueMeterReading({"consumer_id": consumer_id, "reading_date": "2026-11-16"})
+                    originals.append(dict(row["reading"]))
+                remote.online = True
+                with patch.object(remote, "find_existing_reading", side_effect=BackendRequestError(status, "Backend unavailable")) as lookup, patch(
+                    "src.handheld_sync._update_local_reading_state"
+                ):
+                    result = dal.syncPendingReadings()
+                self.assertEqual(lookup.call_count, 1)
+                self.assertTrue(result["stopped_early"])
+                self.assertEqual(result["failed"], 1)
+                self.assertEqual([row["backend_status"] for row in local.queue], ["failed", "pending", "pending"])
+                self.assertEqual([row["payload"] for row in local.queue], originals)
+                with patch("src.handheld_sync._update_local_reading_state"):
+                    retried = dal.syncPendingReadings()
+                self.assertEqual(retried["synced"], 3)
+                self.assertEqual(local.list_pending(), [])
 
     def test_offline_upload_reports_health_detail_and_keeps_queue(self):
         self.dal.saveMeterReading({"consumer_id": 1, "present_reading": 100,

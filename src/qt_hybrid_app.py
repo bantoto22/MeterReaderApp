@@ -734,6 +734,8 @@ class AppBridge(QObject):
     syncStatusColorChanged = Signal()
     syncPendingCountChanged = Signal()
     syncReviewCountChanged = Signal()
+    reviewEntriesChanged = Signal()
+    reviewActionFinished = Signal(object)
     backendStatusChanged = Signal()
     backendPendingCountChanged = Signal()
     backendLastSyncChanged = Signal()
@@ -851,6 +853,7 @@ class AppBridge(QObject):
         self._assignment_download_status = "Not downloaded yet"
         self._assignment_download_error = ""
         self._assignment_download_summary = ""
+        self._assignment_retry_count = 0
         self._auto_pull_enabled = False
         self._auto_push_enabled = False
         self._auto_sync_enabled = self._load_auto_sync_enabled()
@@ -869,6 +872,8 @@ class AppBridge(QObject):
         self._test_print_busy = False
         self._print_preview_busy = False
         self._pending_print_job = None
+        self._review_entries = []
+        self._archived_review_entries = []
         self._print_history_records = []
         self._print_history_detail = None
         self._print_history_months = []
@@ -900,6 +905,7 @@ class AppBridge(QObject):
         self.printExecutionFinished.connect(self._finish_print_execution)
         self.printPreparationFinished.connect(self._finish_print_preparation)
         self.meterIssueSaveFinished.connect(self._finish_meter_issue_save)
+        self.reviewActionFinished.connect(self._finish_review_action)
         self.assignedDatasetFinished.connect(self._finish_assigned_consumer_dataset)
         self.heartbeatResult.connect(self._finish_heartbeat)
 
@@ -1517,6 +1523,67 @@ class AppBridge(QObject):
     def syncReviewSummary(self) -> str:
         return self._sync_review_summary
 
+    @Property(list,notify=reviewEntriesChanged)
+    def reviewEntries(self) -> list:
+        return self._review_entries
+
+    @Property(list,notify=reviewEntriesChanged)
+    def archivedReviewEntries(self) -> list:
+        return self._archived_review_entries
+
+    @Slot()
+    def refreshReviewEntries(self) -> None:
+        if self._sync_dal:
+            self._review_entries=self._sync_dal.reviewEntries()
+            self._archived_review_entries=self._sync_dal.reviewEntries(True)
+            self._sync_review_count=len(self._review_entries)
+            self._sync_review_summary='\n'.join(
+                f"Consumer {entry['consumer_id']} · Schedule {entry['schedule_id']} · {entry['reference']}\nReason: {entry['reason']}"
+                for entry in self._review_entries)
+            self.syncReviewCountChanged.emit()
+            self.reviewEntriesChanged.emit()
+
+    def _start_review_action(self,action:str,queue_id:int,token:str='') -> None:
+        if self._operation_busy or not self._sync_dal:return
+        self._set_operation_busy(True,'Checking saved reading...' if action!='restore' else 'Restoring review entry...')
+        def task():
+            try:
+                if action=='check':
+                    self._sync_dal.checkReviewEntry(queue_id)
+                    message='Compare the office record below before resolving this entry.'
+                elif action=='resolve':
+                    status=self._sync_dal.resolveReviewEntry(queue_id,token)
+                    message=('The extra entry was archived. Its data and reference remain in History. Tap Sync Now to refresh assignments.'
+                             if status=='archived' else 'The office confirmed this exact entry is already saved. It is now marked synced.')
+                elif action=='restore':
+                    self._sync_dal.restoreReviewEntry(queue_id)
+                    message='The archived entry is back in Needs review. It has not been queued for upload.'
+                else:raise ValueError('Unknown review action.')
+                self.reviewActionFinished.emit({'success':True,'message':message})
+            except Exception as exc:
+                self.reviewActionFinished.emit({'success':False,'message':str(exc)})
+        threading.Thread(target=task,daemon=True).start()
+
+    @Slot(int)
+    def checkReviewEntry(self,queue_id:int) -> None:
+        self._start_review_action('check',queue_id)
+
+    @Slot(int,str)
+    def resolveReviewEntry(self,queue_id:int,token:str) -> None:
+        self._start_review_action('resolve',queue_id,token)
+
+    @Slot(int)
+    def restoreReviewEntry(self,queue_id:int) -> None:
+        self._start_review_action('restore',queue_id)
+
+    def _finish_review_action(self,result:dict) -> None:
+        self._set_operation_busy(False,'')
+        self.refreshReviewEntries()
+        self._refresh_sync_snapshot()
+        self._refresh_zone_consumers()
+        self.update_stats()
+        self.alertRequested.emit('Saved reading review' if result.get('success') else 'Review not completed',result.get('message') or 'Try again.')
+
     @Property(str, notify=backendStatusChanged)
     def backendStatus(self) -> str:
         return self._backend_status
@@ -1828,6 +1895,8 @@ class AppBridge(QObject):
             self._backend_status = "Online" if snapshot.get("backend_online") else "Offline"
             if self._backend_status == "Online" and not was_backend_online:
                 self._start_heartbeat()
+                if self._auto_sync_enabled and getattr(self, "_meter_reader_account_id", ""):
+                    self._run_auto_pull()
             self._backend_pending_count = int(snapshot.get("backend_pending_count", 0))
             self._backend_last_sync = str(snapshot.get("backend_last_sync_time") or "Never")
             self._save_target = _friendly_save_target_text(str(snapshot.get("save_target", "Local SQLite only")))
@@ -1900,7 +1969,11 @@ class AppBridge(QObject):
     def _reset_auto_pull_timer(self) -> None:
         if not hasattr(self, "_assignment_refresh_timer"):
             return
-        self._assignment_refresh_timer.setInterval(self._pull_interval * 1000)
+        interval = self._pull_interval
+        if getattr(self, "_assignment_download_error", ""):
+            retries = max(1, getattr(self, "_assignment_retry_count", 1))
+            interval = min(interval, 300, 30 * 2 ** min(retries - 1, 4))
+        self._assignment_refresh_timer.setInterval(interval * 1000)
         if self._sync_dal and self._auto_sync_enabled:
             self._assignment_refresh_timer.start()
         else:
@@ -2037,11 +2110,13 @@ class AppBridge(QObject):
                 self._zone_refresh_attempted.discard(zone_name)
             self._sync_logs = f"Assigned schedule refresh failed: {result.get('error', 'Unknown error')}"
             self.syncLogsChanged.emit()
+            self._assignment_retry_count = getattr(self, "_assignment_retry_count", 0) + 1
         else:
             self._assignment_download_status = "Fresh backend data"
             if result.get("skipped_records"):
                 self._assignment_download_status += f"; {result['skipped_records']} rows skipped"
             self._assignment_download_error = ""
+            self._assignment_retry_count = 0
             self._assignment_download_summary = str(result.get("download_summary") or "")
             if zone_name:
                 self._zone_refresh_attempted.discard(zone_name)
@@ -2071,6 +2146,7 @@ class AppBridge(QObject):
                 self.syncLogsChanged.emit()
             self.lastPullCountChanged.emit()
             self.lastPullMirrorChanged.emit()
+        AppBridge._reset_auto_pull_timer(self)
         self._refresh_local_assignment_views()
         self._refresh_sync_snapshot()
 
@@ -2253,6 +2329,9 @@ class AppBridge(QObject):
             self._last_pull_mirror = int(result.get("mirrored", self._last_pull_mirror))
             self._last_pull_count = int(result.get("pulled", self._last_pull_count))
             self._assignment_download_error = str((result.get("result") or {}).get("pull_error") or "")
+            self._assignment_retry_count = (
+                getattr(self, "_assignment_retry_count", 0) + 1 if self._assignment_download_error else 0
+            )
             self._assignment_download_status = "Download failed; using cached records" if self._assignment_download_error else "Fresh backend data"
             skipped_records = int((result.get("result") or {}).get("skipped_records", 0))
             if not self._assignment_download_error and skipped_records:
@@ -2261,6 +2340,7 @@ class AppBridge(QObject):
                 "" if self._assignment_download_error else str(result.get("download_summary") or "")
             )
             self.lastPullCountChanged.emit()
+            AppBridge._reset_auto_pull_timer(self)
         self._refresh_local_assignment_views()
         self._reload_current_consumer_from_db()
         self._refresh_sync_snapshot()
@@ -2275,6 +2355,8 @@ class AppBridge(QObject):
                 if self._assignment_download_summary:
                     pull_line += "\n" + self._assignment_download_summary
             review_line = f"\nNeeds review: {sync_result.get('needs_review', getattr(self, '_sync_review_count', 0))}"
+            if sync_result.get('ignored_duplicates'):
+                review_line+=f"\nDuplicates ignored: {sync_result['ignored_duplicates']}"
             reference_line = (
                 f"\nOffline references ready: {sync_result.get('offline_references_ready', 0)}"
                 f"\nReference failures: {sync_result.get('offline_reference_failures', 0)}"
@@ -3234,7 +3316,15 @@ class AppBridge(QObject):
                 with self._sync_dal.operation_lock:
                     stage = "Uploading queued readings"
                     report_progress(stage)
-                    result = self._sync_dal.syncPendingReadings()
+                    try:
+                        result = self._sync_dal.syncPendingReadings()
+                    except Exception as upload_exc:
+                        # Keep uploads durable, but still try to retrieve new
+                        # assignments when an upload preflight fails.
+                        diagnostic = format_sync_error(stage, upload_exc, self._backend_endpoint)
+                        self._sync_dal._audit(None, "failed", diagnostic)
+                        result = {"status": "error", "synced": 0, "failed": 0,
+                                  "conflicts": 0, "errors": [diagnostic]}
                     pulled = 0
                     mirrored = 0
                     mirror_report: dict = {}
@@ -3382,6 +3472,9 @@ class AppBridge(QObject):
                         )
                         if not sync_result:
                             raise RuntimeError("The bill could not be persisted to the local retry queue.")
+                        if sync_result.get('status')=='duplicate_ignored':
+                            self.printExecutionFinished.emit({'success':True,'duplicate_ignored':True})
+                            return
                         if sync_result.get("status") == "needs_review":
                             self.printExecutionFinished.emit({
                                 "success": True, "job_type": "original", "pending_review": True,
@@ -3553,6 +3646,12 @@ class AppBridge(QObject):
             return
 
         self._pending_print_job = None
+        if result.get('duplicate_ignored'):
+            self._refresh_zone_consumers()
+            self._refresh_sync_snapshot()
+            self._refresh_local_assignment_views()
+            self.alertRequested.emit('Existing reading kept','The office already has this reading or bill. The extra device entry was ignored and retained in review history. No new bill was printed.')
+            return
         if result.get("job_type") == "original":
             consumer = dict(result["consumer_snapshot"])
             present = _to_float(result["present"])

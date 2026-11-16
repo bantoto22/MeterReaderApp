@@ -28,7 +28,7 @@ class _Remote:
     def is_online(self):
         return self.online
 
-    def find_existing_reading(self, consumer_id, reading_date):
+    def find_existing_reading(self, consumer_id, reading_date, *, billing_cycle=None, include_bill_month=False):
         return None
 
     def save_reading_bundle(self, reading):

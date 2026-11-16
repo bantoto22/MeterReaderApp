@@ -31,7 +31,7 @@ class AssignmentBackend:
     def load_assigned_consumers(self, *args):
         return []
 
-    def find_existing_reading(self, consumer_id, reading_date):
+    def find_existing_reading(self, consumer_id, reading_date, *, billing_cycle=None, include_bill_month=False):
         return None
 
     def save_reading_bundle(self, payload):

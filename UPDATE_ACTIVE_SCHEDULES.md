@@ -1,8 +1,24 @@
-# Meter issue, active schedule and sync update - November 11, 2026
+# Meter issue, active schedule and sync update - November 16, 2026
 
 Install this update together with the matching San Lorenzo backend changes.
 Close the device app, copy the supplied files into its MeterReaderApp folder,
 and reopen the app. Keep the existing `.env`, SQLite database, and data folder.
+
+The current package is `updates/MeterReaderApp-sync-recovery-2026-11-16.zip`.
+After installing, check recovery without restarting the app:
+
+- With automatic sync enabled, interrupt connectivity during a download and
+  restore it. A failed download retries after 30 seconds, backing off to at most
+  five minutes on repeated failure. Backend recovery is checked even if Wi-Fi
+  stays connected. A successful pull shows **Fresh backend data**.
+- Create another assignment in the office while the app remains open, then tap
+  **Settings -> Sync Now**. Confirm the new assignment appears. An upload error
+  must still allow the download stage to run, with the upload problem reported.
+- Retry queued readings after connectivity returns. Confirm the original saved
+  reading IDs and references are retained and only accepted entries become
+  synced. A global API outage must not cause one timeout per queued reading.
+- If the backend rejects the online session, sign in online again. Local field
+  work remains available; restarting the device is not an authentication step.
 
 1. In the main system, create a current or future reading schedule and assign
    the intended reader and concessionaires. Existing expired schedules are no
@@ -16,12 +32,18 @@ and reopen the app. Keep the existing `.env`, SQLite database, and data folder.
    billing month and its last imported meter reading. Its historical bill month
    must not replace the assignment's billing cycle. A reading already completed
    in that billing month remains completed.
-4. Confirmed duplicate readings and captures outside their schedule dates move
-   to **Needs review**. Their original IDs, readings, and billing references are
-   retained. They no longer repeatedly fail uploads or prevent other queued
-   readings from syncing. Settings shows the consumer, schedule, reference and
-   saved reason. Reviewing/resolving the business discrepancy is still manual;
-   this package does not add a button to discard or approve saved readings.
+4. Tap **Settings -> Sync Now** to automatically clear extra entries whose account
+   and billing month already have a usable office reading or bill. This includes
+   old **Needs review** and duplicate-failure entries. The existing office record
+   wins; the extra entry is archived without uploading or issuing another bill.
+   The result shows **Duplicates ignored**. Its original IDs, values, and reserved
+   reference remain in **Settings -> Review history -> History**. Reserved numbers
+   are never recycled. A repeat sync must leave the duplicate archived.
+   The current office meter baseline is refreshed before an extra reading is
+   archived, and genuine newer offline work remains intact. Unconfirmed duplicates,
+   unreadable-meter reports and unrelated schedule problems are not discarded.
+   History provides **Restore to review** for an entry that needs office follow-up;
+   restoring does not upload it or automatically archive it again.
 5. Record a valid reading offline while its schedule is active, restart the app,
    then reconnect and sync. It must upload once even if the deadline has since
    passed. Repeat Sync Now: there must be no second backend reading or bill.
@@ -31,7 +53,7 @@ and reopen the app. Keep the existing `.env`, SQLite database, and data folder.
    action becomes **Save Meter Issue**; a present reading, billing rates, and a
    printer are not required. The report is stored offline and synced without
    generating a bill. It does not advance the previous reading or count as read.
-8. Billing staff can open **Meter Reading -> Unreadable meters -> Refresh** in
+8. Billing staff can open **Scheduling, Zones & Devices -> Unreadable meters -> Refresh** in
    the main system. After repair, choose **None** on the device and capture an
    actual reading. That valid reading can generate a bill and resolve the issue.
 
