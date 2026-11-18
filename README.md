@@ -420,6 +420,13 @@ rate-limit, or server outage stops the upload batch after its first failed
 request instead of waiting for the same failure on every queued reading.
 All unaccepted readings retain their original IDs and billing references for
 retry. An expired online session still requires signing in online again.
+If a first reading was held because its previous reading was missing, a verified
+office zero baseline can restore that same saved entry on the next sync. The
+device verifies the consumer, original reader, meter, coverage date and absence
+of another reading for its billing cycle. It retains the reading ID, bill ID,
+captured date, present reading and exact reserved reference. See
+`FIRST_READING_RECOVERY.md`; a missing baseline is never treated as zero merely
+because the account has no recorded readings.
 Pulled and Mirrored count processed assignment rows, including updates to records
 already on the device. They are not counts of newly created consumers. Settings,
 Diagnostics, and the manual sync result also show unique consumer and schedule

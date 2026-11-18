@@ -1781,6 +1781,44 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             ).fetchall()
         return [self._deserialize_row(row) for row in rows]
 
+    def list_initial_baseline_holds(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT * FROM sync_queue_meter_readings
+                WHERE backend_status IN ('conflict','needs_review') ORDER BY id""").fetchall()
+        candidates = [self._deserialize_row(row) for row in rows]
+        return [row for row in candidates if isinstance(row.get('payload'), dict)
+                and row['payload'].get('previous_reading') in (None, '')
+                and not _is_meter_issue_report(row['payload'])
+                and row.get('review_resolution') != 'Restored to review'
+                and _initial_baseline_message(row.get('conflict_reason') or row.get('last_error'))]
+
+    def resume_initial_reading(self, queue_id: int, original: dict, coverage: dict) -> dict:
+        replacement = dict(original)
+        present = float(original.get('present_reading', original.get('current_reading')))
+        if original.get('previous_reading') not in (None, '') or not math.isfinite(present) or present < 0:
+            raise ValueError('Only a missing first-reading baseline can be recovered automatically.')
+        replacement.update(previous_reading=0, consumption=present, baseline_required=False,
+                           coverage_policy_version=coverage['coverage_policy_version'],
+                           coverage_from=coverage['coverage_from'],
+                           previous_reading_date=coverage['coverage_from'],
+                           previous_schedule_date=coverage.get('previous_schedule_date'))
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT * FROM sync_queue_meter_readings WHERE id=?', (queue_id,)).fetchone()
+            if (not row or row['backend_status'] not in ('conflict', 'needs_review')
+                    or json.loads(row['payload']) != original
+                    or not _initial_baseline_message(row['conflict_reason'] or row['last_error'])
+                    or ('review_resolution' in row.keys() and row['review_resolution'] == 'Restored to review')):
+                raise ValueError('The saved reading changed while checking its baseline; retry sync.')
+            conn.execute("""UPDATE sync_queue_meter_readings SET payload=?,backend_status='pending',
+                last_error=NULL,conflict_reason=NULL WHERE id=?""", (json.dumps(replacement), queue_id))
+            conn.execute("""UPDATE readings SET consumption=?,reading_sync_status='pending',reading_status='valid'
+                WHERE sync_reading_id=? AND consumer_id=? AND reading_sync_status IN ('conflict','needs_review')""",
+                (present, original['reading_id'], original['consumer_id']))
+            self._refresh_queue_status(conn, queue_id)
+            conn.commit()
+        return replacement
+
     def list_archived_reviews(self) -> list[dict]:
         with self._connect() as conn:
             rows=conn.execute("SELECT * FROM sync_queue_meter_readings WHERE backend_status='archived' ORDER BY reviewed_at DESC,id DESC").fetchall()
@@ -1974,6 +2012,10 @@ class SQLiteLocalSyncStore(LocalSyncStore):
 def _duplicate_reading_message(message: str) -> bool:
     value = str(message).lower()
     return any(text in value for text in ("already has a bill for", "is already read for", "server has a newer reading for the same consumer and date", "this billing cycle already has a saved server reading"))
+
+
+def _initial_baseline_message(message: str) -> bool:
+    return 'review the account\'s connection date and existing meter history before billing' in str(message or '').lower()
 
 
 def _invalid_capture_reason(payload: dict) -> str:
@@ -2346,7 +2388,7 @@ class BackendApiClient:
         )
         if status == 409:
             message = self._message(data, "The reserved billing reference conflicts with this bill.")
-            if (isinstance(data,dict) and data.get("code") in {"READING_ALREADY_RECORDED", "BILL_ALREADY_ISSUED", "READING_OUTSIDE_SCHEDULE"}) or _duplicate_reading_message(message):
+            if (isinstance(data,dict) and data.get("code") in {"READING_ALREADY_RECORDED", "BILL_ALREADY_ISSUED", "READING_OUTSIDE_SCHEDULE"}) or _duplicate_reading_message(message) or _initial_baseline_message(message):
                 raise ReadingReviewRequired(message)
             raise ValueError(message)
         if status >= 400 or status == 0 or not isinstance(data, dict):
@@ -2479,6 +2521,38 @@ class HandheldSyncDataAccess:
 
     def _reading_needs_review(self, queue_id: int) -> bool:
         return any(row["id"] == queue_id for row in self.listReviewReadings())
+
+    def _resume_verified_initial_reading(self, row: dict) -> bool:
+        payload = row['payload']
+        try:
+            reader = getattr(self.remote, '_meter_reader_id', None)
+            if isinstance(reader, int) and str(payload.get('meter_reader_id')) != str(reader):
+                return False
+            context = self.remote.get_consumer_context(int(payload['consumer_id']))
+            if (not isinstance(context, dict) or str(context.get('id', context.get('consumer_id'))) != str(payload['consumer_id'])
+                    or context.get('baseline_required') is not False
+                    or context.get('coverage_source') not in ('new_connection', 'opening_reading')
+                    or context.get('coverage_policy_version') != 1):
+                return False
+            previous = Decimal(str(context.get('previous_reading')))
+            start = _parse_date(context.get('coverage_from'))
+            capture = _parse_date(payload.get('schedule_date') or payload.get('reading_date'))
+            if not previous.is_finite() or previous != 0 or not start or not capture or start > capture:
+                return False
+            if payload.get('meter_no') and str(payload['meter_no']) != str(context.get('meter_no')):
+                return False
+            existing = self.remote.find_existing_reading(payload['consumer_id'], payload['reading_date'],
+                billing_cycle=payload.get('billing_cycle') or str(payload['reading_date'])[:7])
+            if existing is not None:
+                return False
+            updated = self.local.resume_initial_reading(row['id'], payload, context)
+            _update_local_reading_state(payload.get('reading_id'), 'pending', 'valid')
+            self._audit(row['id'], 'pending', 'Office-confirmed zero baseline restored the saved first reading for upload.',
+                        {'original': payload, 'reading': updated})
+            return True
+        except Exception as exc:
+            self._audit(row['id'], 'needs_review', f'First-reading baseline verification deferred: {exc}')
+            return False
 
     def _refresh_cancelled_upload_schedules(self, readings: list[dict]) -> None:
         """Confirm cancellations before uploading, even when the offline cache is stale."""
@@ -3194,7 +3268,9 @@ class HandheldSyncDataAccess:
         duplicate_reviews=[row for row in self.listReviewReadings()
                            if _duplicate_reading_message(row.get('last_error') or row.get('conflict_reason'))
                            and row.get('review_resolution')!='Restored to review']
-        if not pending and not duplicate_reviews:
+        baseline_loader = getattr(self.local, 'list_initial_baseline_holds', None)
+        baseline_holds = baseline_loader() if callable(baseline_loader) else []
+        if not pending and not duplicate_reviews and not baseline_holds:
             return {"status": "done", "synced": 0, "failed": 0, "conflicts": 0, "errors": [],
                     "needs_review": len(self.listReviewReadings())}
         if not self.is_online():
@@ -3208,8 +3284,12 @@ class HandheldSyncDataAccess:
             return {"status": "offline", "synced": 0, "failed": 0, "conflicts": 0, "errors": [diagnostic],
                     "needs_review": len(self.listReviewReadings())}
         ignored=0
+        for row in baseline_holds:
+            if not self._resume_verified_initial_reading(row) and row['backend_status'] == 'conflict':
+                self._hold_reading_for_review(row['id'], row['payload'], row.get('conflict_reason') or row.get('last_error'))
         for row in duplicate_reviews:
             if self._ignore_confirmed_duplicate(row['id']):ignored+=1
+        pending = self.listPendingSyncReadings()
         self._refresh_cancelled_upload_schedules([row["payload"] for row in pending if not _is_meter_issue_report(row["payload"])])
         pending = self.listPendingSyncReadings()
         if not pending:
