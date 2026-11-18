@@ -13,6 +13,24 @@ from src.qt_hybrid_app import AppBridge
 
 
 class BackendConnectionTests(unittest.TestCase):
+    def test_invalid_assignment_response_is_not_reported_as_zero_rows(self):
+        client = BackendApiClient(SyncConfig(backend_api_base_url='https://example.test/api'))
+        for response in ({'success': False, 'message': 'Assignments unavailable'}, {'data': []}, None, ['invalid']):
+            for lookup in (
+                lambda: client.load_assigned_consumers(12, None, '2026-11-18', '2026-12-31'),
+                lambda: client.load_assignment_schedules(12, '2026-11-18', '2026-12-31'),
+                lambda: client.load_reading_schedules(12, '2026-11-18', '2026-12-31'),
+            ):
+                with self.subTest(response=response), patch.object(client, '_req', return_value=(200, response)):
+                    with self.assertRaisesRegex(RuntimeError, 'list of records'):
+                        lookup()
+
+    def test_valid_empty_assignment_response_remains_a_valid_empty_download(self):
+        client = BackendApiClient(SyncConfig(backend_api_base_url='https://example.test/api'))
+        with patch.object(client, '_req', return_value=(200, [])):
+            self.assertEqual(client.load_assigned_consumers(12), [])
+            self.assertEqual(client.load_assignment_schedules(12, '2026-11-18', '2026-12-31'), [])
+
     def test_schedule_download_accepts_response_slower_than_old_five_second_limit(self):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):

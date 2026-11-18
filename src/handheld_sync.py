@@ -1470,6 +1470,14 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             rows = conn.execute(base, params).fetchall()
         return sorted((dict(row) for row in rows), key=_cached_assignment_sort_key)
 
+    def load_cached_consumers_for_reader(self, meter_reader_id: int | str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT DISTINCT hc.id FROM handheld_consumers_cache hc
+                JOIN handheld_assignments_cache ha ON ha.consumer_id=hc.id
+                JOIN reading_schedule rs ON rs.schedule_id=ha.schedule_id
+                WHERE rs.meter_reader_id=? ORDER BY hc.id""", (int(meter_reader_id),)).fetchall()
+        return [dict(row) for row in rows]
+
     def cache_consumer_context(self, consumer_id: int, context: dict) -> None:
         """Keep API-provided bill, payment and reading records for offline use."""
         if not isinstance(context, dict) or not context:
@@ -2074,6 +2082,13 @@ class BackendApiClient:
         status_text = "Connection error" if status == 0 else f"HTTP {status}"
         return BackendRequestError(status, f"{status_text} {path}: {self._message(data, fallback)}")
 
+    def _response_rows(self, status: int, data: object, path: str) -> list[dict]:
+        if not 200 <= status < 300:
+            raise self._request_failure(status, path, data, 'Backend assignment lookup failed.')
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise RuntimeError(f'Invalid response from {path}: expected a list of records. No assignment download was confirmed.')
+        return data
+
     def _is_missing_record(self, status: int, data: object) -> bool:
         return status == 404 and "cannot get /api/" not in self._message(data, "").lower()
 
@@ -2233,20 +2248,14 @@ class BackendApiClient:
                 "status": status or "Scheduled",
             },
         )
-        if http_status >= 400 or http_status == 0:
-            raise self._request_failure(http_status, "/api/reading-schedules", data, "Backend reading schedule lookup failed.")
-        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        return self._response_rows(http_status, data, '/api/reading-schedules')
 
     def load_assignment_schedules(self, meter_reader_id, date_from, date_to) -> list[dict]:
         """Download every status in one request, including cancelled schedules."""
         status, data = self._req("GET", "/api/reading-schedules", query={
             "meter_reader_id": meter_reader_id, "date_from": date_from, "date_to": date_to,
         })
-        if status >= 400 or status == 0:
-            raise self._request_failure(status, "/api/reading-schedules", data, "Backend reading schedule lookup failed.")
-        if not isinstance(data, list):
-            raise RuntimeError("Backend reading schedule lookup did not return a list.")
-        return [row for row in data if isinstance(row, dict)]
+        return self._response_rows(status, data, '/api/reading-schedules')
 
     def load_assigned_consumers(
         self,
@@ -2265,13 +2274,8 @@ class BackendApiClient:
                 "date_to": date_to,
             },
         )
-        if status >= 400 or status == 0:
-            raise self._request_failure(status, "/api/handheld/consumers", data, "Backend assigned-consumer lookup failed.")
-        return [
-            _flatten_backend_bill_context(row)
-            for row in data
-            if isinstance(row, dict)
-        ] if isinstance(data, list) else []
+        return [_flatten_backend_bill_context(row)
+                for row in self._response_rows(status, data, '/api/handheld/consumers')]
 
     def get_consumer_context(self, consumer_id: int, *, include_today: bool = False) -> dict:
         options={'query':{'include_today':'1'}} if include_today else {}
@@ -2376,6 +2380,7 @@ class HandheldSyncDataAccess:
             "ready": 0, "reserved": 0, "skipped": 0, "failed": 0, "errors": [],
         }
         self.last_assignment_schedules: list[dict] | None = None
+        self.last_assignment_download: dict = {}
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
@@ -2597,6 +2602,12 @@ class HandheldSyncDataAccess:
             "local_bills": [bill],
         })
 
+    def prefetchCachedConsumerContexts(self, meter_reader_id: int | str, *, progress=None) -> dict:
+        """Refresh consumers previously assigned to this reader, including completed routes."""
+        loader = getattr(self.local, 'load_cached_consumers_for_reader', None)
+        consumers = loader(meter_reader_id) if callable(loader) else []
+        return self.prefetchAssignedConsumerContexts(consumers, progress=progress)
+
     def prefetchAssignedConsumerContexts(self, consumers: list[dict], *, progress=None) -> dict:
         """Cache detailed API records before an assignment is marked offline-ready."""
         result = {"requested": 0, "refreshed": 0, "failed": 0, "skipped": False}
@@ -2791,6 +2802,14 @@ class HandheldSyncDataAccess:
             date_from = date_from or default_from
             date_to = date_to or default_to
 
+        self.last_assignment_download = {
+            'reader_id': effective_reader_id, 'date_from': date_from, 'date_to': date_to,
+            'schedule_count': 0, 'consumer_count': 0, 'completed': False,
+        }
+        self.last_pre_reservation_result = {'ready': 0, 'reserved': 0, 'skipped': 0, 'failed': 0, 'errors': []}
+        if require_online and effective_reader_id in (None, ''):
+            raise PermissionError('A signed-in Meter Reader account is required to download assignments. Sign in online again.')
+
         if self.is_online():
             try:
                 schedules: list[dict] = []
@@ -2815,6 +2834,7 @@ class HandheldSyncDataAccess:
                     self.local.cache_reading_schedules(schedules, effective_reader_id, date_from, date_to)
                     self.reconcileScheduleReadings(schedules)
                 self.last_assignment_schedules = list(schedules)
+                self.last_assignment_download['schedule_count'] = len(schedules)
 
                 if progress:
                     progress("Downloading assigned consumers...")
@@ -2824,6 +2844,7 @@ class HandheldSyncDataAccess:
                     date_from,
                     date_to,
                 )
+                self.last_assignment_download.update(consumer_count=len(consumers), completed=True)
                 if consumers:
                     self.local.cache_consumers(consumers)
                     reservation_result = self.preReserveAssignedBills(
@@ -2834,6 +2855,7 @@ class HandheldSyncDataAccess:
                         "success",
                         "Loaded assigned consumers from Backend API",
                         {
+                            **self.last_assignment_download,
                             "count": len(consumers),
                             "schedule_count": len(schedules),
                             "offline_references_ready": reservation_result["ready"],
@@ -2846,7 +2868,7 @@ class HandheldSyncDataAccess:
                     "success" if require_online else "failed",
                     "Backend API returned no assigned consumers" if require_online else
                     "Backend API returned no assigned consumers; using local cache",
-                    {"schedule_count": len(schedules)},
+                    dict(self.last_assignment_download),
                 )
                 if require_online:
                     # An empty response is a completed download, not permission to

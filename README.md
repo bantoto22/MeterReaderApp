@@ -397,6 +397,20 @@ Settings and Diagnostics show whether the assignment download returned fresh
 backend data or failed while cached records remain in use. A reachable health
 endpoint does not hide a failed authenticated assignment download. Upload-only
 background work does not change the last assignment-download counts.
+An empty assignment response is shown as **No Assigned Consumers**, with the
+reader account, requested dates, and number of schedules returned. Cached
+records remain available; a successful request returning zero rows does not
+mean new assignments were downloaded. Manual and automatic sync still refresh
+the bill, payment, and reading details of cached consumers previously assigned
+to the signed-in reader. This refresh does not reopen a completed assignment or
+fetch another reader's cached consumers. The **Offline records** count reports
+these detail downloads separately from **Pulled** and **Mirrored** assignments.
+A schedule can have no assigned consumers
+when every active consumer in its zone already has a reading for that billing
+cycle. Clearing local Needs review entries does not erase office readings or
+make those consumers unread again. Check the schedule's assigned-consumer count
+and billing cycle in the main system. Unexpected API response formats are
+reported as download failures instead of silently becoming an empty list.
 If a download fails with automatic sync enabled, the running app retries after
 30 seconds, then 60, 120, and 240 seconds, capped at five minutes. A successful
 download restores the configured refresh interval. Backend recovery also triggers

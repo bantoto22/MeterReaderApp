@@ -139,6 +139,19 @@ class AssignmentRefreshTests(unittest.TestCase):
                             for schedule in route["schedules"]))
         self.assertEqual(view.alertRequested.emit.call_args.args[0], "Sync Complete")
 
+    def test_schedule_assigned_after_zero_result_is_downloaded_without_reopening(self):
+        view = self.view()
+        self.remote.schedule['start_date'] = '2027-02-01'
+        AppBridge.syncNow(view)
+        self.assertEqual(view.syncTaskFinished.emit.call_args.args[0]['pulled'], 0)
+        self.remote.schedule['start_date'] = '2026-11-18'
+        self.remote.schedule['due_date'] = '2026-11-21'
+        self.remote.schedule['billing_month'] = 'November 2026'
+        AppBridge.syncNow(view)
+        result = view.syncTaskFinished.emit.call_args.args[0]
+        self.assertEqual((result['pulled'], result['mirrored']), (1, 1))
+        self.assert_new_assignment_downloaded()
+
     def test_auto_pull_discovers_new_schedule_with_no_pending_uploads(self):
         self.assertEqual(self.dal.listPendingBackendReadings(), [])
         view = self.view()
@@ -250,6 +263,74 @@ class AssignmentRefreshTests(unittest.TestCase):
         self.assertEqual(result["pulled"], 0)
         self.assertNotIn("pull_error", result["result"])
         self.assertEqual(self.store.load_cached_consumers()[0]["schedule_id"], 101)
+        self.assertEqual(view.alertRequested.emit.call_args.args[0], 'No Assigned Consumers')
+        self.assertIn('Reader account: 12', view._assignment_download_summary)
+        self.assertIn('2026-11-07 to 2026-12-31', view._assignment_download_summary)
+        self.assertIn('No assigned consumers returned', view._assignment_download_status)
+        self.assertIn('cached', view.alertRequested.emit.call_args.args[1].lower())
+
+    def test_empty_download_reports_schedule_count_and_clears_old_reference_counts(self):
+        self.remote.load_assigned_consumers = lambda *args: []
+        self.dal.last_pre_reservation_result = {'ready': 50, 'failed': 2}
+        view = self.view()
+        AppBridge.syncNow(view)
+        self.assertIn('Assigned schedules: 1', view._assignment_download_summary)
+        self.assertEqual(view.syncTaskFinished.emit.call_args.args[0]['result']['offline_references_ready'], 0)
+        self.assertEqual(self.dal.last_assignment_download['consumer_count'], 0)
+        self.assertTrue(self.dal.last_assignment_download['completed'])
+
+    def test_empty_assignment_download_still_refreshes_cached_bill_and_payment_data(self):
+        self.remote.load_assigned_consumers = lambda *args: []
+        self.remote.get_consumer_context = Mock(return_value={
+            'id': 1, 'name': 'Updated consumer', 'bill': {
+                'bill_id': 85, 'sync_id': 'office-bill', 'status': 'Paid', 'amount_due': 0},
+            'payments': [{'payment_id': 11, 'amount': 200}],
+        })
+        # Cached consumers belonging to another reader must not be queried.
+        self.store.cache_reading_schedules([{
+            'schedule_id': 303, 'meter_reader_id': 99, 'zone_name': 'Zone 2',
+            'start_date': '2026-11-01', 'due_date': '2026-11-02', 'status': 'Completed',
+        }], 99, '2026-11-01', '2026-11-30')
+        self.store.cache_consumers([{'id': 2, 'meter_no': 'MTR-2', 'name': 'Other reader consumer',
+                                    'zone_name': 'Zone 2', 'schedule_id': 303}])
+        view = self.view()
+        for automatic in (False, True):
+            self.remote.get_consumer_context.reset_mock()
+            if automatic:
+                AppBridge._run_auto_pull(view)
+                result = view.assignedDatasetFinished.emit.call_args.args[0]
+            else:
+                AppBridge.syncNow(view)
+                result = view.syncTaskFinished.emit.call_args.args[0]
+            self.assertEqual((result['pulled'], result['mirrored']), (0, 0))
+            self.assertEqual(result['context_pull']['refreshed'], 1)
+            self.remote.get_consumer_context.assert_called_once_with(1)
+            context = self.store.load_cached_consumer_context(1)
+            self.assertEqual(context['bill']['status'], 'Paid')
+            self.assertEqual(context['payments'][0]['payment_id'], 11)
+            self.assertEqual(self.store.load_cached_consumer_context(2), {})
+            self.assertEqual(self.dal.listPendingSyncReadings(), [])
+
+    def test_sync_summary_keeps_its_request_scope_during_later_background_work(self):
+        view = self.view()
+
+        def prefetch(*args, **kwargs):
+            self.dal.last_assignment_download = {'completed': True, 'reader_id': 99,
+                'date_from': '2027-01-01', 'date_to': '2027-01-31', 'schedule_count': 9}
+            return {}
+
+        with patch.object(self.dal, 'prefetchAssignedConsumerContexts', side_effect=prefetch):
+            AppBridge.syncNow(view)
+        self.assertIn('Reader account: 12', view._assignment_download_summary)
+        self.assertNotIn('Reader account: 99', view._assignment_download_summary)
+
+    def test_explicit_download_without_reader_is_rejected_instead_of_requesting_all_accounts(self):
+        view = self.view()
+        view._meter_reader_account_id = ''
+        AppBridge.syncNow(view)
+        self.assertEqual(view.alertRequested.emit.call_args.args[0], 'Sync Finished with Problems')
+        self.assertIn('signed-in Meter Reader', view.syncTaskFinished.emit.call_args.args[0]['result']['pull_error'])
+        self.assertEqual(self.remote.windows, [])
 
     def test_download_failure_stays_visible_when_backend_health_is_online(self):
         self.remote.consumer_error = "HTTP 401 /api/handheld/consumers: session expired"

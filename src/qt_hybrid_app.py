@@ -319,7 +319,7 @@ def _mirror_assigned_consumer_rows(sync_dal, consumers: list[dict]) -> tuple[int
     return mirrored, report
 
 
-def _summarize_assignment_download(consumers: list[dict], mirror_report: dict | None = None) -> str:
+def _summarize_assignment_download(consumers: list[dict], mirror_report: dict | None = None, download: dict | None = None) -> str:
     consumer_ids: set[str] = set()
     schedule_ids: set[str] = set()
     assignments: set[tuple[str, str]] = set()
@@ -345,6 +345,13 @@ def _summarize_assignment_download(consumers: list[dict], mirror_report: dict | 
         if reasons:
             summary += " | " + " | ".join(f"{reason}: {count}" for reason, count in reasons.items())
             summary += "\nCheck meter assignments in the main system for the skipped records."
+    if isinstance(download, dict) and download.get('completed'):
+        summary += (f"\nReader account: {download.get('reader_id')} | "
+                    f"Dates: {download.get('date_from')} to {download.get('date_to')}"
+                    f"\nAssigned schedules: {download.get('schedule_count', 0)}")
+        if not consumers:
+            summary += ('\nNo assigned consumers were returned for this reader and date range. '
+                        'Cached records remain on this device. Check the reader and active assignments in the main system.')
     return summary
 
 
@@ -1265,16 +1272,19 @@ class AppBridge(QObject):
                         require_online=True,
                     )
                     mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
+                    download_summary = _summarize_assignment_download(
+                        consumers, mirror_report, getattr(self._sync_dal, 'last_assignment_download', None))
                 pulled_zones = sorted({
                     str(item.get("zone_name") or "").strip()
                     for item in consumers if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
                 })
-                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers)
+                context_pull = (self._sync_dal.prefetchAssignedConsumerContexts(consumers) if consumers else
+                                self._sync_dal.prefetchCachedConsumerContexts(self._meter_reader_account_id))
                 self.assignedDatasetFinished.emit({
                     "success": True, "pulled": len(consumers), "mirrored": mirrored,
                     "zone": zone_name, "pulled_zones": pulled_zones,
                     "context_pull": context_pull,
-                    "download_summary": _summarize_assignment_download(consumers, mirror_report),
+                    "download_summary": download_summary,
                     "skipped_records": mirror_report["skipped"],
                 })
             except Exception as exc:
@@ -2048,6 +2058,8 @@ class AppBridge(QObject):
                     )
                     schedule_count = self._mirror_assigned_schedules(date_from, date_to)
                     mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
+                    download_summary = _summarize_assignment_download(
+                        consumers, mirror_report, getattr(self._sync_dal, 'last_assignment_download', None))
                 pulled_zones = sorted(
                     {
                         str(item.get("zone_name") or "").strip()
@@ -2055,7 +2067,8 @@ class AppBridge(QObject):
                         if isinstance(item, dict) and str(item.get("zone_name") or "").strip()
                     }
                 )
-                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers)
+                context_pull = (self._sync_dal.prefetchAssignedConsumerContexts(consumers) if consumers else
+                                self._sync_dal.prefetchCachedConsumerContexts(self._meter_reader_account_id))
                 self.assignedDatasetFinished.emit(
                     {
                         "success": True,
@@ -2064,7 +2077,7 @@ class AppBridge(QObject):
                         "schedules": schedule_count,
                         "pulled_zones": pulled_zones,
                         "context_pull": context_pull,
-                        "download_summary": _summarize_assignment_download(consumers, mirror_report),
+                        "download_summary": download_summary,
                         "skipped_records": mirror_report["skipped"],
                     }
                 )
@@ -2112,7 +2125,10 @@ class AppBridge(QObject):
             self.syncLogsChanged.emit()
             self._assignment_retry_count = getattr(self, "_assignment_retry_count", 0) + 1
         else:
-            self._assignment_download_status = "Fresh backend data"
+            self._assignment_download_status = (
+                "Fresh backend data" if result.get('pulled') else
+                "No assigned consumers returned; cached records retained"
+            )
             if result.get("skipped_records"):
                 self._assignment_download_status += f"; {result['skipped_records']} rows skipped"
             self._assignment_download_error = ""
@@ -2332,7 +2348,11 @@ class AppBridge(QObject):
             self._assignment_retry_count = (
                 getattr(self, "_assignment_retry_count", 0) + 1 if self._assignment_download_error else 0
             )
-            self._assignment_download_status = "Download failed; using cached records" if self._assignment_download_error else "Fresh backend data"
+            self._assignment_download_status = (
+                "Download failed; using cached records" if self._assignment_download_error else
+                "Fresh backend data" if result.get('pulled') else
+                "No assigned consumers returned; cached records retained"
+            )
             skipped_records = int((result.get("result") or {}).get("skipped_records", 0))
             if not self._assignment_download_error and skipped_records:
                 self._assignment_download_status += f"; {skipped_records} rows skipped"
@@ -2376,7 +2396,8 @@ class AppBridge(QObject):
                 or context_result.get("failed") or context_result.get("skipped")
             )
             self.alertRequested.emit(
-                "Sync Finished with Problems" if has_problems else "Sync Complete",
+                "Sync Finished with Problems" if has_problems else
+                "No Assigned Consumers" if 'pulled' in result and not result['pulled'] else "Sync Complete",
                 f"Synced: {sync_result.get('synced', 0)}\nFailed: {sync_result.get('failed', 0)}\nConflicts: {sync_result.get('conflicts', 0)}{review_line}{pull_line}{reference_line}{context_line}{error_line}{first_error_line}",
             )
 
@@ -3327,6 +3348,8 @@ class AppBridge(QObject):
                                   "conflicts": 0, "errors": [diagnostic]}
                     pulled = 0
                     mirrored = 0
+                    consumers = []
+                    download_summary = ''
                     mirror_report: dict = {}
                     try:
                         stage = "Downloading assigned schedules and consumers"
@@ -3351,6 +3374,8 @@ class AppBridge(QObject):
                         stage = "Updating the device consumer cache"
                         report_progress(stage)
                         mirrored, mirror_report = _mirror_assigned_consumer_rows(self._sync_dal, consumers)
+                        download_summary = _summarize_assignment_download(
+                            consumers, mirror_report, getattr(self._sync_dal, 'last_assignment_download', None))
                         result = {**result, "skipped_records": mirror_report["skipped"]}
                     except Exception as pull_exc:
                         self._sync_dal._audit(None, "failed", format_sync_error(stage, pull_exc, self._backend_endpoint))
@@ -3358,11 +3383,15 @@ class AppBridge(QObject):
                             **result,
                             "pull_error": format_sync_error(stage, pull_exc, self._backend_endpoint),
                         }
-                context_pull = self._sync_dal.prefetchAssignedConsumerContexts(consumers, progress=report_progress) if pulled else {}
+                context_pull = {}
+                if not result.get('pull_error'):
+                    context_pull = (self._sync_dal.prefetchAssignedConsumerContexts(consumers, progress=report_progress)
+                                    if consumers else self._sync_dal.prefetchCachedConsumerContexts(
+                                        self._meter_reader_account_id, progress=report_progress))
                 self.syncTaskFinished.emit({
                     "kind": "sync", "result": result, "pulled": pulled,
                     "mirrored": mirrored, "context_pull": context_pull,
-                    "download_summary": _summarize_assignment_download(consumers, mirror_report) if pulled else "",
+                    "download_summary": download_summary if not result.get('pull_error') else "",
                 })
             except Exception as exc:
                 self.syncTaskFinished.emit(

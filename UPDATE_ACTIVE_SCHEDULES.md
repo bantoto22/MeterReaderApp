@@ -1,10 +1,19 @@
-# Meter issue, active schedule and sync update - November 16, 2026
+# Meter issue, active schedule and sync update - November 18, 2026
 
 Install this update together with the matching San Lorenzo backend changes.
 Close the device app, copy the supplied files into its MeterReaderApp folder,
 and reopen the app. Keep the existing `.env`, SQLite database, and data folder.
 
-The current package is `updates/MeterReaderApp-sync-recovery-2026-11-16.zip`.
+The current package is `updates/MeterReaderApp-empty-sync-reporting-2026-11-18.zip`.
+This includes the previous sync recovery changes and clearer empty-download
+results. **No Assigned Consumers** means the backend returned no consumer rows
+for the displayed reader and dates. Check the schedule's assigned count and
+billing cycle in the main system. A new schedule for a consumer already read in
+that billing cycle has no new reading work; local review cleanup does not clear
+the office reading. A malformed backend response must show a download error.
+With no new assignments, sync still refreshes cached consumer details for the
+signed-in reader. Verify a changed office bill/payment appears in the cached
+details and **Offline records** shows a download even when **Pulled** is zero.
 After installing, check recovery without restarting the app:
 
 - With automatic sync enabled, interrupt connectivity during a download and
