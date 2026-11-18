@@ -374,6 +374,11 @@ remaining readings to sync. No manual review is needed for those duplicates.
 Their original payloads and references remain in **Settings -> Review history ->
 History**; reserved references are retained and never reused. The meter baseline
 is refreshed before archiving, without replacing newer unsynced field readings.
+An old missing-opening-reading hold can also be archived after the office saves
+the full first bill: sync verifies the account, billing cycle, original meter,
+zero office previous reading, and matching present reading/consumption. The
+unknown original previous value remains unchanged in History. A saved opening
+baseline alone still allows the original device entry to upload normally.
 An unavailable or changed office record remains saved until it can be verified.
 Other review reasons remain visible. **Restore to review** retains an archived
 entry for office follow-up without retrying its upload or auto-archiving it again.

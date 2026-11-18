@@ -4,10 +4,16 @@ Install this update together with the matching San Lorenzo backend changes.
 Close the device app, copy the supplied files into its MeterReaderApp folder,
 and reopen the app. Keep the existing `.env`, SQLite database, and data folder.
 
-The current package is `updates/MeterReaderApp-first-reading-sync-fix-2026-11-18.zip`.
+Update the Pi from this Git repository after the source changes are committed
+and pushed. Close the app during the update and preserve its local database.
 It also recovers a held first reading after the office verifies its missing zero
 baseline, preserving the saved reading and its exact reserved reference. See
 `FIRST_READING_RECOVERY.md` for the office and device checks.
+If the office saved the full first bill instead, sync can now verify that bill
+against the held device capture and archive the extra device entry. Matching
+account, billing cycle, original meter, zero previous reading and matching
+present reading/consumption are required. The office bill stays unchanged;
+the device evidence and its reserved reference remain in Review history.
 This includes the previous sync recovery changes and clearer empty-download
 results. **No Assigned Consumers** means the backend returned no consumer rows
 for the displayed reader and dates. Check the schedule's assigned count and

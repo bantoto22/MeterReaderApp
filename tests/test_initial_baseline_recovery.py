@@ -107,6 +107,71 @@ class InitialBaselineRecoveryTests(unittest.TestCase):
         self.assertIsNone(self.store.list_needs_review()[0]['payload']['previous_reading'])
         self.remote.save_reading_bundle.assert_not_called()
 
+    def office_bill(self):
+        saved = {'reading_id': 90, 'consumer_id': 7, 'schedule_id': 100,
+            'reading_date': '2026-11-18', 'updated_at': '2026-11-18T12:30:00',
+            'previous_reading': '0.00', 'present_reading': '23.00', 'consumption': '23.00',
+            'reading_status': 'Recorded', 'sync_status': 'synced', 'sync_id': 'office-reading',
+            'billing_cycle': '2026-11', 'bill': {'bill_id': 93, 'sync_id': 'office-bill',
+                'billing_reference': 'SLR2026001056', 'bill_month': '2026-11', 'status': 'Unpaid'}}
+        self.remote.find_existing_reading.return_value = saved
+        self.remote.get_consumer_context.return_value = {**self.coverage, 'previous_reading': 23,
+            'coverage_source': 'historical_reading', 'latest_reading': 23, 'latest_reading_date': '2026-11-18'}
+        return saved
+
+    def test_office_created_first_bill_archives_old_baseline_hold_and_retains_original_evidence(self):
+        saved = self.office_bill()
+        with self.store._connect() as conn:
+            original = conn.execute('SELECT payload FROM sync_queue_meter_readings WHERE id=?', (self.queue['id'],)).fetchone()[0]
+        result = self.dal.syncPendingReadings()
+        self.assertEqual((result['ignored_duplicates'], result['needs_review'], result['synced']), (1, 0, 0))
+        self.remote.save_reading_bundle.assert_not_called()
+        archived = self.store.list_archived_reviews()[0]
+        self.assertIsNone(archived['payload']['previous_reading'])
+        self.assertEqual(archived['payload']['billing_reference'], 'SLR2026000999')
+        self.assertEqual(archived['review_server_record']['reference'], saved['bill']['billing_reference'])
+        self.assertEqual(archived['review_server_record']['reading_id'], 90)
+        with self.store._connect() as conn:
+            self.assertEqual(conn.execute('SELECT payload FROM sync_queue_meter_readings WHERE id=?', (self.queue['id'],)).fetchone()[0], original)
+            self.assertEqual(conn.execute('SELECT previous_reading FROM consumers WHERE id=7').fetchone()[0], 23)
+            reservation = conn.execute('SELECT status,billing_reference FROM local_billing_reference_reservations').fetchone()
+            self.assertEqual((reservation['status'], reservation['billing_reference']), ('Reserved', 'SLR2026000999'))
+        self.assertEqual(self.dal.syncPendingReadings()['needs_review'], 0)
+        self.assertEqual(len(self.store.list_archived_reviews()), 1)
+
+    def test_office_first_bill_requires_same_consumer_cycle_values_and_active_bill(self):
+        for change in ({'consumer_id': 8}, {'billing_cycle': '2026-10'}, {'previous_reading': 2},
+                       {'present_reading': 24}, {'consumption': 24}, {'bill': None},
+                       {'bill': {'bill_id': 93, 'bill_month': '2026-10', 'status': 'Unpaid'}},
+                       {'bill': {'bill_id': 93, 'bill_month': '2026-11', 'status': 'Cancelled'}},
+                       {'reading_status': 'Rejected'}):
+            with self.subTest(change=change):
+                saved = self.office_bill()
+                saved.update(change)
+                result = self.dal.syncPendingReadings()
+                self.assertEqual((result['ignored_duplicates'], result['needs_review']), (0, 1))
+                self.assertEqual(self.store.list_archived_reviews(), [])
+                self.remote.save_reading_bundle.assert_not_called()
+
+    def test_office_first_bill_requires_original_reader_and_meter_and_fresh_verification(self):
+        self.office_bill()
+        self.remote._meter_reader_id = 3
+        self.assertEqual(self.dal.syncPendingReadings()['needs_review'], 1)
+        self.remote._meter_reader_id = 2
+        self.remote.get_consumer_context.return_value['meter_no'] = 'OTHER-METER'
+        self.assertEqual(self.dal.syncPendingReadings()['needs_review'], 1)
+        self.office_bill()
+        self.remote.find_existing_reading.side_effect = [self.remote.find_existing_reading.return_value, None]
+        self.assertEqual(self.dal.syncPendingReadings()['needs_review'], 1)
+        self.assertEqual(self.store.list_archived_reviews(), [])
+
+    def test_restored_history_stays_in_review_instead_of_being_archived_again(self):
+        self.office_bill()
+        self.dal.syncPendingReadings()
+        self.dal.restoreReviewEntry(self.queue['id'])
+        self.assertEqual(self.dal.syncPendingReadings()['needs_review'], 1)
+        self.remote.save_reading_bundle.assert_not_called()
+
     def test_changed_saved_payload_requires_another_verification(self):
         row = self.store.list_initial_baseline_holds()[0]
         with self.store._connect() as conn:

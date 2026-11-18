@@ -25,11 +25,12 @@ def _number(value):
 
 
 class ReviewQueue:
-    def __init__(self,local,remote,is_duplicate,is_issue,audit,update_state,refresh_baseline):
+    def __init__(self,local,remote,is_duplicate,is_issue,audit,update_state,refresh_baseline,is_initial_baseline=None):
         self.local,self.remote=local,remote
         self.is_duplicate,self.is_issue=is_duplicate,is_issue
         self.audit,self.update_state=audit,update_state
         self.refresh_baseline=refresh_baseline
+        self.is_initial_baseline=is_initial_baseline
         self.checked={}
 
     def entries(self,archived=False):
@@ -57,7 +58,9 @@ class ReviewQueue:
         if not row:raise ValueError('This entry is no longer in Needs review. Refresh the list.')
         payload=row['payload']
         reason=str(row.get('last_error') or row.get('conflict_reason') or '')
-        if self.is_issue(payload) or not self.is_duplicate(reason):
+        baseline_hold=bool(self.is_initial_baseline and self.is_initial_baseline(reason)
+                           and payload.get('previous_reading') in (None,''))
+        if self.is_issue(payload) or not (self.is_duplicate(reason) or baseline_hold):
             raise ValueError('This is not a confirmed duplicate. Keep it saved for office review.')
         current_reader=getattr(self.remote,'_meter_reader_id',None)
         if isinstance(current_reader,int) and str(payload.get('meter_reader_id'))!=str(current_reader):
@@ -67,7 +70,7 @@ class ReviewQueue:
         reason_month=re.search(r'\b(\d{4}-(?:0[1-9]|1[0-2]))\b',reason)
         cycle=(reason_month.group(1) if reason_month else '') or _month(payload.get('billing_cycle')) or _month(payload.get('reading_date'))
         if not cycle:raise ValueError('The billing month is missing. Keep this entry for office review.')
-        bill_duplicate='already has a bill for' in reason.lower()
+        bill_duplicate='already has a bill for' in reason.lower() or baseline_hold
         saved=self.remote.find_existing_reading(payload['consumer_id'],payload['reading_date'],billing_cycle=cycle,include_bill_month=bill_duplicate)
         if not isinstance(saved,dict) or not saved.get('reading_id'):
             raise ValueError('No matching office reading was found. This entry remains saved for review.')
@@ -89,7 +92,21 @@ class ReviewQueue:
             'consumption':_number(saved.get('consumption')),'updated_at':str(saved.get('updated_at') or ''),
             'bill_id':bill.get('bill_id'),'bill_sync_id':str(bill.get('sync_id') or ''),
             'reference':str(bill.get('billing_reference') or 'No bill issued')}
-        differs=str(payload.get('reading_date'))[:10]!=office['reading_date'] or any(left!=right for left,right in (
+        if baseline_hold:
+            # An office-created first bill can supersede a held capture whose
+            # previous value was unknown. Keep the unknown value in History;
+            # require matching values before retiring this case. The billing
+            # cycle was verified above; capture dates may differ from bill dates.
+            if (not bill.get('status') or str(bill['status']).strip().lower() in {'cancelled','canceled','void','voided','rejected'}
+                    or office['previous']!='0'
+                    or _number(payload.get('present_reading',payload.get('current_reading')))!=office['present']
+                    or _number(payload.get('consumption'))!=office['consumption']):
+                raise ValueError('The office bill differs from the held first reading. Keep this entry for office review.')
+            context=self.remote.get_consumer_context(payload['consumer_id'],include_today=True)
+            if (not isinstance(context,dict) or str(context.get('id',context.get('consumer_id')))!=str(payload['consumer_id'])
+                    or not payload.get('meter_no') or str(context.get('meter_no'))!=str(payload['meter_no'])):
+                raise ValueError('The original meter could not be confirmed. Keep this entry for office review.')
+        differs=baseline_hold or str(payload.get('reading_date'))[:10]!=office['reading_date'] or any(left!=right for left,right in (
             (_number(payload.get('previous_reading')),office['previous']),
             (_number(payload.get('present_reading',payload.get('current_reading'))),office['present']),
             (_number(payload.get('consumption')),office['consumption'])))

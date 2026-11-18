@@ -2426,7 +2426,7 @@ class HandheldSyncDataAccess:
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.local.ensure_schema()
-        self._review_queue=ReviewQueue(self.local,self.remote,_duplicate_reading_message,_is_meter_issue_report,self._audit,_update_local_reading_state,self._refresh_review_baseline)
+        self._review_queue=ReviewQueue(self.local,self.remote,_duplicate_reading_message,_is_meter_issue_report,self._audit,_update_local_reading_state,self._refresh_review_baseline,_initial_baseline_message)
         self.reconcileScheduleReadings()
 
     def _endpoint(self) -> str:
@@ -2504,7 +2504,9 @@ class HandheldSyncDataAccess:
         """Keep the existing office record and retire only its extra device entry."""
         row=next((row for row in self.listReviewReadings() if row['id']==queue_id),None)
         if (not row or row.get('review_resolution')=='Restored to review'
-                or not _duplicate_reading_message(row.get('last_error') or row.get('conflict_reason'))
+                or not (_duplicate_reading_message(row.get('last_error') or row.get('conflict_reason'))
+                        or (_initial_baseline_message(row.get('last_error') or row.get('conflict_reason'))
+                            and row['payload'].get('previous_reading') in (None,'')))
                 or _is_meter_issue_report(row['payload'])):
             return None
         try:
@@ -3285,8 +3287,12 @@ class HandheldSyncDataAccess:
                     "needs_review": len(self.listReviewReadings())}
         ignored=0
         for row in baseline_holds:
-            if not self._resume_verified_initial_reading(row) and row['backend_status'] == 'conflict':
+            if row['backend_status'] == 'conflict':
                 self._hold_reading_for_review(row['id'], row['payload'], row.get('conflict_reason') or row.get('last_error'))
+            if self._ignore_confirmed_duplicate(row['id']):
+                ignored+=1
+                continue
+            self._resume_verified_initial_reading(row)
         for row in duplicate_reviews:
             if self._ignore_confirmed_duplicate(row['id']):ignored+=1
         pending = self.listPendingSyncReadings()
