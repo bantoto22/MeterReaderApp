@@ -52,6 +52,35 @@ class ActiveScheduleSyncTests(unittest.TestCase):
         database.replace_reading_schedules_from_sync([schedule], 2, today, today)
         self.assertEqual(_group_route_rows(database.get_assigned_routes(2))[0]['billingMonth'], cycle)
 
+    def test_zero_assignments_hide_a_cached_zone_until_work_becomes_available(self):
+        start = self.payload['reading_date']
+        header = {'Schedule_ID': 100, 'Start_Date': start, 'Zone_Name': 'Zone 1',
+                  'Meter_Reader_ID': 2, 'Status': 'Scheduled'}
+        self.store.cache_reading_schedules([header], 2, start, start)
+        database.replace_consumers_from_sync([{
+            'id': self.payload['consumer_id'], 'meter_no': 'MTR-7', 'acct_no': '01-11-007-0',
+            'name': 'Test consumer', 'zone_name': 'Zone 1', 'schedule_id': 100, 'is_read': False,
+        }])
+        self.dal.queueMeterReading(dict(self.payload))
+        queued = self.dal.listPendingSyncReadings()[0]['payload']
+
+        for mirror in (self.store.cache_reading_schedules, database.replace_reading_schedules_from_sync):
+            with self.subTest(mirror=mirror.__name__):
+                self.assertEqual(database.get_assigned_routes(2)[0]['unread_count'], 1)
+                mirror([{**header, 'Assigned_Consumers': 0}], 2, start, start)
+                self.assertEqual(database.get_assigned_routes(2), [])
+                with self.store._connect() as conn:
+                    stored = conn.execute('SELECT status, assigned_consumer_count FROM reading_schedule').fetchone()
+                    self.assertEqual(tuple(stored), ('Scheduled', 0))
+                    self.assertEqual(conn.execute('SELECT COUNT(*) FROM reading_assignment').fetchone()[0], 1)
+                self.dal.reconcileScheduleReadings([header])
+                self.assertEqual(self.dal.listPendingSyncReadings()[0]['payload'], queued)
+                mirror([{**header, 'Assigned_Consumers': 1}], 2, start, start)
+                self.assertEqual(database.get_assigned_routes(2)[0]['schedule_id'], 100)
+                mirror([{**header, 'Assigned_Consumers': 0}], 2, start, start)
+                mirror([header], 2, start, start)
+                self.assertEqual(database.get_assigned_routes(2)[0]['schedule_id'], 100)
+
     def test_duplicate_is_retained_once_for_review_without_blocking_normal_readings(self):
         self.dal.queueMeterReading(dict(self.payload))
         normal = {**self.payload, 'consumer_id': 8, 'reading_id': 'normal-reading', 'bill_sync_id': 'normal-bill'}

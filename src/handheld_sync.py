@@ -1132,6 +1132,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             meter_reader_name TEXT,
             meter_reader_contact TEXT,
             status TEXT NOT NULL DEFAULT 'Scheduled',
+            assigned_consumer_count INTEGER,
             cached_consumer_count INTEGER NOT NULL DEFAULT 0,
             cache_verified_at TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -1228,6 +1229,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                     "meter_reader_name": "TEXT",
                     "meter_reader_contact": "TEXT",
                     "status": "TEXT NOT NULL DEFAULT 'Scheduled'",
+                    "assigned_consumer_count": "INTEGER",
                     "cached_consumer_count": "INTEGER NOT NULL DEFAULT 0",
                     "cache_verified_at": "TEXT",
                     "updated_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
@@ -1250,9 +1252,9 @@ class SQLiteLocalSyncStore(LocalSyncStore):
         INSERT INTO reading_schedule (
             schedule_id, schedule_date, start_date, due_date, payment_due_date, billing_month,
             remote_zone_id, zone_name, meter_reader_id,
-            meter_reader_name, meter_reader_contact, status, updated_at
+            meter_reader_name, meter_reader_contact, status, assigned_consumer_count, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(schedule_id) DO UPDATE SET
             schedule_date = excluded.schedule_date,
             start_date = excluded.start_date,
@@ -1265,6 +1267,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             meter_reader_name = excluded.meter_reader_name,
             meter_reader_contact = excluded.meter_reader_contact,
             status = excluded.status,
+            assigned_consumer_count = excluded.assigned_consumer_count,
             updated_at = CURRENT_TIMESTAMP
         """
         with self._connect() as conn:
@@ -1309,6 +1312,7 @@ class SQLiteLocalSyncStore(LocalSyncStore):
                         item.get("Meter_Reader_Name", item.get("meter_reader_name")),
                         item.get("Meter_Reader_Contact", item.get("meter_reader_contact")),
                         item.get("Status", item.get("status")) or "Scheduled",
+                        item.get("Assigned_Consumers", item.get("assigned_consumers")),
                     ),
                 )
             conn.commit()

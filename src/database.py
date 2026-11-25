@@ -219,6 +219,7 @@ def _initialize_database(conn):
             meter_reader_name TEXT,
             meter_reader_contact TEXT,
             status TEXT NOT NULL DEFAULT 'Scheduled',
+            assigned_consumer_count INTEGER,
             cached_consumer_count INTEGER NOT NULL DEFAULT 0,
             cache_verified_at TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -340,6 +341,7 @@ def _initialize_database(conn):
             "meter_reader_name": "TEXT",
             "meter_reader_contact": "TEXT",
             "status": "TEXT",
+            "assigned_consumer_count": "INTEGER",
             "cached_consumer_count": "INTEGER NOT NULL DEFAULT 0",
             "cache_verified_at": "TEXT",
             "updated_at": "DATETIME DEFAULT CURRENT_TIMESTAMP",
@@ -802,9 +804,9 @@ def replace_reading_schedules_from_sync(
             INSERT INTO reading_schedule (
                 schedule_id, schedule_date, start_date, due_date, payment_due_date, billing_month,
                 remote_zone_id, zone_name, meter_reader_id,
-                meter_reader_name, meter_reader_contact, status, updated_at
+                meter_reader_name, meter_reader_contact, status, assigned_consumer_count, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(schedule_id) DO UPDATE SET
                 schedule_date = excluded.schedule_date,
                 start_date = excluded.start_date,
@@ -817,6 +819,7 @@ def replace_reading_schedules_from_sync(
                 meter_reader_name = excluded.meter_reader_name,
                 meter_reader_contact = excluded.meter_reader_contact,
                 status = excluded.status,
+                assigned_consumer_count = excluded.assigned_consumer_count,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -832,6 +835,7 @@ def replace_reading_schedules_from_sync(
                 meter_reader_name,
                 meter_reader_contact,
                 status,
+                row.get("Assigned_Consumers", row.get("assigned_consumers")),
             ),
         )
         upserted += 1
@@ -850,6 +854,7 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
     if reader_id is None:
         return []
     conn = get_connection()
+    # A missing count preserves route visibility for older backend responses.
     rows = conn.execute(
         """
         SELECT schedule_id,
@@ -878,6 +883,7 @@ def get_assigned_routes(meter_reader_id: int | str | None) -> list[dict]:
         FROM reading_schedule
         WHERE meter_reader_id = ?
           AND lower(status) <> 'cancelled'
+          AND (assigned_consumer_count IS NULL OR assigned_consumer_count > 0)
           AND (
               lower(status) <> 'completed'
               OR EXISTS (
