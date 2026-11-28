@@ -1542,7 +1542,7 @@ class HandheldSyncTests(unittest.TestCase):
             apply_authoritative_bill(context, bill), 0, 1, "None",
             reading_date=reading["reading_date"],
         )
-        self.assertIn("Previous       : PHP    40.00", receipt)
+        self.assertIn("Unpaid Bills   : PHP    40.00", receipt)
         self.assertIn("Prev Pen(10%)  : PHP     4.00", receipt)
         self.assertIn("TOTAL DUE      : PHP    84.00", receipt)
         self.assertIn("AFTER DUE      : PHP    88.00", receipt)
@@ -1770,6 +1770,44 @@ class HandheldSyncTests(unittest.TestCase):
         self.assertEqual(payload["previous_penalty"], 5.0)
         self.assertEqual(payload["amount_due"], 88.0)
 
+    def test_downloaded_unpaid_bills_use_remaining_amounts_and_each_due_date(self):
+        context = {
+            "minimum_cubic": 6, "minimum_rate": 120, "excess_rate_per_cubic": 20,
+            "amount_due": 100, "bill_status": "Unpaid",
+            "unpaid_bills_as_of": "2026-11-28",
+            "unpaid_bills": [
+                {"original_amount": 60, "bill_due_date": "2026-08-30", "penalty_after_due": 6},
+                {"original_amount": 60, "bill_due_date": "2026-09-17", "penalty_after_due": 6},
+                {"original_amount": 100, "bill_due_date": "2026-09-17", "penalty_after_due": 10},
+            ],
+        }
+        reading = {"bill_sync_id": "current", "reading_date": "2026-11-28",
+                   "consumption": 6, "present_reading": 21}
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 11, 28))
+        self.assertEqual((bill["previous_balance"], bill["previous_penalty"]), (220, 22))
+        self.assertEqual((bill["amount_due"], bill["total_after_due_date"]), (362, 374))
+
+        context["unpaid_bills"] = [
+            {"original_amount": 0, "bill_due_date": "2026-11-28", "penalty_after_due": 2},
+        ]
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 11, 28))
+        self.assertEqual((bill["previous_balance"], bill["previous_penalty"]), (0, 0))
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 11, 29))
+        self.assertEqual((bill["previous_balance"], bill["previous_penalty"]), (0, 2))
+
+        context["unpaid_bills"] = []
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 11, 29))
+        self.assertEqual(bill["previous_balance"], 0)
+
+        previous_local_bill = {
+            "sync_id": "offline", "bill_date": "2026-10-28", "due_date": "2026-11-12",
+            "water_charge": 50, "amount_due": 292, "total_after_due_date": 297,
+        }
+        context.update(local_bill=previous_local_bill, local_bills=[previous_local_bill],
+                       pending_bill_ids=["offline"])
+        bill = _build_bill_payload(reading, context, 0, as_of_date=date(2026, 11, 29))
+        self.assertEqual((bill["previous_balance"], bill["previous_penalty"]), (50, 5))
+
     def test_empty_unpaid_list_falls_back_and_displays_previous_penalty_separately(self):
         payload = _build_bill_payload(
             {
@@ -1826,7 +1864,6 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    10.00", text)
-        self.assertIn("Prev Bill      : None", text)
         self.assertIn("Bill Month     : July 2026", text)
         self.assertIn("Coverage       : N/A to", text)
         self.assertIn("TOTAL DUE      : PHP    10.00", text)
@@ -1897,9 +1934,8 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    10.00", text)
-        self.assertIn("Previous       : PHP    50.00", text)
+        self.assertIn("Unpaid Bills   : PHP    50.00", text)
         self.assertIn("Prev Pen(10%)  : PHP     5.00", text)
-        self.assertIn("Prev Bill      : PHP 50.00", text)
         self.assertIn("TOTAL DUE      : PHP    65.00", text)
         self.assertIn("AFTER DUE      : PHP    66.00", text)
 
@@ -1932,7 +1968,7 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    10.00", text)
-        self.assertIn("Previous       : PHP     0.00", text)
+        self.assertIn("Unpaid Bills   : PHP     0.00", text)
         self.assertIn("Prev Pen(10%)  : PHP     0.00", text)
         self.assertIn("TOTAL DUE      : PHP    10.00", text)
         self.assertIn("AFTER DUE      : PHP    11.00", text)
@@ -1966,7 +2002,7 @@ class HandheldSyncTests(unittest.TestCase):
 
         current_line = "Current Bill   : PHP    40.00"
         due_penalty_line = "Due Pen(10%)   : PHP     4.00"
-        previous_line = "Previous       : PHP   360.00"
+        previous_line = "Unpaid Bills   : PHP   360.00"
         previous_penalty_line = "Prev Pen(10%)  : PHP    36.00"
 
         self.assertIn(current_line, text)
@@ -2008,7 +2044,7 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    30.00", text)
-        self.assertIn("Previous       : PHP   132.00", text)
+        self.assertIn("Unpaid Bills   : PHP   132.00", text)
         self.assertIn("Prev Pen(10%)  : PHP    13.20", text)
         self.assertIn("TOTAL DUE      : PHP   175.20", text)
         self.assertIn("AFTER DUE      : PHP   178.20", text)
@@ -2073,7 +2109,7 @@ class HandheldSyncTests(unittest.TestCase):
         )
 
         self.assertIn("Current Bill   : PHP    40.00", text)
-        self.assertIn("Previous       : PHP    42.00", text)
+        self.assertIn("Unpaid Bills   : PHP    42.00", text)
         self.assertIn("Prev Pen(10%)  : PHP     4.20", text)
         self.assertIn("TOTAL DUE      : PHP    86.20", text)
         self.assertIn("AFTER DUE      : PHP    86.20", text)

@@ -46,7 +46,8 @@ class ReceiptCoverageTests(unittest.TestCase):
                 "due_date": "2026-10-12",
             }), 5, 7, "None", "Juan Dela Cruz", reading_date="2026-09-17",
         )
-        for label in ("Coverage", "Current Bill", "Previous", "TOTAL DUE", "AFTER DUE", "Due Date", "Reading Date"):
+        for label in ("Coverage", "Current Bill", "Prev Reading", "Unpaid Bills",
+                      "TOTAL DUE", "AFTER DUE", "Due Date", "Reading Date"):
             self.assertIn(label, preview)
             self.assertIn(label, issued)
         self.assertIn("Current Bill   : PHP   100.00", preview)
@@ -188,7 +189,7 @@ class ReceiptCoverageTests(unittest.TestCase):
         self.assertNotIn("due_date", reservations[0][2])
         self.assertIn("TOTAL DUE      : PHP   150.00", job["receipt_text"])
         self.assertIn("AFTER DUE      : PHP   160.00", job["receipt_text"])
-        self.assertIn("Previous       : PHP    50.00", job["receipt_text"])
+        self.assertIn("Unpaid Bills   : PHP    50.00", job["receipt_text"])
         self.assertEqual(job["previous_reading_date"], "2026-08-20")
         self.assertEqual(job["consumer_snapshot"]["previous_reading_date"], "2026-08-20")
         self.assertIn("Reading Date   : " + job["reading_date"], job["receipt_text"])

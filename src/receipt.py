@@ -184,14 +184,6 @@ def _billing_period_text(consumer: dict, reference_date: datetime.date) -> str:
     return f"{start_value} to {end_value}"
 
 
-def _previous_bill_text(previous: float, carried_previous_bill: float | None) -> str:
-    if carried_previous_bill is None:
-        return "Pending server calculation"
-    if carried_previous_bill <= 0:
-        return "None"
-    return f"PHP {carried_previous_bill:.2f}"
-
-
 def _calculate_penalty(
     consumer: dict,
     current_bill: float,
@@ -523,7 +515,6 @@ def build_receipt_text(
     late_fee_percent = 10.0 if late_fee in (None, "") else float(late_fee)
     billing_month = _billing_month_text(consumer, reference_date)
     billing_period = _billing_period_text(consumer, reference_date)
-    previous_bill = _previous_bill_text(previous, carried_previous_bill)
     address = consumer.get("address") or consumer.get("consumer_address") or "N/A"
 
     divider = _receipt_line("-")
@@ -549,9 +540,8 @@ def build_receipt_text(
     lines.extend(_wrap_field_lines("Coverage", billing_period))
     lines += [
         _field_line("Present", _format_reading(present)),
-        _field_line("Previous", _format_reading(previous)),
+        _field_line("Prev Reading", _format_reading(previous)),
         _field_line("Use", f"{_format_reading(consumption)} m3"),
-        _field_line("Prev Bill", previous_bill),
     ]
 
     if exception and exception.strip().lower() not in {"none", ""}:
@@ -567,7 +557,7 @@ def build_receipt_text(
         _money_line("Connection Fee", connection_fee),
         _money_line("Membership Fee", membership_fee),
         _server_money_line(f"Due Pen({late_fee_percent:g}%)", penalty),
-        _server_money_line("Previous", carried_previous_bill),
+        _server_money_line("Unpaid Bills", carried_previous_bill),
         _server_money_line(f"Prev Pen({late_fee_percent:g}%)", previous_penalty),
         border,
         _server_money_line("TOTAL DUE", amount_due),

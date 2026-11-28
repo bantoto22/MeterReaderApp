@@ -173,8 +173,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
             }),
             0, 2, "None", reading_date="2026-09-25",
         )
-        self.assertIn("Prev Bill      : PHP 145.00", receipt)
-        self.assertIn("Previous       : PHP   145.00", receipt)
+        self.assertIn("Unpaid Bills   : PHP   145.00", receipt)
 
     def test_reconnect_refreshes_assignments_without_pending_uploads(self):
         view = SimpleNamespace(
@@ -357,7 +356,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
         receipt = build_receipt_text(snapshot, 12, 20, "None", reading_date="2026-09-25")
         self.assertIn("TOTAL DUE      : PHP   345.75", receipt)
         self.assertIn("AFTER DUE      : PHP   365.75", receipt)
-        self.assertIn("Previous       : PHP   120.00", receipt)
+        self.assertIn("Unpaid Bills   : PHP   120.00", receipt)
         self.assertIn("Prev Pen(8%)", receipt)
 
     def test_missing_server_totals_are_not_displayed_as_zero_or_old_bill(self):
@@ -660,7 +659,7 @@ class ServerOwnedBillingTests(unittest.TestCase):
         self.assertIn("Due Pen(7.5%)", receipt)
         self.assertIn("PHP    15.00", receipt)
         self.assertIn("AFTER DUE      : PHP   235.00", receipt)
-        self.assertIn("Previous       : PHP   120.00", receipt)
+        self.assertIn("Unpaid Bills   : PHP   120.00", receipt)
         self.assertIn("2026-10-12", receipt)
 
     def test_reading_cannot_print_a_previous_bill(self):

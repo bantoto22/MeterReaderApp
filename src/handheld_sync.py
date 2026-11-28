@@ -526,6 +526,55 @@ def _stored_bill_penalty(unpaid_bill: dict) -> float:
     return stored
 
 
+def _prior_bill_snapshot(bill: dict) -> dict:
+    """Use the bill's own charge and penalty when adding it to the cached ledger."""
+    due = _parse_date(bill.get("due_date"))
+    day = _parse_date(bill.get("bill_date"))
+    return {
+        "sync_id": str(bill.get("sync_id") or ""),
+        "bill_date": day.isoformat() if day else None,
+        "bill_due_date": due.isoformat() if due else None,
+        "original_amount": _first_money(bill, ("water_charge", "class_cost")) or 0.0,
+        "own_penalty": 0.0,
+        "penalty_after_due": _stored_bill_penalty(bill),
+    }
+
+
+def _cached_prior_bill_amounts(
+    reading: dict, context: dict, bill_date: date, penalty_date: date,
+) -> tuple[float, float]:
+    bills = [bill for bill in context["unpaid_bills"] if isinstance(bill, dict)]
+    seen = {str(bill["sync_id"]) for bill in bills if bill.get("sync_id")}
+    pending_ids = set(context.get("pending_bill_ids") or ())
+    local_bills = list(context.get("local_bills") or ())
+    if isinstance(context.get("local_bill"), dict):
+        local_bills.append(context["local_bill"])
+    for local_bill in local_bills:
+        if not isinstance(local_bill, dict):
+            continue
+        sync_id = str(local_bill.get("sync_id") or "")
+        if sync_id in pending_ids and sync_id not in seen:
+            bills.append(_prior_bill_snapshot(local_bill))
+            seen.add(sync_id)
+
+    current_sync_id = str(reading.get("bill_sync_id") or "")
+    principal = 0.0
+    penalty = 0.0
+    for bill in bills:
+        if current_sync_id and str(bill.get("sync_id") or "") == current_sync_id:
+            continue
+        prior_date = _parse_date(bill.get("bill_date"))
+        if prior_date and prior_date > bill_date:
+            continue
+        principal += _safe_float(bill.get("original_amount"))
+        due_date = _parse_date(bill.get("bill_due_date"))
+        if due_date and penalty_date > due_date:
+            penalty += _safe_float(bill.get("penalty_after_due"))
+        elif due_date is None:
+            penalty += _safe_float(bill.get("own_penalty"))
+    return round(principal, 2), round(penalty, 2)
+
+
 def _build_bill_payload(
     reading: dict,
     context: dict,
@@ -559,7 +608,12 @@ def _build_bill_payload(
     # principal or have another penalty applied to it.
     unpaid_bills = context.get("unpaid_bills")
     used_itemized_unpaid_bills = False
-    if isinstance(unpaid_bills, list):
+    if context.get("unpaid_bills_as_of") and isinstance(unpaid_bills, list):
+        carried_balance, carried_penalty = _cached_prior_bill_amounts(
+            reading, context, reference_date, penalty_date,
+        )
+        used_itemized_unpaid_bills = True
+    elif isinstance(unpaid_bills, list):
         current_bill_sync_id = str(reading.get("bill_sync_id") or "").strip()
         for unpaid_bill in unpaid_bills:
             if not isinstance(unpaid_bill, dict):
@@ -1765,6 +1819,16 @@ class SQLiteLocalSyncStore(LocalSyncStore):
             self._refresh_queue_status(conn, queue_id)
             conn.commit()
 
+    def pending_bill_ids(self, consumer_id: int) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT payload FROM sync_queue_meter_readings
+                WHERE consumer_id = ? AND backend_status IN ('pending', 'failed')
+            """, (int(consumer_id),)).fetchall()
+        readings = [self._deserialize_row(row)["payload"] for row in rows]
+        return [str(reading["bill_sync_id"]) for reading in readings
+                if reading.get("bill_sync_id") and not _is_meter_issue_report(reading)]
+
     def meter_issue_bill_ids(self, consumer_id: int) -> set[str]:
         with self._connect() as conn:
             rows=conn.execute('SELECT payload,backend_status FROM sync_queue_meter_readings WHERE consumer_id=?',(int(consumer_id),)).fetchall()
@@ -2660,6 +2724,9 @@ class HandheldSyncDataAccess:
                     for key in CONTEXT_BILL_FIELDS:
                         if context.get(key) is not None:
                             merged[key] = context[key]
+                    pending_ids_getter = getattr(self.local, "pending_bill_ids", None)
+                    if context.get("unpaid_bills_as_of") and callable(pending_ids_getter):
+                        merged["pending_bill_ids"] = pending_ids_getter(consumer_id)
                     issue_ids_getter=getattr(self.local,'meter_issue_bill_ids',None)
                     issue_ids=issue_ids_getter(consumer_id) if callable(issue_ids_getter) else set()
                     # Hide unissued drafts for unreadable or archived entries from
@@ -2777,6 +2844,14 @@ class HandheldSyncDataAccess:
                 snapshot["bill_status"] = bill["status"]
             self.local.cache_consumers([snapshot])
             context_update = {"bill": bill}
+            cached_context = self.local.load_cached_consumer_context(consumer_id)
+            prior_bills = cached_context.get("unpaid_bills")
+            if cached_context.get("unpaid_bills_as_of") and isinstance(prior_bills, list) and bill.get("sync_id"):
+                sync_id = str(bill["sync_id"])
+                current = [prior for prior in prior_bills if str(prior.get("sync_id")) != sync_id]
+                if str(bill.get("status") or "").strip().lower() not in {"paid", "cancelled", "canceled", "void", "voided"}:
+                    current.append(_prior_bill_snapshot(bill))
+                context_update["unpaid_bills"] = current
             if policy:
                 context_update["billing_policy"] = policy
             self.local.cache_consumer_context(consumer_id, context_update)
